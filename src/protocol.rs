@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A request sent from a client to the broker over the Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,10 +42,43 @@ pub enum BrokerResponse {
     Error { message: String },
 }
 
+/// A registered worker in the broker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Worker {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    /// Unix timestamp (seconds) when this worker's TTL expires.
+    pub expires_at: u64,
+}
+
 /// The payload inside a successful response, varies by request type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponsePayload {
     /// Generic acknowledgement with no extra data.
     Ack {},
+    /// A worker was registered; returns the assigned worker ID.
+    WorkerRegistered { worker_id: String },
+    /// List of active workers.
+    WorkerList { workers: Vec<Worker> },
+    /// A message delivered or queued.
+    MessageAck { message_id: String },
+    /// Heartbeat renewed.
+    HeartbeatAck { worker_id: String, expires_at: u64 },
+    /// A message received from listen.
+    Message {
+        message_id: String,
+        from: Option<String>,
+        to: String,
+        body: String,
+    },
+    /// Listen timed out with no messages.
+    Timeout { worker_id: String },
+    /// Map of arbitrary key-value data (used as a flexible response shape).
+    Data {
+        data: HashMap<String, serde_json::Value>,
+    },
 }
