@@ -4,7 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
-    #[error("dispatch.config.toml already exists at {path} -- use a text editor to modify it")]
+    #[error(
+        "dispatch.config.toml already exists in this directory -- use a text editor to modify it"
+    )]
     ConfigAlreadyExists { path: PathBuf },
 
     #[error("config not found at {path} -- run `dispatch init` or create dispatch.config.toml")]
