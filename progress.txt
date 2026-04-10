@@ -1,0 +1,160 @@
+## Codebase Patterns
+- Config in `src/config.rs`: `resolve_config(cli_cell_id, start_dir)` with inner testable function for env var isolation
+- Config file is `dispatch.config.toml`, searched upward from cwd; cell_id derived via `DefaultHasher` on canonical path
+- Precedence: CLI `--cell-id` > `DISPATCH_CELL_ID` env > config file > derived fallback
+- Use `resolve_config_inner()` in tests to avoid env var races in parallel test execution
+- Edition 2021, async everywhere with tokio, lib/bin split
+- Use `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build` before committing
+- Error types in `src/errors.rs` with thiserror, CLI in `src/cli.rs` with clap derive
+- Tracing setup in `src/logging.rs` — rolling file appender to data_local_dir + stderr layer
+- All dependencies: clap, serde, toml, thiserror, tracing, tracing-subscriber, tracing-appender, tokio, reqwest, semver, uuid, serde_json, dirs
+- Protocol types in `src/protocol.rs`: `BrokerRequest` (tagged enum) and `BrokerResponse` (tagged enum with `ResponsePayload`)
+- Client in `src/client.rs`: `Client::new(project_root, cell_id)` then `client.send_request(&req).await`
+- Broker routes requests in `handle_request()` — add new handler logic there per request type
+- CLI subcommands (except `serve`) map to `BrokerRequest`, send via `Client`, print JSON response to stdout
+- `Worker` struct in `protocol.rs` with id, name, role, description, capabilities, expires_at
+- `BrokerState.workers` is `HashMap<String, Worker>` — `register_worker()` returns UUID, `evict_expired()` cleans up
+- Default worker TTL is 300s (5 min) — `DEFAULT_WORKER_TTL_SECS` const in `broker.rs`
+- `ResponsePayload` variants added: `WorkerRegistered`, `WorkerList`, `MessageAck`, `HeartbeatAck`, `Message`, `Timeout`, `Data`
+- `BrokerState.list_workers()` evicts expired then returns cloned Vec; `heartbeat_worker()` evicts then renews TTL
+- `now_secs()` helper in broker.rs — use instead of inline SystemTime boilerplate
+- Test helpers `send_json_request()` and `register_worker()` in broker tests — use for any broker integration test
+- `BrokerState.mailboxes` is `HashMap<String, VecDeque<Message>>` — `send_message()` queues messages per worker
+- `Message` struct in `protocol.rs`: message_id, from (optional), to, body
+- `send_message()` evicts expired workers first, returns None if recipient not found
+- `BrokerState.notifiers` is `HashMap<String, Arc<Notify>>` — `get_notifier()` returns per-worker Notify handle
+- Long-poll pattern: lock state, check mailbox, get notifier, unlock, then `tokio::time::timeout(notifier.notified())` to wait
+- `send_message()` calls `notify.notify_one()` after queuing — wakes any long-polling `listen` handler
+- `Listen` handler renews worker TTL implicitly — no separate heartbeat needed during listen loops
+- `pop_message()` pops front of VecDeque for FIFO ordering
+- Example scripts go in `examples/` — shell scripts should be executable, have `--help`, and use `dispatch send` (not internal APIs)
+- `ResponsePayload` is `#[serde(untagged)]` — variant order matters: `Ack {}` must be LAST or it swallows all responses during deserialization
+- Multi-worker examples: register all workers first, start `dispatch listen` in background subshells, then send initial message to kick off pipeline
+
+---
+
+## 2026-04-10 - US-001
+- What was implemented: Full Rust project scaffold with cargo init, Cargo.toml with all dependencies, lib/bin split, Clap derive CLI with 6 subcommands (serve, register, team, send, listen, heartbeat), thiserror error enum, tracing setup with rolling file appender and DISPATCH_LOG env var, profile.release with strip+lto
+- Files changed: Cargo.toml, Cargo.lock, src/main.rs, src/lib.rs, src/cli.rs, src/errors.rs, src/logging.rs, .gitignore
+- **Learnings for future iterations:**
+  - `cargo init` works in an existing directory with files — no need to cargo new + move
+  - The `dirs` crate is needed for log directory resolution (data_local_dir)
+  - `serde_json` is needed alongside `serde` + `toml` since the broker protocol will be JSON
+  - Run `cargo fmt` after writing code — the formatter reorders import groups and adjusts line wrapping
+---
+
+## 2026-04-10 - US-003
+- What was implemented: Embedded broker server with Unix domain socket, in-memory BrokerState, JSON-line request/response protocol, duplicate broker detection (try-connect to stale socket), graceful shutdown on SIGINT/SIGTERM with socket cleanup, stale socket recovery on restart
+- Files changed: src/broker.rs (new), src/lib.rs, src/main.rs
+- **Learnings for future iterations:**
+  - Socket path is `<project_root>/.dispatch/<cell_id>.sock` — derived via `broker::socket_path()`
+  - Duplicate detection works by trying to connect to existing socket; if connection succeeds = active broker, if fails = stale file to remove
+  - `tokio::select!` between accept loop and signal handler is the pattern for graceful shutdown
+  - Tests that start a broker should use `tokio::spawn` + `serve_handle.abort()` for cleanup
+  - `BrokerState` is currently empty — will be extended with worker map and message queues in US-004/US-005
+  - Connection handler reads one JSON line, responds with one JSON line, then closes — request routing will be added in US-004
+---
+
+## 2026-04-10 - US-002
+- What was implemented: Config module with serde+toml config file parsing (deny_unknown_fields), upward directory search for dispatch.config.toml, stable cell identity derivation from project root path hash, CLI --cell-id global flag, DISPATCH_CELL_ID env var support, full precedence layering, 13 unit tests
+- Files changed: src/config.rs (new), src/lib.rs, src/cli.rs, src/main.rs, Cargo.toml, Cargo.lock
+- **Learnings for future iterations:**
+  - Tests that manipulate env vars will race in parallel test execution — use a testable inner function that accepts env values as parameters instead
+  - `tempfile` added as dev dependency for config path tests
+  - The `--cell-id` flag uses `global = true` on the Cli struct so it works with any subcommand
+  - Config resolution returns `project_root` which will be needed for socket path derivation in US-003
+- Broker socket at `<project_root>/.dispatch/<cell_id>.sock` — use `broker::socket_path()` to derive
+- Stale socket detection: try connecting; if connection fails, remove file and rebind
+- `BrokerState` is `Arc<Mutex<BrokerState>>` shared across connection handlers
+- JSON-line protocol: one JSON line per request, one JSON line per response, then close
+- Signal handling via `tokio::signal::unix` with `tokio::select!` for graceful shutdown
+---
+
+## 2026-04-10 - US-004
+- What was implemented: Shared protocol types (BrokerRequest/BrokerResponse enums in src/protocol.rs), client transport module (src/client.rs) with socket connection and send_request method, broker request routing via handle_request(), all CLI subcommands wired to send requests via client and print JSON responses to stdout
+- Files changed: src/protocol.rs (new), src/client.rs (new), src/lib.rs, src/broker.rs, src/main.rs
+- **Learnings for future iterations:**
+  - `BrokerRequest` uses `#[serde(tag = "type")]` for clean JSON discriminant; `BrokerResponse` uses `#[serde(tag = "status")]`
+  - Client maps `NotFound`/`ConnectionRefused` IO errors to `BrokerNotRunning` for a clear user-facing message
+  - Each CLI subcommand (except `serve`) maps directly to a `BrokerRequest` variant — add new commands by adding enum variants and match arms
+  - `ResponsePayload` is an untagged enum so future story handlers can add new payload shapes without breaking existing ones
+  - The broker's `handle_request()` function is the single routing point — implement handler logic per request type there
+---
+
+## 2026-04-10 - US-005
+- What was implemented: Worker registration command — `Worker` struct in protocol.rs with TTL-based liveness, `BrokerState.workers` HashMap with `register_worker()` and `evict_expired()` methods, broker `Register` handler returning UUID worker_id, `ResponsePayload` expanded with all future payload variants (WorkerRegistered, WorkerList, MessageAck, HeartbeatAck, Message, Timeout, Data)
+- Files changed: src/protocol.rs, src/broker.rs
+- **Learnings for future iterations:**
+  - `ResponsePayload` is `#[serde(untagged)]` — new variants are added freely but field names must be unique across variants to avoid ambiguous deserialization
+  - `BrokerState.register_worker()` uses `uuid::Uuid::new_v4()` for worker IDs — no need to generate from outside
+  - `DEFAULT_WORKER_TTL_SECS` = 300 (5 min) — worker heartbeat and listen should reset `expires_at` to `now + TTL`
+  - `evict_expired()` should be called before team listing or any query that returns worker lists
+  - Added all `ResponsePayload` variants upfront to avoid breaking existing tests when adding new handlers
+---
+
+## 2026-04-10 - US-006
+- What was implemented: Team listing handler (evicts expired workers, returns WorkerList payload) and Heartbeat handler (renews worker TTL, returns HeartbeatAck with new expires_at, or error if worker not found/expired). Added `list_workers()`, `heartbeat_worker()`, and `now_secs()` helper to BrokerState. 7 new tests: unit tests for list filtering, heartbeat renewal, not-found, expired-worker cases, and integration tests for team/heartbeat/heartbeat-error via broker socket.
+- Files changed: src/broker.rs
+- **Learnings for future iterations:**
+  - Extracted `now_secs()` helper to avoid repeated SystemTime boilerplate — use this in future timestamp code
+  - `list_workers()` calls `evict_expired()` internally so callers don't need to remember
+  - `heartbeat_worker()` also evicts first, so an expired worker can't be renewed even if it's still in the map
+  - Test helpers `send_json_request()` and `register_worker()` simplify broker integration tests — reuse for US-007/US-008
+  - `ResponsePayload::HeartbeatAck` returns both `worker_id` and `expires_at` so the client knows the new TTL deadline
+---
+
+## 2026-04-10 - US-007
+- What was implemented: Direct message sending — `Message` struct in protocol.rs, `BrokerState.mailboxes` HashMap with VecDeque per worker, `send_message()` method that evicts expired workers and queues messages with UUID message_id, broker `Send` handler returning `MessageAck` with message_id or error for unknown/expired recipients
+- Files changed: src/protocol.rs, src/broker.rs
+- **Learnings for future iterations:**
+  - `Message` struct is in protocol.rs (shared between client and server), not broker.rs
+  - `send_message()` follows the same pattern as other BrokerState methods: evict_expired first, then check worker exists
+  - Mailboxes are created lazily via `entry().or_default()` — no need to pre-create on worker registration
+  - `ResponsePayload::MessageAck` returns `message_id` — the client can use this to correlate acknowledgements
+  - 8 new tests: 5 unit (queuing, unknown, expired, unique IDs, no-from) + 3 integration (send via broker, unknown recipient via broker, multiple messages via broker)
+---
+
+## 2026-04-10 - US-008
+- What was implemented: Listen loop with long-poll — `BrokerState.notifiers` HashMap with per-worker `Arc<Notify>` for wakeup signaling, `pop_message()` method for FIFO mailbox consumption, `get_notifier()` for per-worker Notify handle creation, `send_message()` now calls `notify_one()` after queuing, Listen handler with immediate delivery (if message already queued), long-poll wait via `tokio::time::timeout` + `Notify::notified()`, implicit TTL renewal on listen, distinct JSON shapes for message vs timeout responses
+- Files changed: src/broker.rs
+- **Learnings for future iterations:**
+  - `tokio::sync::Notify` is the right primitive for long-poll wakeup — `notify_one()` stores a permit so the waiter wakes even if notification happens between lock release and `notified().await`
+  - Must release the Mutex lock before awaiting the Notify — otherwise `send_message` can't acquire the lock to queue the message and notify
+  - Pattern: lock → check mailbox → get notifier → drop lock → await notifier with timeout → re-lock → pop message
+  - `Notify` doesn't have `try_recv` — use `Arc::ptr_eq` to test notifier identity instead
+  - Timeout of 0 falls back to DEFAULT_LISTEN_TIMEOUT_SECS (30s) to avoid instant return
+  - 10 new tests: 4 unit (pop FIFO, empty mailbox, unknown worker, notifier identity) + 6 integration (immediate delivery, timeout, long-poll delivery, TTL renewal, unknown worker error, FIFO ordering)
+---
+
+## 2026-04-10 - US-009
+- What was implemented: README.md with project overview, quick start, architecture section, commands table, configuration section, and comprehensive stale/refresh control message documentation including JSON body convention, sending stale messages (file-level), sending refresh messages (folder-level), a worker listen loop reacting to control messages, and key design points (broker doesn't inspect bodies, any process can send, workers define their own reactions)
+- Files changed: README.md (new)
+- **Learnings for future iterations:**
+  - Stale/refresh are purely conventional — JSON body with `{"type":"stale"|"refresh","scope":"...","reason":"..."}`, broker never inspects message bodies
+  - The `dispatch team | jq` pattern is the way to discover worker IDs by role for scripting
+  - Worker listen loop pattern: `while true; dispatch listen; parse body with jq; case on .type; done`
+  - US-009 is documentation-only — no Rust code changes, so all existing tests continue to pass
+---
+
+## 2026-04-10 - US-010
+- What was implemented: Filesystem watcher reference script in `examples/watch-files.sh` using `fswatch` for cross-platform file monitoring, with debounce tracking via associative array, file-level stale messages for individual file changes, folder-level refresh messages for directory changes, argument parsing for worker-id/debounce/from options, color/TTY detection for stderr output. Added comprehensive watcher documentation to README with prerequisites, quick start, connection guide, and options table.
+- Files changed: examples/watch-files.sh (new), README.md
+- **Learnings for future iterations:**
+  - `fswatch --latency N` provides its own batching window that complements the script-level debounce
+  - Bash associative arrays (`declare -A`) work for simple debounce tracking — maps scope to last-sent epoch
+  - `bash -n` is sufficient for syntax checking shell scripts; shellcheck would be nice-to-have but not required
+  - US-010 is shell-script-only — no Rust code changes, so `cargo build`/`cargo test` pass without modification
+  - The `dispatch team | jq -r '.workers[] | select(.role == "...") | .id'` pattern is the standard way to discover worker IDs for scripts
+---
+
+## 2026-04-10 - US-011
+- What was implemented: End-to-end multi-role workflow example in `examples/workflow.sh` with 5 workers (planner, code.implementer, code.reviewer, test.runner, code.shipper) coordinating a plan -> implement -> review -> test -> ship pipeline. Also fixed critical `ResponsePayload` deserialization bug where `Ack {}` variant being first in the untagged enum swallowed all response payloads. Added comprehensive workflow documentation to README with pipeline diagram, running instructions, architecture explanation, and extension guide.
+- Files changed: examples/workflow.sh (new), README.md, src/protocol.rs
+- **Learnings for future iterations:**
+  - `#[serde(untagged)]` enum variant order is critical — serde tries variants in declaration order, and `Ack {}` (empty struct) matches ANY JSON object, so it must be last
+  - Background subshells with `dispatch listen` create a natural fan-out pattern for multi-worker orchestration
+  - Worker-to-worker messaging works cleanly: each worker receives context from the previous stage as a JSON body and forwards its result to the next worker
+  - The `jq -r '.workers[] | select(.role == "...") | .id'` pattern from `dispatch team` output is the standard way to discover worker IDs in scripts
+  - `sleep 1` after starting the broker and before registering workers is necessary for socket readiness
+  - All 5 workers can start their listen loops concurrently in background subshells, then the initial message triggers the sequential pipeline
+---

@@ -145,18 +145,18 @@ lto = true
 
 ### Key Crates
 
-| Crate | Purpose |
-|-------|---------|
-| `clap` (derive) | Argument parsing |
-| `serde` + `toml` | Config serialization |
-| `thiserror` | Typed error enums |
-| `tracing` + `tracing-subscriber` | Structured logging |
-| `reqwest` (rustls-tls, no `blocking`) | Async HTTP client |
-| `semver` | Version comparison |
-| `self-replace` | Atomic binary swap for updates |
-| `tempfile` | Temp dirs in tests |
-| `assert_cmd` | Binary integration tests |
-| `tokio` (full) | Async runtime (always — all I/O is async) |
+| Crate                                 | Purpose                                   |
+| ------------------------------------- | ----------------------------------------- |
+| `clap` (derive)                       | Argument parsing                          |
+| `serde` + `toml`                      | Config serialization                      |
+| `thiserror`                           | Typed error enums                         |
+| `tracing` + `tracing-subscriber`      | Structured logging                        |
+| `reqwest` (rustls-tls, no `blocking`) | Async HTTP client                         |
+| `semver`                              | Version comparison                        |
+| `self-replace`                        | Atomic binary swap for updates            |
+| `tempfile`                            | Temp dirs in tests                        |
+| `assert_cmd`                          | Binary integration tests                  |
+| `tokio` (full)                        | Async runtime (always — all I/O is async) |
 
 ### Code Quality Rules
 
@@ -166,3 +166,8 @@ lto = true
 - Use `deny_unknown_fields` on all config structs
 - Keep modules focused: one responsibility per file
 - Command handlers return `Result<()>`, `main.rs` converts errors to stderr + non-zero exit
+
+### Ralph Workflow
+
+- After completing each step, commit and push to `origin` immediately
+- Do not accumulate changes across steps — commit and push after every step

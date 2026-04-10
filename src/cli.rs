@@ -15,6 +15,10 @@ Exit codes:
 Docs: https://github.com/codesoda/dispatch"
 )]
 pub struct Cli {
+    /// Override the cell identity (takes precedence over env var and config)
+    #[arg(long, global = true)]
+    pub cell_id: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
