@@ -25,6 +25,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Initialize a dispatch.config.toml in the current directory
+    Init,
+
     /// Start the embedded broker server on a Unix domain socket
     Serve,
 

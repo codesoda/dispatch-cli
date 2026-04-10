@@ -65,6 +65,43 @@ pub fn derive_cell_id(project_root: &Path) -> String {
     format!("cell-{hash:016x}")
 }
 
+/// Config file template written by `dispatch init`.
+const CONFIG_TEMPLATE: &str = "\
+# Dispatch configuration
+# https://github.com/codesoda/dispatch-cli
+
+# Cell identity for this project.
+# If omitted, a stable ID is derived from the project directory path.
+# Override precedence: --cell-id flag > DISPATCH_CELL_ID env var > this value > derived
+# cell_id = \"my-project\"
+";
+
+/// Create a `dispatch.config.toml` in `cwd` with commented-out defaults.
+///
+/// Returns the path to the created file.
+/// Errors if the file already exists in `cwd`.
+/// Warns on stderr if a config exists in a parent directory.
+pub fn init_config(cwd: &Path) -> Result<PathBuf, DispatchError> {
+    let config_path = cwd.join("dispatch.config.toml");
+
+    if config_path.is_file() {
+        return Err(DispatchError::ConfigAlreadyExists { path: config_path });
+    }
+
+    // Check for config in a parent directory (skip cwd itself)
+    if let Some(parent) = cwd.parent() {
+        if let Some((parent_config, _)) = find_config_file(parent) {
+            eprintln!(
+                "Note: found existing config at {}, creating a new one in the current directory",
+                parent_config.display()
+            );
+        }
+    }
+
+    std::fs::write(&config_path, CONFIG_TEMPLATE)?;
+    Ok(config_path)
+}
+
 /// Resolve configuration with full precedence:
 /// CLI flag > env var > config file > derived fallback.
 pub fn resolve_config(
@@ -246,6 +283,57 @@ backend = "https://example.com"
         let resolved =
             resolve_config_inner(Some("from-cli"), Some("from-env"), tmp.path()).unwrap();
         assert_eq!(resolved.cell_id, "from-cli");
+    }
+
+    #[test]
+    fn test_init_config_creates_file() {
+        let tmp = TempDir::new().unwrap();
+        let result = init_config(tmp.path());
+        assert!(result.is_ok());
+
+        let path = result.unwrap();
+        assert_eq!(path, tmp.path().join("dispatch.config.toml"));
+        assert!(path.is_file());
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("# cell_id = \"my-project\""));
+
+        // Template must be valid TOML (all active lines are comments)
+        let parsed: Result<ConfigFile, _> = toml::from_str(&contents);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_init_config_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(&config_path, "").unwrap();
+
+        let result = init_config(tmp.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected 'already exists' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_init_config_with_parent_config() {
+        let tmp = TempDir::new().unwrap();
+        // Config in parent
+        let parent_config = tmp.path().join("dispatch.config.toml");
+        fs::write(&parent_config, "").unwrap();
+
+        // Init in child — should succeed despite parent config
+        let child = tmp.path().join("subdir");
+        fs::create_dir(&child).unwrap();
+
+        let result = init_config(&child);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path, child.join("dispatch.config.toml"));
+        assert!(path.is_file());
     }
 
     #[test]

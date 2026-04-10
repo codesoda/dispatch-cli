@@ -16,12 +16,27 @@ async fn main() {
 
     if let Err(e) = run(cli).await {
         eprintln!("Error: {e}");
-        process::exit(1);
+        let code = match e {
+            dispatch::errors::DispatchError::ConfigAlreadyExists { .. }
+            | dispatch::errors::DispatchError::ConfigNotFound { .. }
+            | dispatch::errors::DispatchError::ConfigInvalid { .. } => 2,
+            _ => 1,
+        };
+        process::exit(code);
     }
 }
 
 async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
     let cwd = std::env::current_dir().map_err(dispatch::errors::DispatchError::Io)?;
+
+    // Handle init before config resolution — it doesn't need an existing config
+    if let Commands::Init = cli.command {
+        let path = dispatch::config::init_config(&cwd)?;
+        println!("{}", path.display());
+        eprintln!("Created dispatch.config.toml");
+        return Ok(());
+    }
+
     let config = resolve_config(cli.cell_id.as_deref(), &cwd)?;
 
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
@@ -38,6 +53,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         }
         cmd => {
             let request = match cmd {
+                Commands::Init => unreachable!(),
                 Commands::Serve => unreachable!(),
                 Commands::Register {
                     name,
