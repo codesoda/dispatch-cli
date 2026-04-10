@@ -35,10 +35,7 @@ impl BrokerState {
         capabilities: Vec<String>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
+        let now = now_secs();
         let worker = Worker {
             id: id.clone(),
             name,
@@ -53,12 +50,35 @@ impl BrokerState {
 
     /// Remove workers whose TTL has expired.
     pub fn evict_expired(&mut self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
+        let now = now_secs();
         self.workers.retain(|_, w| w.expires_at > now);
     }
+
+    /// Return a list of all active (non-expired) workers.
+    pub fn list_workers(&mut self) -> Vec<Worker> {
+        self.evict_expired();
+        self.workers.values().cloned().collect()
+    }
+
+    /// Renew a worker's TTL. Returns the new expiry timestamp, or None if not found/expired.
+    pub fn heartbeat_worker(&mut self, worker_id: &str) -> Option<u64> {
+        self.evict_expired();
+        if let Some(worker) = self.workers.get_mut(worker_id) {
+            let new_expiry = now_secs() + DEFAULT_WORKER_TTL_SECS;
+            worker.expires_at = new_expiry;
+            Some(new_expiry)
+        } else {
+            None
+        }
+    }
+}
+
+/// Get current Unix timestamp in seconds.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs()
 }
 
 /// Derive the Unix domain socket path for a given cell identity.
@@ -212,9 +232,11 @@ async fn handle_request(request: BrokerRequest, state: Arc<Mutex<BrokerState>>) 
             }
         }
         BrokerRequest::Team => {
-            // Will be implemented in US-006.
+            let mut state = state.lock().await;
+            let workers = state.list_workers();
+            tracing::info!(count = workers.len(), "team listing");
             BrokerResponse::Ok {
-                payload: ResponsePayload::Ack {},
+                payload: ResponsePayload::WorkerList { workers },
             }
         }
         BrokerRequest::Send { .. } => {
@@ -229,10 +251,21 @@ async fn handle_request(request: BrokerRequest, state: Arc<Mutex<BrokerState>>) 
                 payload: ResponsePayload::Ack {},
             }
         }
-        BrokerRequest::Heartbeat { .. } => {
-            // Will be implemented in US-006.
-            BrokerResponse::Ok {
-                payload: ResponsePayload::Ack {},
+        BrokerRequest::Heartbeat { worker_id } => {
+            let mut state = state.lock().await;
+            match state.heartbeat_worker(&worker_id) {
+                Some(expires_at) => {
+                    tracing::info!(worker_id = %worker_id, expires_at, "heartbeat renewed");
+                    BrokerResponse::Ok {
+                        payload: ResponsePayload::HeartbeatAck {
+                            worker_id,
+                            expires_at,
+                        },
+                    }
+                }
+                None => BrokerResponse::Error {
+                    message: format!("worker not found or expired: {worker_id}"),
+                },
             }
         }
     }
@@ -560,6 +593,180 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["status"], "ok");
         assert!(parsed["worker_id"].is_string());
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// Helper: send a JSON request to a broker socket and return the parsed response.
+    async fn send_json_request(sock: &Path, request: &serde_json::Value) -> serde_json::Value {
+        let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut req_bytes = serde_json::to_vec(request).unwrap();
+        req_bytes.push(b'\n');
+        writer.write_all(&req_bytes).await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        serde_json::from_str(&response).unwrap()
+    }
+
+    /// Helper: register a worker via broker and return its worker_id.
+    async fn register_worker(sock: &Path, name: &str, role: &str) -> String {
+        let req = serde_json::json!({
+            "type": "register",
+            "name": name,
+            "role": role,
+            "description": format!("{name} worker"),
+            "capabilities": []
+        });
+        let resp = send_json_request(sock, &req).await;
+        resp["worker_id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_list_workers_excludes_expired() {
+        let mut state = BrokerState::new();
+        let active_id =
+            state.register_worker("active".into(), "coder".into(), "desc".into(), vec![]);
+        let expired_id =
+            state.register_worker("expired".into(), "coder".into(), "desc".into(), vec![]);
+        // Expire one worker.
+        state.workers.get_mut(&expired_id).unwrap().expires_at = 0;
+
+        let workers = state.list_workers();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, active_id);
+    }
+
+    #[test]
+    fn test_heartbeat_worker_renews_ttl() {
+        let mut state = BrokerState::new();
+        let id = state.register_worker("hb-worker".into(), "role".into(), "desc".into(), vec![]);
+        let original_expiry = state.workers.get(&id).unwrap().expires_at;
+
+        // Manually lower the expiry to simulate time passing.
+        state.workers.get_mut(&id).unwrap().expires_at = now_secs() + 10;
+
+        let new_expiry = state.heartbeat_worker(&id).unwrap();
+        assert!(
+            new_expiry >= original_expiry,
+            "heartbeat should renew to at least the original TTL"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_worker_not_found() {
+        let mut state = BrokerState::new();
+        assert!(state.heartbeat_worker("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_worker_expired() {
+        let mut state = BrokerState::new();
+        let id = state.register_worker("exp-worker".into(), "role".into(), "desc".into(), vec![]);
+        state.workers.get_mut(&id).unwrap().expires_at = 0;
+
+        assert!(
+            state.heartbeat_worker(&id).is_none(),
+            "heartbeat for expired worker should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_team_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "team-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "team-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        // Register two workers.
+        let id1 = register_worker(&sock, "worker-a", "planner").await;
+        let id2 = register_worker(&sock, "worker-b", "coder").await;
+
+        // List team.
+        let resp = send_json_request(&sock, &serde_json::json!({"type": "team"})).await;
+        assert_eq!(resp["status"], "ok");
+
+        let workers = resp["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), 2);
+        let ids: Vec<&str> = workers.iter().map(|w| w["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&id1.as_str()));
+        assert!(ids.contains(&id2.as_str()));
+
+        // Verify worker fields are present.
+        for w in workers {
+            assert!(w["name"].is_string());
+            assert!(w["role"].is_string());
+            assert!(w["description"].is_string());
+            assert!(w["capabilities"].is_array());
+            assert!(w["id"].is_string());
+        }
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "hb-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "hb-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        // Register a worker.
+        let worker_id = register_worker(&sock, "hb-agent", "coder").await;
+
+        // Send heartbeat.
+        let resp = send_json_request(
+            &sock,
+            &serde_json::json!({"type": "heartbeat", "worker_id": worker_id}),
+        )
+        .await;
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["worker_id"], worker_id);
+        assert!(
+            resp["expires_at"].is_number(),
+            "should return new expires_at"
+        );
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_unknown_worker_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "hb-err-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "hb-err-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        // Heartbeat for a non-existent worker.
+        let resp = send_json_request(
+            &sock,
+            &serde_json::json!({"type": "heartbeat", "worker_id": "nonexistent-id"}),
+        )
+        .await;
+        assert_eq!(resp["status"], "error");
+        assert!(
+            resp["message"].as_str().unwrap().contains("not found"),
+            "error message should mention worker not found"
+        );
 
         serve_handle.abort();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
