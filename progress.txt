@@ -28,6 +28,8 @@
 - `Listen` handler renews worker TTL implicitly — no separate heartbeat needed during listen loops
 - `pop_message()` pops front of VecDeque for FIFO ordering
 - Example scripts go in `examples/` — shell scripts should be executable, have `--help`, and use `dispatch send` (not internal APIs)
+- `ResponsePayload` is `#[serde(untagged)]` — variant order matters: `Ack {}` must be LAST or it swallows all responses during deserialization
+- Multi-worker examples: register all workers first, start `dispatch listen` in background subshells, then send initial message to kick off pipeline
 
 ---
 
@@ -143,4 +145,16 @@
   - `bash -n` is sufficient for syntax checking shell scripts; shellcheck would be nice-to-have but not required
   - US-010 is shell-script-only — no Rust code changes, so `cargo build`/`cargo test` pass without modification
   - The `dispatch team | jq -r '.workers[] | select(.role == "...") | .id'` pattern is the standard way to discover worker IDs for scripts
+---
+
+## 2026-04-10 - US-011
+- What was implemented: End-to-end multi-role workflow example in `examples/workflow.sh` with 5 workers (planner, code.implementer, code.reviewer, test.runner, code.shipper) coordinating a plan -> implement -> review -> test -> ship pipeline. Also fixed critical `ResponsePayload` deserialization bug where `Ack {}` variant being first in the untagged enum swallowed all response payloads. Added comprehensive workflow documentation to README with pipeline diagram, running instructions, architecture explanation, and extension guide.
+- Files changed: examples/workflow.sh (new), README.md, src/protocol.rs
+- **Learnings for future iterations:**
+  - `#[serde(untagged)]` enum variant order is critical — serde tries variants in declaration order, and `Ack {}` (empty struct) matches ANY JSON object, so it must be last
+  - Background subshells with `dispatch listen` create a natural fan-out pattern for multi-worker orchestration
+  - Worker-to-worker messaging works cleanly: each worker receives context from the previous stage as a JSON body and forwards its result to the next worker
+  - The `jq -r '.workers[] | select(.role == "...") | .id'` pattern from `dispatch team` output is the standard way to discover worker IDs in scripts
+  - `sleep 1` after starting the broker and before registering workers is necessary for socket readiness
+  - All 5 workers can start their listen loops concurrently in background subshells, then the initial message triggers the sequential pipeline
 ---
