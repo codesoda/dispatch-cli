@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::errors::DispatchError;
-use crate::protocol::{BrokerRequest, BrokerResponse, ResponsePayload, Worker};
+use crate::protocol::{BrokerRequest, BrokerResponse, Message, ResponsePayload, Worker};
 
 /// Default worker TTL in seconds (5 minutes).
 const DEFAULT_WORKER_TTL_SECS: u64 = 300;
@@ -19,6 +19,8 @@ const DEFAULT_WORKER_TTL_SECS: u64 = 300;
 pub struct BrokerState {
     /// Registered workers keyed by worker ID.
     pub workers: HashMap<String, Worker>,
+    /// Per-worker message mailboxes keyed by worker ID.
+    pub mailboxes: HashMap<String, VecDeque<Message>>,
 }
 
 impl BrokerState {
@@ -70,6 +72,29 @@ impl BrokerState {
         } else {
             None
         }
+    }
+
+    /// Queue a message in a worker's mailbox. Returns the message ID, or None if the
+    /// recipient worker is not found or expired.
+    pub fn send_message(
+        &mut self,
+        to: String,
+        body: String,
+        from: Option<String>,
+    ) -> Option<String> {
+        self.evict_expired();
+        if !self.workers.contains_key(&to) {
+            return None;
+        }
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let message = Message {
+            message_id: message_id.clone(),
+            from,
+            to: to.clone(),
+            body,
+        };
+        self.mailboxes.entry(to).or_default().push_back(message);
+        Some(message_id)
     }
 }
 
@@ -239,10 +264,18 @@ async fn handle_request(request: BrokerRequest, state: Arc<Mutex<BrokerState>>) 
                 payload: ResponsePayload::WorkerList { workers },
             }
         }
-        BrokerRequest::Send { .. } => {
-            // Will be implemented in US-007.
-            BrokerResponse::Ok {
-                payload: ResponsePayload::Ack {},
+        BrokerRequest::Send { to, body, from } => {
+            let mut state = state.lock().await;
+            match state.send_message(to.clone(), body, from) {
+                Some(message_id) => {
+                    tracing::info!(message_id = %message_id, to = %to, "message queued");
+                    BrokerResponse::Ok {
+                        payload: ResponsePayload::MessageAck { message_id },
+                    }
+                }
+                None => BrokerResponse::Error {
+                    message: format!("recipient worker not found or expired: {to}"),
+                },
             }
         }
         BrokerRequest::Listen { .. } => {
@@ -767,6 +800,186 @@ mod tests {
             resp["message"].as_str().unwrap().contains("not found"),
             "error message should mention worker not found"
         );
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn test_send_message_queues_in_mailbox() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![]);
+
+        let msg_id = state.send_message(worker_id.clone(), "hello".into(), Some("sender-1".into()));
+        assert!(msg_id.is_some(), "send_message should return a message ID");
+
+        let mailbox = state.mailboxes.get(&worker_id).unwrap();
+        assert_eq!(mailbox.len(), 1);
+        let msg = &mailbox[0];
+        assert_eq!(msg.message_id, msg_id.unwrap());
+        assert_eq!(msg.to, worker_id);
+        assert_eq!(msg.body, "hello");
+        assert_eq!(msg.from.as_deref(), Some("sender-1"));
+    }
+
+    #[test]
+    fn test_send_message_unknown_recipient() {
+        let mut state = BrokerState::new();
+        let result = state.send_message("nonexistent".into(), "hello".into(), None);
+        assert!(result.is_none(), "sending to unknown worker should fail");
+    }
+
+    #[test]
+    fn test_send_message_expired_recipient() {
+        let mut state = BrokerState::new();
+        let worker_id =
+            state.register_worker("expiring".into(), "role".into(), "desc".into(), vec![]);
+        state.workers.get_mut(&worker_id).unwrap().expires_at = 0;
+
+        let result = state.send_message(worker_id, "hello".into(), None);
+        assert!(result.is_none(), "sending to expired worker should fail");
+    }
+
+    #[test]
+    fn test_send_message_unique_ids() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![]);
+
+        let id1 = state
+            .send_message(worker_id.clone(), "msg1".into(), None)
+            .unwrap();
+        let id2 = state
+            .send_message(worker_id.clone(), "msg2".into(), None)
+            .unwrap();
+        assert_ne!(id1, id2, "each message should have a unique ID");
+        assert_eq!(state.mailboxes.get(&worker_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_send_message_without_from() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![]);
+
+        let msg_id = state
+            .send_message(worker_id.clone(), "anon msg".into(), None)
+            .unwrap();
+        let msg = &state.mailboxes.get(&worker_id).unwrap()[0];
+        assert_eq!(msg.message_id, msg_id);
+        assert!(msg.from.is_none(), "from should be None when not provided");
+    }
+
+    #[tokio::test]
+    async fn test_send_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "send-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "send-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        // Register a worker to receive the message.
+        let worker_id = register_worker(&sock, "receiver", "coder").await;
+
+        // Send a message.
+        let resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": worker_id,
+                "body": "build the feature",
+                "from": "planner-1"
+            }),
+        )
+        .await;
+        assert_eq!(resp["status"], "ok");
+        assert!(
+            resp["message_id"].is_string(),
+            "response should contain message_id"
+        );
+        let message_id = resp["message_id"].as_str().unwrap();
+        assert!(
+            uuid::Uuid::parse_str(message_id).is_ok(),
+            "message_id should be a valid UUID"
+        );
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_unknown_recipient_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "send-err-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "send-err-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        // Send to a non-existent worker.
+        let resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": "nonexistent-worker-id",
+                "body": "hello"
+            }),
+        )
+        .await;
+        assert_eq!(resp["status"], "error");
+        assert!(
+            resp["message"].as_str().unwrap().contains("not found"),
+            "error message should mention recipient not found"
+        );
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_multiple_messages_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "send-multi-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "send-multi-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        let worker_id = register_worker(&sock, "multi-recv", "coder").await;
+
+        // Send two messages.
+        let resp1 = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": worker_id,
+                "body": "first message"
+            }),
+        )
+        .await;
+        let resp2 = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": worker_id,
+                "body": "second message"
+            }),
+        )
+        .await;
+
+        assert_eq!(resp1["status"], "ok");
+        assert_eq!(resp2["status"], "ok");
+        let id1 = resp1["message_id"].as_str().unwrap();
+        let id2 = resp2["message_id"].as_str().unwrap();
+        assert_ne!(id1, id2, "each message should have a unique ID");
 
         serve_handle.abort();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

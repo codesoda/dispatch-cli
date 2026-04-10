@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A message queued in a worker's mailbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub message_id: String,
+    pub from: Option<String>,
+    pub to: String,
+    pub body: String,
+}
+
 /// A request sent from a client to the broker over the Unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
