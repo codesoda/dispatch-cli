@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tracing::instrument;
 
@@ -16,6 +17,86 @@ const DEFAULT_WORKER_TTL_SECS: u64 = 300;
 
 /// Default listen timeout in seconds.
 const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
+
+/// Local backend that uses a Unix domain socket for IPC.
+///
+/// The broker runs in-process with in-memory state. Clients connect
+/// over a UDS, send one JSON-line request, and receive one JSON-line
+/// response before the connection is closed.
+pub struct LocalBackend {
+    project_root: PathBuf,
+    cell_id: String,
+}
+
+impl LocalBackend {
+    pub fn new(project_root: &Path, cell_id: &str) -> Self {
+        Self {
+            project_root: project_root.to_path_buf(),
+            cell_id: cell_id.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl super::Backend for LocalBackend {
+    /// Start the broker server on a Unix domain socket, blocking until
+    /// a shutdown signal (SIGINT/SIGTERM) is received.
+    async fn serve(&self) -> Result<(), DispatchError> {
+        serve(&self.project_root, &self.cell_id).await
+    }
+
+    /// Send a request to the broker over a Unix domain socket and
+    /// return the response.
+    #[instrument(skip(self, request), fields(cell_id = %self.cell_id))]
+    async fn send_request(&self, request: &BrokerRequest) -> Result<BrokerResponse, DispatchError> {
+        let sock = socket_path(&self.project_root, &self.cell_id);
+
+        let stream = UnixStream::connect(&sock).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::ConnectionRefused
+            {
+                DispatchError::BrokerNotRunning {
+                    cell_id: self.cell_id.clone(),
+                }
+            } else {
+                DispatchError::ConnectionFailed {
+                    reason: e.to_string(),
+                }
+            }
+        })?;
+
+        let (reader, mut writer) = stream.into_split();
+
+        // Serialize and send the request as a single JSON line.
+        let mut request_bytes = serde_json::to_vec(request)?;
+        request_bytes.push(b'\n');
+        writer
+            .write_all(&request_bytes)
+            .await
+            .map_err(DispatchError::Io)?;
+
+        // Read the response line.
+        let mut reader = BufReader::new(reader);
+        let mut response_line = String::new();
+        let n = reader
+            .read_line(&mut response_line)
+            .await
+            .map_err(DispatchError::Io)?;
+
+        if n == 0 {
+            return Err(DispatchError::ConnectionFailed {
+                reason: "broker closed connection without responding".to_string(),
+            });
+        }
+
+        let response: BrokerResponse = serde_json::from_str(response_line.trim())?;
+        Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broker state
+// ---------------------------------------------------------------------------
 
 /// In-memory broker state.
 #[derive(Debug, Default)]
@@ -133,6 +214,10 @@ impl BrokerState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /// Get current Unix timestamp in seconds.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -144,7 +229,7 @@ fn now_secs() -> u64 {
 /// Derive the Unix domain socket path for a given cell identity.
 ///
 /// Socket is placed in `<project_root>/.dispatch/<cell_id>.sock`.
-pub fn socket_path(project_root: &Path, cell_id: &str) -> PathBuf {
+fn socket_path(project_root: &Path, cell_id: &str) -> PathBuf {
     project_root
         .join(".dispatch")
         .join(format!("{cell_id}.sock"))
@@ -152,13 +237,13 @@ pub fn socket_path(project_root: &Path, cell_id: &str) -> PathBuf {
 
 /// Check whether a broker is already running for this cell by testing
 /// if the socket file exists and a connection can be made.
-pub async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<(), DispatchError> {
+async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<(), DispatchError> {
     if !socket.exists() {
         return Ok(());
     }
 
     // Socket file exists — try to connect to see if a broker is actually listening.
-    match tokio::net::UnixStream::connect(socket).await {
+    match UnixStream::connect(socket).await {
         Ok(_) => Err(DispatchError::BrokerAlreadyRunning {
             cell_id: cell_id.to_string(),
             socket_path: socket.to_path_buf(),
@@ -171,6 +256,10 @@ pub async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<()
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
 
 /// Start the embedded broker server.
 ///
@@ -240,7 +329,7 @@ async fn accept_loop(
 ///
 /// Reads one JSON line, processes it, writes one JSON line response, then closes.
 async fn handle_connection(
-    stream: tokio::net::UnixStream,
+    stream: UnixStream,
     _state: Arc<Mutex<BrokerState>>,
 ) -> Result<(), DispatchError> {
     let (reader, mut writer) = stream.into_split();
@@ -419,11 +508,65 @@ async fn shutdown_signal() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // ---- Client-side tests (formerly in client.rs) ----
+
+    #[tokio::test]
+    async fn test_client_broker_not_running() {
+        let tmp = TempDir::new().unwrap();
+        let backend = LocalBackend::new(tmp.path(), "nonexistent-cell");
+
+        let result = backend.send_request(&BrokerRequest::Team).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            DispatchError::BrokerNotRunning { cell_id } => {
+                assert_eq!(cell_id, "nonexistent-cell");
+            }
+            other => panic!("expected BrokerNotRunning, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_send_and_receive() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "client-test";
+
+        // Start broker in background.
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "client-test").await });
+
+        // Wait for broker to start.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let backend = LocalBackend::new(&project_root, cell_id);
+        let response = backend.send_request(&BrokerRequest::Team).await;
+        assert!(response.is_ok(), "expected Ok response, got: {response:?}");
+
+        let resp = response.unwrap();
+        match resp {
+            BrokerResponse::Ok { .. } => {} // Expected
+            BrokerResponse::Error { message } => {
+                panic!("expected Ok response, got error: {message}");
+            }
+        }
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // ---- Broker-side tests (formerly in broker.rs) ----
 
     #[test]
     fn test_socket_path_derivation() {
@@ -503,7 +646,7 @@ mod tests {
         assert!(sock.exists(), "socket file should exist after startup");
 
         // Connect and send a request.
-        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let stream = UnixStream::connect(&sock).await.unwrap();
         let (reader, mut writer) = stream.into_split();
 
         writer.write_all(b"{\"type\":\"ping\"}\n").await.unwrap();
@@ -577,7 +720,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Should be able to connect.
-        let result = tokio::net::UnixStream::connect(&sock).await;
+        let result = UnixStream::connect(&sock).await;
         assert!(
             result.is_ok(),
             "should connect to fresh broker after stale cleanup"
@@ -660,7 +803,7 @@ mod tests {
 
         // Send register request via raw socket.
         let sock = socket_path(&project_root, cell_id);
-        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let stream = UnixStream::connect(&sock).await.unwrap();
         let (reader, mut writer) = stream.into_split();
 
         let req = serde_json::json!({
@@ -707,7 +850,7 @@ mod tests {
         let sock = socket_path(&project_root, "cap-test");
 
         // Register with capabilities using name:description convention.
-        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let stream = UnixStream::connect(&sock).await.unwrap();
         let (reader, mut writer) = stream.into_split();
 
         let req = serde_json::json!({
@@ -735,7 +878,7 @@ mod tests {
 
     /// Helper: send a JSON request to a broker socket and return the parsed response.
     async fn send_json_request(sock: &Path, request: &serde_json::Value) -> serde_json::Value {
-        let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+        let stream = UnixStream::connect(sock).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut req_bytes = serde_json::to_vec(request).unwrap();
         req_bytes.push(b'\n');

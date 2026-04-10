@@ -25,6 +25,9 @@ pub enum DispatchError {
     #[error("worker expired: {worker_id}")]
     WorkerExpired { worker_id: String },
 
+    #[error("unknown backend \"{name}\" -- only \"local\" is supported")]
+    UnknownBackend { name: String },
+
     #[error("connection failed: {reason}")]
     ConnectionFailed { reason: String },
 
