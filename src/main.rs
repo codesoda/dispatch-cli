@@ -2,8 +2,8 @@ use std::process;
 
 use clap::Parser;
 
+use dispatch::backend::create_backend;
 use dispatch::cli::{Cli, Commands};
-use dispatch::client::Client;
 use dispatch::config::resolve_config;
 use dispatch::logging::init_tracing;
 use dispatch::protocol::BrokerRequest;
@@ -26,12 +26,17 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
 
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
 
+    let backend = create_backend(
+        config.backend.as_deref(),
+        &config.project_root,
+        &config.cell_id,
+    )?;
+
     match cli.command {
         Commands::Serve => {
-            dispatch::broker::serve(&config.project_root, &config.cell_id).await?;
+            backend.serve().await?;
         }
         cmd => {
-            let client = Client::new(&config.project_root, &config.cell_id);
             let request = match cmd {
                 Commands::Serve => unreachable!(),
                 Commands::Register {
@@ -53,7 +58,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 },
                 Commands::Heartbeat { worker_id } => BrokerRequest::Heartbeat { worker_id },
             };
-            let response = client.send_request(&request).await?;
+            let response = backend.send_request(&request).await?;
             let json = serde_json::to_string(&response)?;
             println!("{json}");
         }

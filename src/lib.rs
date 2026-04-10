@@ -1,6 +1,5 @@
-pub mod broker;
+pub mod backend;
 pub mod cli;
-pub mod client;
 pub mod config;
 pub mod errors;
 pub mod logging;
