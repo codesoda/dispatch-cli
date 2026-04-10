@@ -27,6 +27,7 @@
 - `send_message()` calls `notify.notify_one()` after queuing — wakes any long-polling `listen` handler
 - `Listen` handler renews worker TTL implicitly — no separate heartbeat needed during listen loops
 - `pop_message()` pops front of VecDeque for FIFO ordering
+- Example scripts go in `examples/` — shell scripts should be executable, have `--help`, and use `dispatch send` (not internal APIs)
 
 ---
 
@@ -131,4 +132,15 @@
   - The `dispatch team | jq` pattern is the way to discover worker IDs by role for scripting
   - Worker listen loop pattern: `while true; dispatch listen; parse body with jq; case on .type; done`
   - US-009 is documentation-only — no Rust code changes, so all existing tests continue to pass
+---
+
+## 2026-04-10 - US-010
+- What was implemented: Filesystem watcher reference script in `examples/watch-files.sh` using `fswatch` for cross-platform file monitoring, with debounce tracking via associative array, file-level stale messages for individual file changes, folder-level refresh messages for directory changes, argument parsing for worker-id/debounce/from options, color/TTY detection for stderr output. Added comprehensive watcher documentation to README with prerequisites, quick start, connection guide, and options table.
+- Files changed: examples/watch-files.sh (new), README.md
+- **Learnings for future iterations:**
+  - `fswatch --latency N` provides its own batching window that complements the script-level debounce
+  - Bash associative arrays (`declare -A`) work for simple debounce tracking — maps scope to last-sent epoch
+  - `bash -n` is sufficient for syntax checking shell scripts; shellcheck would be nice-to-have but not required
+  - US-010 is shell-script-only — no Rust code changes, so `cargo build`/`cargo test` pass without modification
+  - The `dispatch team | jq -r '.workers[] | select(.role == "...") | .id'` pattern is the standard way to discover worker IDs for scripts
 ---

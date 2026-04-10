@@ -166,3 +166,8 @@ lto = true
 - Use `deny_unknown_fields` on all config structs
 - Keep modules focused: one responsibility per file
 - Command handlers return `Result<()>`, `main.rs` converts errors to stderr + non-zero exit
+
+### Ralph Workflow
+
+- After completing each step, push commits to `main` immediately
+- Do not accumulate changes across steps — commit and push after every step
