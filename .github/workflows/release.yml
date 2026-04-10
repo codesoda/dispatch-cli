@@ -25,7 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Rust checks
-        run: cargo fmt --check && cargo clippy -- -D warnings && cargo build --locked && cargo test --locked
+        run: cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build --all-targets --locked && cargo test --locked
 
   build:
     name: Build ${{ matrix.target }}
@@ -86,7 +86,6 @@ jobs:
           sha256sum *.tar.gz > checksums-sha256.txt
 
       - name: Extract changelog for release
-        id: changelog
         run: |
           tag="${GITHUB_REF#refs/tags/}"
           version="${tag#v}"
