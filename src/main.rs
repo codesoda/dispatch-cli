@@ -26,7 +26,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
 
     match cli.command {
         Commands::Serve => {
-            eprintln!("dispatch serve: cell_id={}", config.cell_id);
+            dispatch::broker::serve(&config.project_root, &config.cell_id).await?;
         }
         Commands::Register {
             name,
