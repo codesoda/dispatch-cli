@@ -3,6 +3,7 @@ use std::process;
 use clap::Parser;
 
 use dispatch::cli::{Cli, Commands};
+use dispatch::config::resolve_config;
 use dispatch::logging::init_tracing;
 
 #[tokio::main]
@@ -18,9 +19,14 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
+    let cwd = std::env::current_dir().map_err(dispatch::errors::DispatchError::Io)?;
+    let config = resolve_config(cli.cell_id.as_deref(), &cwd)?;
+
+    tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
+
     match cli.command {
         Commands::Serve => {
-            eprintln!("dispatch serve: not yet implemented");
+            eprintln!("dispatch serve: cell_id={}", config.cell_id);
         }
         Commands::Register {
             name,
