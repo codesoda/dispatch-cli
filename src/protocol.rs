@@ -64,19 +64,13 @@ pub struct Worker {
 }
 
 /// The payload inside a successful response, varies by request type.
+///
+/// **Variant order matters**: serde tries untagged variants in declaration order.
+/// More-specific variants (with fields) must come before `Ack {}` which matches
+/// any object. `Ack` must be last or it will swallow every response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponsePayload {
-    /// Generic acknowledgement with no extra data.
-    Ack {},
-    /// A worker was registered; returns the assigned worker ID.
-    WorkerRegistered { worker_id: String },
-    /// List of active workers.
-    WorkerList { workers: Vec<Worker> },
-    /// A message delivered or queued.
-    MessageAck { message_id: String },
-    /// Heartbeat renewed.
-    HeartbeatAck { worker_id: String, expires_at: u64 },
     /// A message received from listen.
     Message {
         message_id: String,
@@ -84,10 +78,20 @@ pub enum ResponsePayload {
         to: String,
         body: String,
     },
+    /// Heartbeat renewed.
+    HeartbeatAck { worker_id: String, expires_at: u64 },
+    /// List of active workers.
+    WorkerList { workers: Vec<Worker> },
+    /// A worker was registered; returns the assigned worker ID.
+    WorkerRegistered { worker_id: String },
+    /// A message delivered or queued.
+    MessageAck { message_id: String },
     /// Listen timed out with no messages.
     Timeout { worker_id: String },
     /// Map of arbitrary key-value data (used as a flexible response shape).
     Data {
         data: HashMap<String, serde_json::Value>,
     },
+    /// Generic acknowledgement with no extra data. Must be last — matches any object.
+    Ack {},
 }

@@ -206,3 +206,68 @@ REVIEWER=$(dispatch team | jq -r '.workers[] | select(.role == "code.reviewer") 
 - **Any process can send control messages.** File watchers, CI pipelines, git hooks, or other workers can all use `dispatch send`.
 - **Workers define their own reaction.** One worker might drop a cache entry; another might re-run an entire analysis pipeline. Dispatch doesn't prescribe behavior.
 - **The `scope` field is free-form.** Use file paths, directory paths, module names, or any identifier meaningful to the worker.
+
+## Multi-Role Workflow Example
+
+The `examples/workflow.sh` script demonstrates a complete coding workflow with 5 workers coordinating in a single cell:
+
+| Worker | Role | Responsibility |
+|--------|------|----------------|
+| planner | `planner` | Breaks down tasks into implementation plans |
+| implementer | `code.implementer` | Writes code based on plans |
+| reviewer | `code.reviewer` | Reviews code for quality and correctness |
+| test-runner | `test.runner` | Runs tests and reports results |
+| shipper | `code.shipper` | Ships approved and tested code |
+
+### Pipeline Flow
+
+```
+caller -> planner -> implementer -> reviewer -> test.runner -> shipper
+            |            |             |            |            |
+         plan task    write code    review it    run tests     ship it
+```
+
+### Running the Example
+
+```bash
+# Build dispatch first
+cargo build --release
+
+# Run the full workflow
+./examples/workflow.sh
+```
+
+The script handles everything automatically:
+
+1. Starts the broker (`dispatch serve`)
+2. Registers all 5 workers with their roles and capabilities
+3. Each worker enters a `dispatch listen` loop waiting for work
+4. A caller sends a task to the planner to kick off the pipeline
+5. Each worker processes its message and passes the result to the next worker
+6. The pipeline completes when the shipper finishes
+
+### How It Works
+
+- **No permission model.** Worker behavior comes from how the process is launched, not from Dispatch enforcing roles. The planner sends to the implementer because the script tells it to, not because Dispatch restricts messaging.
+- **No external broker.** Everything runs on one machine using the embedded Unix domain socket broker.
+- **Workers are independent processes.** Each worker runs in a background subshell with its own listen loop. They communicate only through `dispatch send` and `dispatch listen`.
+- **Messages carry the workflow state.** Each worker receives context from the previous stage (the plan, the implementation, the review verdict, the test results) as a JSON message body.
+
+### Extending the Workflow
+
+To add a new stage (e.g., a linter between implementer and reviewer):
+
+```bash
+# Register the new worker
+LINTER_ID=$(dispatch register \
+  --name linter \
+  --role code.linter \
+  --description "Lints code for style issues" \
+  | jq -r '.worker_id')
+
+# In the implementer, send to linter instead of reviewer
+dispatch send --to "$LINTER_ID" --from "$IMPLEMENTER_ID" --body "$implementation"
+
+# In the linter, forward to reviewer after checking
+dispatch send --to "$REVIEWER_ID" --from "$LINTER_ID" --body "$lint_result"
+```
