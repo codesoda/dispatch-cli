@@ -355,6 +355,19 @@ fn listen_times_out_with_no_messages() {
     let json: serde_json::Value = serde_json::from_slice(&listen_out).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["worker_id"], worker_id);
+    // Confirm this is a timeout response, not a message or heartbeat ack.
+    assert!(
+        json.get("body").is_none(),
+        "timeout should not contain body"
+    );
+    assert!(
+        json.get("message_id").is_none(),
+        "timeout should not contain message_id"
+    );
+    assert!(
+        json.get("expires_at").is_none(),
+        "timeout should not contain expires_at"
+    );
 
     broker.kill().ok();
     broker.wait().ok();
