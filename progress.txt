@@ -22,6 +22,11 @@
 - `BrokerState.mailboxes` is `HashMap<String, VecDeque<Message>>` — `send_message()` queues messages per worker
 - `Message` struct in `protocol.rs`: message_id, from (optional), to, body
 - `send_message()` evicts expired workers first, returns None if recipient not found
+- `BrokerState.notifiers` is `HashMap<String, Arc<Notify>>` — `get_notifier()` returns per-worker Notify handle
+- Long-poll pattern: lock state, check mailbox, get notifier, unlock, then `tokio::time::timeout(notifier.notified())` to wait
+- `send_message()` calls `notify.notify_one()` after queuing — wakes any long-polling `listen` handler
+- `Listen` handler renews worker TTL implicitly — no separate heartbeat needed during listen loops
+- `pop_message()` pops front of VecDeque for FIFO ordering
 
 ---
 
@@ -104,4 +109,16 @@
   - Mailboxes are created lazily via `entry().or_default()` — no need to pre-create on worker registration
   - `ResponsePayload::MessageAck` returns `message_id` — the client can use this to correlate acknowledgements
   - 8 new tests: 5 unit (queuing, unknown, expired, unique IDs, no-from) + 3 integration (send via broker, unknown recipient via broker, multiple messages via broker)
+---
+
+## 2026-04-10 - US-008
+- What was implemented: Listen loop with long-poll — `BrokerState.notifiers` HashMap with per-worker `Arc<Notify>` for wakeup signaling, `pop_message()` method for FIFO mailbox consumption, `get_notifier()` for per-worker Notify handle creation, `send_message()` now calls `notify_one()` after queuing, Listen handler with immediate delivery (if message already queued), long-poll wait via `tokio::time::timeout` + `Notify::notified()`, implicit TTL renewal on listen, distinct JSON shapes for message vs timeout responses
+- Files changed: src/broker.rs
+- **Learnings for future iterations:**
+  - `tokio::sync::Notify` is the right primitive for long-poll wakeup — `notify_one()` stores a permit so the waiter wakes even if notification happens between lock release and `notified().await`
+  - Must release the Mutex lock before awaiting the Notify — otherwise `send_message` can't acquire the lock to queue the message and notify
+  - Pattern: lock → check mailbox → get notifier → drop lock → await notifier with timeout → re-lock → pop message
+  - `Notify` doesn't have `try_recv` — use `Arc::ptr_eq` to test notifier identity instead
+  - Timeout of 0 falls back to DEFAULT_LISTEN_TIMEOUT_SECS (30s) to avoid instant return
+  - 10 new tests: 4 unit (pop FIFO, empty mailbox, unknown worker, notifier identity) + 6 integration (immediate delivery, timeout, long-poll delivery, TTL renewal, unknown worker error, FIFO ordering)
 ---

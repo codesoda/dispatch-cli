@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::instrument;
 
 use crate::errors::DispatchError;
@@ -14,6 +14,9 @@ use crate::protocol::{BrokerRequest, BrokerResponse, Message, ResponsePayload, W
 /// Default worker TTL in seconds (5 minutes).
 const DEFAULT_WORKER_TTL_SECS: u64 = 300;
 
+/// Default listen timeout in seconds.
+const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
+
 /// In-memory broker state.
 #[derive(Debug, Default)]
 pub struct BrokerState {
@@ -21,6 +24,8 @@ pub struct BrokerState {
     pub workers: HashMap<String, Worker>,
     /// Per-worker message mailboxes keyed by worker ID.
     pub mailboxes: HashMap<String, VecDeque<Message>>,
+    /// Per-worker notification channels for long-poll wakeup.
+    pub notifiers: HashMap<String, Arc<Notify>>,
 }
 
 impl BrokerState {
@@ -93,8 +98,28 @@ impl BrokerState {
             to: to.clone(),
             body,
         };
-        self.mailboxes.entry(to).or_default().push_back(message);
+        self.mailboxes
+            .entry(to.clone())
+            .or_default()
+            .push_back(message);
+        // Wake any long-polling listener for this worker.
+        if let Some(notify) = self.notifiers.get(&to) {
+            notify.notify_one();
+        }
         Some(message_id)
+    }
+
+    /// Pop the next message from a worker's mailbox, if any.
+    pub fn pop_message(&mut self, worker_id: &str) -> Option<Message> {
+        self.mailboxes.get_mut(worker_id)?.pop_front()
+    }
+
+    /// Get or create the Notify handle for a worker's mailbox.
+    pub fn get_notifier(&mut self, worker_id: &str) -> Arc<Notify> {
+        self.notifiers
+            .entry(worker_id.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
     }
 }
 
@@ -278,10 +303,77 @@ async fn handle_request(request: BrokerRequest, state: Arc<Mutex<BrokerState>>) 
                 },
             }
         }
-        BrokerRequest::Listen { .. } => {
-            // Will be implemented in US-008.
-            BrokerResponse::Ok {
-                payload: ResponsePayload::Ack {},
+        BrokerRequest::Listen {
+            worker_id,
+            timeout_secs,
+        } => {
+            let timeout = if timeout_secs == 0 {
+                DEFAULT_LISTEN_TIMEOUT_SECS
+            } else {
+                timeout_secs
+            };
+
+            // Check worker exists and renew TTL; get notifier and try immediate pop.
+            let (notifier, immediate_msg) = {
+                let mut s = state.lock().await;
+                s.evict_expired();
+                if !s.workers.contains_key(&worker_id) {
+                    return BrokerResponse::Error {
+                        message: format!("worker not found or expired: {worker_id}"),
+                    };
+                }
+                // Renew TTL on listen.
+                if let Some(w) = s.workers.get_mut(&worker_id) {
+                    w.expires_at = now_secs() + DEFAULT_WORKER_TTL_SECS;
+                }
+                let notifier = s.get_notifier(&worker_id);
+                let msg = s.pop_message(&worker_id);
+                (notifier, msg)
+            };
+
+            // If a message was immediately available, return it.
+            if let Some(msg) = immediate_msg {
+                tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: immediate delivery");
+                return BrokerResponse::Ok {
+                    payload: ResponsePayload::Message {
+                        message_id: msg.message_id,
+                        from: msg.from,
+                        to: msg.to,
+                        body: msg.body,
+                    },
+                };
+            }
+
+            // Long-poll: wait for a notification or timeout.
+            let result =
+                tokio::time::timeout(Duration::from_secs(timeout), notifier.notified()).await;
+
+            if result.is_ok() {
+                // Notified — try to pop a message.
+                let mut s = state.lock().await;
+                if let Some(msg) = s.pop_message(&worker_id) {
+                    tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: delivered after wait");
+                    BrokerResponse::Ok {
+                        payload: ResponsePayload::Message {
+                            message_id: msg.message_id,
+                            from: msg.from,
+                            to: msg.to,
+                            body: msg.body,
+                        },
+                    }
+                } else {
+                    // Spurious wake — treat as timeout.
+                    tracing::debug!(worker_id = %worker_id, "listen: spurious wake, returning timeout");
+                    BrokerResponse::Ok {
+                        payload: ResponsePayload::Timeout { worker_id },
+                    }
+                }
+            } else {
+                // Timed out.
+                tracing::debug!(worker_id = %worker_id, timeout, "listen: timed out");
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::Timeout { worker_id },
+                }
             }
         }
         BrokerRequest::Heartbeat { worker_id } => {
@@ -936,6 +1028,302 @@ mod tests {
             resp["message"].as_str().unwrap().contains("not found"),
             "error message should mention recipient not found"
         );
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // ---- Listen tests ----
+
+    #[test]
+    fn test_pop_message_returns_fifo_order() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![]);
+        state.send_message(worker_id.clone(), "first".into(), None);
+        state.send_message(worker_id.clone(), "second".into(), None);
+
+        let msg1 = state.pop_message(&worker_id).unwrap();
+        assert_eq!(msg1.body, "first");
+        let msg2 = state.pop_message(&worker_id).unwrap();
+        assert_eq!(msg2.body, "second");
+        assert!(state.pop_message(&worker_id).is_none());
+    }
+
+    #[test]
+    fn test_pop_message_empty_mailbox() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![]);
+        assert!(state.pop_message(&worker_id).is_none());
+    }
+
+    #[test]
+    fn test_pop_message_unknown_worker() {
+        let mut state = BrokerState::new();
+        assert!(state.pop_message("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_notifier_returns_same_instance() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![]);
+        let n1 = state.get_notifier(&worker_id);
+        let n2 = state.get_notifier(&worker_id);
+        assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");
+    }
+
+    #[tokio::test]
+    async fn test_listen_immediate_delivery_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "listen-imm-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "listen-imm-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        // Register a worker and send a message before listening.
+        let worker_id = register_worker(&sock, "listener", "coder").await;
+        let send_resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": worker_id,
+                "body": "immediate msg",
+                "from": "sender-1"
+            }),
+        )
+        .await;
+        assert_eq!(send_resp["status"], "ok");
+
+        // Listen should immediately return the queued message.
+        let listen_resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "listen",
+                "worker_id": worker_id,
+                "timeout_secs": 5
+            }),
+        )
+        .await;
+        assert_eq!(listen_resp["status"], "ok");
+        assert_eq!(listen_resp["body"], "immediate msg");
+        assert_eq!(listen_resp["from"], "sender-1");
+        assert_eq!(listen_resp["to"], worker_id);
+        assert!(listen_resp["message_id"].is_string());
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_timeout_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "listen-to-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "listen-to-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        let worker_id = register_worker(&sock, "waiter", "coder").await;
+
+        // Listen with a very short timeout and no messages queued.
+        let listen_resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "listen",
+                "worker_id": worker_id,
+                "timeout_secs": 1
+            }),
+        )
+        .await;
+        assert_eq!(listen_resp["status"], "ok");
+        assert_eq!(
+            listen_resp["worker_id"], worker_id,
+            "timeout response should contain worker_id"
+        );
+        // Timeout response should NOT have a message_id or body.
+        assert!(
+            listen_resp.get("message_id").is_none() || listen_resp["message_id"].is_null(),
+            "timeout should not have message_id"
+        );
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_long_poll_delivery_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "listen-lp-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "listen-lp-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        let worker_id = register_worker(&sock, "poller", "coder").await;
+
+        // Start listening in a background task — message arrives after a delay.
+        let sock_clone = sock.clone();
+        let wid = worker_id.clone();
+        let listen_handle = tokio::spawn(async move {
+            send_json_request(
+                &sock_clone,
+                &serde_json::json!({
+                    "type": "listen",
+                    "worker_id": wid,
+                    "timeout_secs": 10
+                }),
+            )
+            .await
+        });
+
+        // Wait a bit, then send a message.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let send_resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": worker_id,
+                "body": "delayed message"
+            }),
+        )
+        .await;
+        assert_eq!(send_resp["status"], "ok");
+
+        // The listen should return the message.
+        let listen_resp = listen_handle.await.unwrap();
+        assert_eq!(listen_resp["status"], "ok");
+        assert_eq!(listen_resp["body"], "delayed message");
+        assert!(listen_resp["message_id"].is_string());
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_renews_worker_ttl_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "listen-ttl-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "listen-ttl-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        let worker_id = register_worker(&sock, "ttl-worker", "coder").await;
+
+        // Send a message so listen returns immediately.
+        send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "send",
+                "to": worker_id,
+                "body": "ttl test"
+            }),
+        )
+        .await;
+
+        // Listen (which should renew TTL).
+        let listen_resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "listen",
+                "worker_id": worker_id,
+                "timeout_secs": 5
+            }),
+        )
+        .await;
+        assert_eq!(listen_resp["status"], "ok");
+        assert_eq!(listen_resp["body"], "ttl test");
+
+        // Worker should still be active in team listing.
+        let team_resp = send_json_request(&sock, &serde_json::json!({"type": "team"})).await;
+        let workers = team_resp["workers"].as_array().unwrap();
+        let found = workers.iter().any(|w| w["id"] == worker_id);
+        assert!(found, "worker should still be active after listen");
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_unknown_worker_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "listen-err-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "listen-err-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        let resp = send_json_request(
+            &sock,
+            &serde_json::json!({
+                "type": "listen",
+                "worker_id": "nonexistent-id",
+                "timeout_secs": 1
+            }),
+        )
+        .await;
+        assert_eq!(resp["status"], "error");
+        assert!(resp["message"].as_str().unwrap().contains("not found"));
+
+        serve_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_fifo_ordering_via_broker() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let cell_id = "listen-fifo-test";
+
+        let root = project_root.clone();
+        let serve_handle = tokio::spawn(async move { serve(&root, "listen-fifo-test").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sock = socket_path(&project_root, cell_id);
+
+        let worker_id = register_worker(&sock, "fifo-worker", "coder").await;
+
+        // Send two messages.
+        send_json_request(
+            &sock,
+            &serde_json::json!({"type": "send", "to": worker_id, "body": "first"}),
+        )
+        .await;
+        send_json_request(
+            &sock,
+            &serde_json::json!({"type": "send", "to": worker_id, "body": "second"}),
+        )
+        .await;
+
+        // Listen should return them in FIFO order.
+        let r1 = send_json_request(
+            &sock,
+            &serde_json::json!({"type": "listen", "worker_id": worker_id, "timeout_secs": 1}),
+        )
+        .await;
+        let r2 = send_json_request(
+            &sock,
+            &serde_json::json!({"type": "listen", "worker_id": worker_id, "timeout_secs": 1}),
+        )
+        .await;
+
+        assert_eq!(r1["body"], "first");
+        assert_eq!(r2["body"], "second");
 
         serve_handle.abort();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
