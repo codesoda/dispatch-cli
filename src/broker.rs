@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::errors::DispatchError;
+use crate::protocol::{BrokerRequest, BrokerResponse, ResponsePayload};
 
 /// In-memory broker state.
 #[derive(Debug, Default)]
@@ -137,11 +138,12 @@ async fn handle_connection(
     let line = line.trim();
     tracing::debug!(request = %line, "received request");
 
-    // For now, echo back an acknowledgement. Real handlers will be added in US-004+.
-    let response = serde_json::json!({
-        "status": "error",
-        "message": "unknown request"
-    });
+    let response = match serde_json::from_str::<BrokerRequest>(line) {
+        Ok(request) => handle_request(request, _state).await,
+        Err(e) => BrokerResponse::Error {
+            message: format!("invalid request: {e}"),
+        },
+    };
 
     let mut response_bytes = serde_json::to_vec(&response)?;
     response_bytes.push(b'\n');
@@ -151,6 +153,42 @@ async fn handle_connection(
         .map_err(DispatchError::Io)?;
 
     Ok(())
+}
+
+/// Route a parsed request to the appropriate handler.
+async fn handle_request(request: BrokerRequest, _state: Arc<Mutex<BrokerState>>) -> BrokerResponse {
+    match request {
+        BrokerRequest::Register { .. } => {
+            // Will be implemented in US-005.
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
+            }
+        }
+        BrokerRequest::Team => {
+            // Will be implemented in US-006.
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
+            }
+        }
+        BrokerRequest::Send { .. } => {
+            // Will be implemented in US-007.
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
+            }
+        }
+        BrokerRequest::Listen { .. } => {
+            // Will be implemented in US-008.
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
+            }
+        }
+        BrokerRequest::Heartbeat { .. } => {
+            // Will be implemented in US-006.
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
+            }
+        }
+    }
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
@@ -260,7 +298,8 @@ mod tests {
         reader.read_line(&mut response).await.unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(parsed["status"], "error"); // No handlers yet.
+        // Unrecognized request type returns an error.
+        assert_eq!(parsed["status"], "error");
 
         // Clean up: abort the server.
         serve_handle.abort();
