@@ -122,3 +122,13 @@
   - Timeout of 0 falls back to DEFAULT_LISTEN_TIMEOUT_SECS (30s) to avoid instant return
   - 10 new tests: 4 unit (pop FIFO, empty mailbox, unknown worker, notifier identity) + 6 integration (immediate delivery, timeout, long-poll delivery, TTL renewal, unknown worker error, FIFO ordering)
 ---
+
+## 2026-04-10 - US-009
+- What was implemented: README.md with project overview, quick start, architecture section, commands table, configuration section, and comprehensive stale/refresh control message documentation including JSON body convention, sending stale messages (file-level), sending refresh messages (folder-level), a worker listen loop reacting to control messages, and key design points (broker doesn't inspect bodies, any process can send, workers define their own reactions)
+- Files changed: README.md (new)
+- **Learnings for future iterations:**
+  - Stale/refresh are purely conventional — JSON body with `{"type":"stale"|"refresh","scope":"...","reason":"..."}`, broker never inspects message bodies
+  - The `dispatch team | jq` pattern is the way to discover worker IDs by role for scripting
+  - Worker listen loop pattern: `while true; dispatch listen; parse body with jq; case on .type; done`
+  - US-009 is documentation-only — no Rust code changes, so all existing tests continue to pass
+---
