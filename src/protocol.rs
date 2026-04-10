@@ -95,3 +95,106 @@ pub enum ResponsePayload {
     /// Generic acknowledgement with no extra data. Must be last — matches any object.
     Ack {},
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify each BrokerRequest variant survives a JSON round-trip.
+    #[test]
+    fn request_round_trip() {
+        let cases = vec![
+            BrokerRequest::Register {
+                name: "w1".into(),
+                role: "builder".into(),
+                description: "test".into(),
+                capabilities: vec!["rust".into()],
+            },
+            BrokerRequest::Team,
+            BrokerRequest::Send {
+                to: "w1".into(),
+                body: "hello".into(),
+                from: Some("w2".into()),
+            },
+            BrokerRequest::Listen {
+                worker_id: "w1".into(),
+                timeout_secs: 30,
+            },
+            BrokerRequest::Heartbeat {
+                worker_id: "w1".into(),
+            },
+        ];
+        for req in &cases {
+            let json = serde_json::to_string(req).expect("serialize request");
+            let back: BrokerRequest = serde_json::from_str(&json).expect("deserialize request");
+            assert_eq!(
+                serde_json::to_value(req).unwrap(),
+                serde_json::to_value(&back).unwrap(),
+            );
+        }
+    }
+
+    /// Verify each ResponsePayload variant survives a round-trip when wrapped
+    /// in BrokerResponse::Ok, ensuring the untagged enum deserialises to the
+    /// correct variant.
+    #[test]
+    fn response_round_trip() {
+        let payloads = vec![
+            ResponsePayload::WorkerRegistered {
+                worker_id: "abc".into(),
+            },
+            ResponsePayload::MessageAck {
+                message_id: "msg-1".into(),
+            },
+            ResponsePayload::WorkerList {
+                workers: vec![Worker {
+                    id: "w1".into(),
+                    name: "worker-1".into(),
+                    role: "builder".into(),
+                    description: "test worker".into(),
+                    capabilities: vec![],
+                    expires_at: 1000,
+                }],
+            },
+            ResponsePayload::HeartbeatAck {
+                worker_id: "w1".into(),
+                expires_at: 2000,
+            },
+            ResponsePayload::Message {
+                message_id: "m1".into(),
+                from: Some("w2".into()),
+                to: "w1".into(),
+                body: "payload".into(),
+            },
+            ResponsePayload::Timeout {
+                worker_id: "w1".into(),
+            },
+            ResponsePayload::Ack {},
+        ];
+        for payload in payloads {
+            let resp = BrokerResponse::Ok {
+                payload: payload.clone(),
+            };
+            let json = serde_json::to_string(&resp).expect("serialize response");
+            let back: BrokerResponse = serde_json::from_str(&json).expect("deserialize response");
+            assert_eq!(
+                serde_json::to_value(&resp).unwrap(),
+                serde_json::to_value(&back).unwrap(),
+            );
+        }
+    }
+
+    /// BrokerResponse::Error round-trips correctly.
+    #[test]
+    fn error_response_round_trip() {
+        let resp = BrokerResponse::Error {
+            message: "not found".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: BrokerResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            serde_json::to_value(&back).unwrap(),
+        );
+    }
+}

@@ -55,10 +55,20 @@ impl BrokerState {
         id
     }
 
-    /// Remove workers whose TTL has expired.
+    /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
     pub fn evict_expired(&mut self) {
         let now = now_secs();
-        self.workers.retain(|_, w| w.expires_at > now);
+        let expired_ids: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| w.expires_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired_ids {
+            self.workers.remove(id);
+            self.mailboxes.remove(id);
+            self.notifiers.remove(id);
+        }
     }
 
     /// Return a list of all active (non-expired) workers.
