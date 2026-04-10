@@ -146,6 +146,60 @@ while true; do
 done
 ```
 
+## Filesystem Watcher
+
+The `examples/watch-files.sh` script demonstrates how to observe filesystem changes and send stale/refresh messages through the Dispatch CLI. It uses [fswatch](https://emcrisostomo.github.io/fswatch/) to monitor paths and includes built-in debouncing to avoid flooding workers with rapid-fire events.
+
+### Prerequisites
+
+- `fswatch` — `brew install fswatch` (macOS) or `apt install fswatch` (Linux)
+- `jq` — `brew install jq` (macOS) or `apt install jq` (Linux)
+- `dispatch` CLI on PATH
+
+### Quick Start
+
+```bash
+# Start the broker
+dispatch serve &
+
+# Register a worker
+WORKER_ID=$(dispatch register --name reviewer --role code.reviewer --description "Reviews code" | jq -r '.worker_id')
+
+# Start the watcher pointing at the worker
+./examples/watch-files.sh --worker-id "$WORKER_ID" --from file-watcher src/
+```
+
+### How It Works
+
+1. The watcher monitors one or more filesystem paths using `fswatch`
+2. When a **file** changes, it sends a **stale** message with the file path as scope
+3. When a **directory** changes, it sends a **refresh** message with the directory path as scope
+4. A debounce window (default: 2 seconds) prevents duplicate messages for rapid edits
+5. Messages are sent via `dispatch send` — no internal broker APIs are used
+
+### Connecting to a Specific Worker
+
+Use `dispatch team` to find workers by role, then pass the ID to the watcher:
+
+```bash
+# Find the code reviewer's worker ID
+REVIEWER=$(dispatch team | jq -r '.workers[] | select(.role == "code.reviewer") | .id')
+
+# Watch src/ and notify the reviewer of changes
+./examples/watch-files.sh --worker-id "$REVIEWER" --from file-watcher src/
+
+# Watch specific files with a longer debounce
+./examples/watch-files.sh --worker-id "$REVIEWER" --debounce 5 --from file-watcher src/main.rs src/lib.rs
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--worker-id ID` | (required) | Target worker to notify |
+| `--debounce SECS` | `2` | Seconds to wait before sending |
+| `--from NAME` | `file-watcher` | Sender identity in messages |
+
 ### Key Points
 
 - **Dispatch does not inspect message bodies.** The `stale`/`refresh` convention is purely between senders and receivers.
