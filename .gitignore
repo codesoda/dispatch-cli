@@ -1,4 +1,5 @@
 tasks
 scripts
 target/
-.claude
+/.claude
+dispatch.config.toml

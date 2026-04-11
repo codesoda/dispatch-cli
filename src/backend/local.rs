@@ -228,11 +228,13 @@ fn now_secs() -> u64 {
 
 /// Derive the Unix domain socket path for a given cell identity.
 ///
-/// Socket is placed in `<project_root>/.dispatch/<cell_id>.sock`.
-fn socket_path(project_root: &Path, cell_id: &str) -> PathBuf {
-    project_root
-        .join(".dispatch")
-        .join(format!("{cell_id}.sock"))
+/// Socket is placed in `/tmp/dispatch-cli/sockets/<cell_id>.sock`.
+/// The cell_id already encodes the project identity (hashed canonical path),
+/// so no additional path components are needed. Using `/tmp` avoids the
+/// Unix domain socket `SUN_LEN` limit (104 bytes on macOS) that triggers
+/// when project paths are deeply nested.
+fn socket_path(_project_root: &Path, cell_id: &str) -> PathBuf {
+    PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"))
 }
 
 /// Check whether a broker is already running for this cell by testing
@@ -573,7 +575,7 @@ mod tests {
         let path = socket_path(Path::new("/home/user/project"), "cell-abc123");
         assert_eq!(
             path,
-            PathBuf::from("/home/user/project/.dispatch/cell-abc123.sock")
+            PathBuf::from("/tmp/dispatch-cli/sockets/cell-abc123.sock")
         );
     }
 
@@ -710,6 +712,9 @@ mod tests {
 
         // Create socket directory and a stale socket file.
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        // Remove any leftover real socket from a previous run before
+        // creating a fake stale file.
+        let _ = std::fs::remove_file(&sock);
         std::fs::write(&sock, "stale").unwrap();
 
         // Starting serve should clean up the stale socket and bind fresh.

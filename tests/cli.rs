@@ -8,6 +8,12 @@ use tempfile::TempDir;
 /// Start a `dispatch serve` broker as a background process in the given
 /// temp directory with the given cell ID. Returns the child process handle.
 fn start_broker(dir: &TempDir, cell_id: &str) -> Child {
+    // Remove any stale socket from a previous test run so the broker
+    // can bind cleanly.
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+    let _ = std::fs::remove_file(&socket);
+
     let mut child = Command::cargo_bin("dispatch")
         .unwrap()
         .arg("--cell-id")
@@ -18,9 +24,6 @@ fn start_broker(dir: &TempDir, cell_id: &str) -> Child {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("failed to start broker");
-
-    // Wait for the socket to appear.
-    let socket = dir.path().join(".dispatch").join(format!("{cell_id}.sock"));
     for _ in 0..50 {
         if socket.exists() {
             return child;
@@ -66,7 +69,8 @@ fn serve_creates_socket_file() {
     let cell_id = "test-serve-socket";
 
     let mut broker = start_broker(&dir, cell_id);
-    let socket = dir.path().join(".dispatch").join(format!("{cell_id}.sock"));
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
     assert!(
         socket.exists(),
         "socket file should exist while broker runs"
