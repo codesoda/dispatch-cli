@@ -2,12 +2,31 @@
 
 Multi-agent, multi-vendor orchestration system. A project-local CLI and embedded broker for coordinating long-lived agent sessions and lightweight scripts inside a single cell.
 
+## Install
+
+### Pre-built binary (macOS / Linux)
+
+```sh
+curl -sSf https://raw.githubusercontent.com/codesoda/dispatch-cli/main/install.sh | sh
+```
+
+Downloads the latest release binary from GitHub, verifies the checksum, and installs to `~/.dispatch/bin/`.
+
+### From a clone (requires Rust)
+
+```sh
+git clone https://github.com/codesoda/dispatch-cli.git
+cd dispatch-cli
+./install.sh
+```
+
+Builds from source with `cargo build --release`.
+
+Both methods symlink into `~/.local/bin/` by default. Pass `--skip-symlink` to opt out. Run `./install.sh --help` for all options and environment overrides.
+
 ## Quick Start
 
 ```bash
-# Build
-cargo build --release
-
 # Start the broker (in a separate terminal)
 dispatch serve
 
