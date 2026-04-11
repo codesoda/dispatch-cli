@@ -159,14 +159,18 @@ detect_target() {
     arch="$(uname -m)"
 
     case "$os" in
-        Darwin) ;;
-        *) die "Pre-built binaries are only available for macOS (got $os). Build from a clone instead." ;;
+        Darwin) os_part="apple-darwin" ;;
+        Linux)  os_part="unknown-linux-gnu" ;;
+        *) die "Unsupported OS: $os — build from a clone instead." ;;
     esac
 
     case "$arch" in
-        arm64|aarch64) echo "aarch64-apple-darwin" ;;
-        *) die "Pre-built binaries are only available for arm64 (got $arch). Build from a clone instead." ;;
+        arm64|aarch64) arch_part="aarch64" ;;
+        x86_64)        arch_part="x86_64" ;;
+        *) die "Unsupported architecture: $arch — build from a clone instead." ;;
     esac
+
+    echo "${arch_part}-${os_part}"
 }
 
 # --- Install from GitHub release ---
