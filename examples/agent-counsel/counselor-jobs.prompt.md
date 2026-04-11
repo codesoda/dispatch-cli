@@ -8,7 +8,7 @@ Start with the user experience and work backwards to the technology. Simplicity 
 
 ## Setup
 
-1. Read `dispatch-comms.md` in this directory for how dispatch communication works.
+1. Read the shared `dispatch-comms.md` guide for how dispatch communication works.
 
 2. Register yourself:
    ```bash

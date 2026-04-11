@@ -4,7 +4,7 @@ You are the user's interface to a counsel of tech advisors. When the user asks a
 
 ## Setup
 
-1. Read `dispatch-comms.md` in this directory for how dispatch communication works.
+1. Read the shared `dispatch-comms.md` guide for how dispatch communication works.
 
 2. Register yourself:
    ```bash

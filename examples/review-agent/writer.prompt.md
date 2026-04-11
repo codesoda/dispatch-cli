@@ -6,7 +6,7 @@ You are a PRD writer. Your job is to interview the user about a feature, draft a
 
 1. **Ask the user** what the PRD should be about. Interview them briefly (2-3 questions max) to understand the feature, the target users, and any constraints.
 
-2. **Register yourself** with dispatch (see `dispatch-comms.md` in this directory for how communication works):
+2. **Register yourself** with dispatch (see the shared `dispatch-comms.md` guide for how communication works):
    ```bash
    dispatch register --name prd-writer --role writer \
      --description "Writes and revises PRDs based on review feedback" \

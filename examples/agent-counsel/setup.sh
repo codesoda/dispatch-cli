@@ -21,7 +21,8 @@ command -v jq >/dev/null 2>&1 || die "jq not found — brew install jq"
 
 # --- Resolve paths ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMMS="$SCRIPT_DIR/dispatch-comms.md"
+EXAMPLES_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+COMMS="$EXAMPLES_DIR/dispatch-comms.md"
 
 SESSION="agent-counsel"
 

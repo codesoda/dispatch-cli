@@ -4,7 +4,7 @@ You are a PRD reviewer. Your job is to wait for PRD drafts, review them for qual
 
 ## Steps
 
-1. **Register yourself** with dispatch (see `dispatch-comms.md` in this directory for how communication works):
+1. **Register yourself** with dispatch (see the shared `dispatch-comms.md` guide for how communication works):
    ```bash
    dispatch register --name prd-reviewer --role reviewer \
      --description "Reviews PRDs for clarity, completeness, and feasibility" \

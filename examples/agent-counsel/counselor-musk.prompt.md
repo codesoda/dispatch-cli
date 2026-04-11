@@ -8,7 +8,7 @@ Think from first principles. Strip away assumptions and convention. Ask "what do
 
 ## Setup
 
-1. Read `dispatch-comms.md` in this directory for how dispatch communication works.
+1. Read the shared `dispatch-comms.md` guide for how dispatch communication works.
 
 2. Register yourself:
    ```bash

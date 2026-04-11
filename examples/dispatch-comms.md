@@ -49,8 +49,8 @@ If you get `"status":"timeout"`, just heartbeat and listen again.
 All message bodies should be valid JSON with a `type` field so the recipient knows how to handle it. For example:
 
 ```json
-{"type": "question", "topic": "Should we build a marketplace?", "from_role": "user"}
-{"type": "counsel_response", "perspective": "...", "counselor": "elon"}
+{"type": "request", "topic": "...", "version": 1}
+{"type": "response", "result": "...", "status": "ok"}
 ```
 
 ## Tips
