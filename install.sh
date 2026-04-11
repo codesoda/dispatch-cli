@@ -189,7 +189,7 @@ install_from_release() {
     else
         # Get the latest release tag via redirect (avoids GitHub API rate limits)
         latest_url="https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest"
-        tag="$(curl -sSf -o /dev/null -w '%{redirect_url}' "$latest_url" | grep -oE '[^/]+$')"
+        tag="$(curl -sSf -o /dev/null -w '%{redirect_url}' "$latest_url" | sed 's#.*/##')"
         if [ -z "$tag" ]; then
             die "Could not determine latest release — check https://github.com/$REPO_OWNER/$REPO_NAME/releases"
         fi
@@ -205,6 +205,32 @@ install_from_release() {
         die "Failed to download $asset_url"
     fi
     ok "Downloaded"
+
+    # Verify checksum against published checksums-sha256.txt
+    checksum_url="https://github.com/$REPO_OWNER/$REPO_NAME/releases/download/${tag}/checksums-sha256.txt"
+    if curl -sSfL "$checksum_url" -o "$TMP_DIR/checksums-sha256.txt" 2>/dev/null; then
+        expected="$(grep "$asset_name" "$TMP_DIR/checksums-sha256.txt" | cut -d' ' -f1)"
+        if [ -n "$expected" ]; then
+            if command -v sha256sum >/dev/null 2>&1; then
+                actual="$(sha256sum "$TMP_DIR/$asset_name" | cut -d' ' -f1)"
+            elif command -v shasum >/dev/null 2>&1; then
+                actual="$(shasum -a 256 "$TMP_DIR/$asset_name" | cut -d' ' -f1)"
+            else
+                actual=""
+                warn "Neither sha256sum nor shasum found — skipping checksum verification"
+            fi
+            if [ -n "$actual" ]; then
+                if [ "$actual" != "$expected" ]; then
+                    die "Checksum mismatch: expected $expected, got $actual"
+                fi
+                ok "Checksum verified"
+            fi
+        else
+            warn "Asset not found in checksums file — skipping verification"
+        fi
+    else
+        warn "Could not download checksums — skipping verification"
+    fi
 
     tar xzf "$TMP_DIR/$asset_name" -C "$TMP_DIR"
     downloaded_binary="$TMP_DIR/${BIN_NAME}-${tag}-${target}/${BIN_NAME}"
@@ -227,7 +253,7 @@ build_from_source() {
     ok "cargo found"
 
     header "Building dispatch"
-    if ! (cd "$SOURCE_ROOT" && cargo build --release); then
+    if ! (cd "$SOURCE_ROOT" && cargo build --release --locked); then
         die "cargo build failed"
     fi
 
