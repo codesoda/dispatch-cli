@@ -156,6 +156,7 @@ run_planner() {
 
   log_planner "received task: $task"
   log_planner "creating implementation plan..."
+  sleep 2
 
   # Simulate planning work
   local plan
@@ -195,6 +196,7 @@ run_implementer() {
 
   log_implementer "received plan for: $task ($steps steps)"
   log_implementer "implementing..."
+  sleep 3
 
   # Simulate implementation work
   local implementation
@@ -232,8 +234,11 @@ run_reviewer() {
   files=$(echo "$body" | jq -r '.files_changed // empty')
 
   log_reviewer "reviewing: $task (files: $files)"
+  sleep 1
   log_reviewer "checking code quality..."
+  sleep 1
   log_reviewer "checking security..."
+  sleep 1
 
   # Simulate review work
   local review
@@ -271,6 +276,7 @@ run_test_runner() {
 
   log_test "running tests for: $task (review: $verdict)"
   log_test "executing test suite..."
+  sleep 2
 
   # Simulate test execution
   local results
@@ -311,8 +317,11 @@ run_shipper() {
   coverage=$(echo "$body" | jq -r '.coverage_pct // empty')
 
   log_shipper "shipping: $task (tests: $test_result, coverage: ${coverage}%)"
+  sleep 1
   log_shipper "creating release..."
+  sleep 1
   log_shipper "deploying..."
+  sleep 1
 
   log_shipper "shipped successfully!"
 }
