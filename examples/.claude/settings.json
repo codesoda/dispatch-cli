@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dispatch register*)",
+      "Bash(dispatch team*)",
+      "Bash(dispatch send*)",
+      "Bash(dispatch listen*)",
+      "Bash(dispatch heartbeat*)",
+      "Bash(dispatch serve*)",
+      "Bash(dispatch init*)",
+      "Bash(jq *)",
+      "Read",
+      "Glob",
+      "Grep"
+    ]
+  }
+}
