@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dispatch Monitor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; }
+  .header { padding: 12px 20px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 14px; font-weight: 600; color: #58a6ff; }
+  .header .cell { font-size: 12px; color: #8b949e; }
+  .container { display: grid; grid-template-columns: 1fr 1fr; height: calc(100vh - 45px); }
+  .pane { padding: 16px; overflow-y: auto; }
+  .pane:first-child { border-right: 1px solid #21262d; }
+  .pane h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; padding: 6px 8px; color: #8b949e; border-bottom: 1px solid #21262d; font-weight: 500; }
+  td { padding: 6px 8px; border-bottom: 1px solid #161b22; }
+  .role { color: #d2a8ff; }
+  .id { color: #8b949e; font-size: 11px; }
+  .event-log { display: flex; flex-direction: column; gap: 2px; }
+  .event { font-size: 12px; padding: 4px 8px; border-radius: 4px; display: flex; gap: 12px; }
+  .event .ts { color: #484f58; min-width: 60px; }
+  .event .kind { min-width: 72px; font-weight: 600; }
+  .event .detail { color: #8b949e; }
+  .kind-register { color: #3fb950; }
+  .kind-send { color: #d29922; }
+  .kind-deliver { color: #58a6ff; }
+  .kind-heartbeat { color: #484f58; }
+  .kind-expire { color: #f85149; }
+  .empty { color: #484f58; font-style: italic; font-size: 12px; }
+  .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #3fb950; margin-right: 6px; }
+  .worker-count { color: #8b949e; font-size: 12px; font-weight: 400; }
+</style>
+</head>
+<body>
+<div class="header">
+  <span class="status-dot"></span>
+  <h1>Dispatch Monitor</h1>
+  <span class="cell" id="cell-id"></span>
+</div>
+<div class="container">
+  <div class="pane">
+    <h2>Team <span class="worker-count" id="worker-count"></span></h2>
+    <table>
+      <thead><tr><th>Name</th><th>Role</th><th>ID</th><th>TTL</th></tr></thead>
+      <tbody id="team-body"><tr><td colspan="4" class="empty">No workers registered</td></tr></tbody>
+    </table>
+  </div>
+  <div class="pane">
+    <h2>Events</h2>
+    <div class="event-log" id="event-log">
+      <div class="empty">Waiting for events...</div>
+    </div>
+  </div>
+</div>
+<script>
+async function refreshTeam() {
+  try {
+    const resp = await fetch('/api/team');
+    const workers = await resp.json();
+    const tbody = document.getElementById('team-body');
+    const count = document.getElementById('worker-count');
+    count.textContent = `(${workers.length})`;
+    if (workers.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No workers registered</td></tr>';
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    tbody.innerHTML = workers.map(w => {
+      const ttl = Math.max(0, w.expires_at - now);
+      return `<tr><td>${esc(w.name)}</td><td class="role">${esc(w.role)}</td><td class="id">${esc(w.id.slice(0,8))}...</td><td>${ttl}s</td></tr>`;
+    }).join('');
+  } catch(e) { /* ignore fetch errors */ }
+}
+setInterval(refreshTeam, 2000);
+refreshTeam();
+
+const log = document.getElementById('event-log');
+let firstEvent = true;
+const es = new EventSource('/api/events');
+es.addEventListener('broker', (e) => {
+  if (firstEvent) { log.innerHTML = ''; firstEvent = false; }
+  const ev = JSON.parse(e.data);
+  const d = new Date(ev.timestamp * 1000);
+  const ts = d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const el = document.createElement('div');
+  el.className = 'event';
+  el.innerHTML = `<span class="ts">${ts}</span><span class="kind kind-${esc(ev.kind)}">${esc(ev.kind)}</span><span class="detail">${esc(ev.detail)}</span>`;
+  log.prepend(el);
+  if (log.children.length > 500) log.removeChild(log.lastChild);
+  refreshTeam();
+});
+es.onerror = () => { /* reconnect is automatic */ };
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+</script>
+</body>
+</html>
