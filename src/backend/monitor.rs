@@ -52,8 +52,20 @@ async fn dashboard() -> Html<&'static str> {
 }
 
 /// Return the current team as JSON.
+/// Evicts expired workers first and emits expire events so the dashboard
+/// stays consistent even when no other request triggers eviction.
 async fn api_team(State(state): State<MonitorState>) -> axum::Json<Vec<crate::protocol::Worker>> {
     let mut broker = state.broker.lock().await;
+    let expired = broker.evict_expired();
+    for id in &expired {
+        let _ = state.events.send(super::local::BrokerEvent {
+            kind: "expire".to_string(),
+            worker_id: id.clone(),
+            detail: "worker expired".to_string(),
+            payload: None,
+            timestamp: super::local::now_secs(),
+        });
+    }
     let workers = broker.list_workers();
     axum::Json(workers)
 }
