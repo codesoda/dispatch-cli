@@ -1,8 +1,10 @@
 pub mod local;
 pub mod monitor;
+pub mod orchestrator;
 
 use async_trait::async_trait;
 
+use crate::config::ResolvedConfig;
 use crate::errors::DispatchError;
 use crate::protocol::{BrokerRequest, BrokerResponse};
 
@@ -25,17 +27,11 @@ pub trait Backend: Send + Sync {
 /// - `None` or `"local"` → `LocalBackend`
 /// - Anything else → `DispatchError::UnknownBackend`
 pub fn create_backend(
-    backend_name: Option<&str>,
-    project_root: &std::path::Path,
-    cell_id: &str,
+    config: &ResolvedConfig,
     monitor_port: Option<u16>,
 ) -> Result<Box<dyn Backend>, DispatchError> {
-    match backend_name.unwrap_or("local") {
-        "local" => Ok(Box::new(local::LocalBackend::new(
-            project_root,
-            cell_id,
-            monitor_port,
-        ))),
+    match config.backend.as_deref().unwrap_or("local") {
+        "local" => Ok(Box::new(local::LocalBackend::new(config, monitor_port))),
         other => Err(DispatchError::UnknownBackend {
             name: other.to_string(),
         }),

@@ -10,22 +10,161 @@ use crate::errors::DispatchError;
 /// Runtime configuration for Dispatch, resolved from multiple sources.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
+    /// Human-readable project name (shown in monitor dashboard).
+    pub name: Option<String>,
     /// The cell identity for this project.
     pub cell_id: String,
     /// Backend URL (if configured).
     pub backend: Option<String>,
     /// The project root (directory containing dispatch.config.toml, or cwd).
     pub project_root: PathBuf,
+    /// Monitor dashboard port (from config or CLI flag).
+    pub monitor_port: Option<u16>,
+    /// Agent definitions to launch on serve.
+    pub agents: Vec<ResolvedAgentConfig>,
+    /// Main interactive agent (printed as a command, not auto-launched).
+    pub main_agent: Option<MainAgentConfig>,
+    /// Scheduled heartbeat commands.
+    pub heartbeats: Vec<HeartbeatConfig>,
+}
+
+/// Agent config after prompt_file has been resolved to prompt text.
+#[derive(Debug, Clone)]
+pub struct ResolvedAgentConfig {
+    pub name: String,
+    pub role: String,
+    pub description: String,
+    pub command: String,
+    pub prompt: Option<String>,
+    pub ttl: Option<u64>,
 }
 
 /// On-disk config file shape.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    /// Human-readable project name.
+    pub name: Option<String>,
     /// Explicit cell identity override.
     pub cell_id: Option<String>,
     /// Backend URL.
     pub backend: Option<String>,
+    /// Monitor dashboard configuration.
+    pub monitor: Option<MonitorConfig>,
+    /// Agent definitions to launch on serve.
+    #[serde(default)]
+    pub agents: Vec<AgentConfig>,
+    /// Main interactive agent configuration.
+    pub main_agent: Option<MainAgentConfig>,
+    /// Scheduled heartbeat commands.
+    #[serde(default)]
+    pub heartbeats: Vec<HeartbeatConfig>,
+}
+
+/// On-disk heartbeat (scheduled command) definition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatConfig {
+    /// Name for this heartbeat (shown in monitor/logs).
+    pub name: String,
+    /// Shell command to execute.
+    pub command: String,
+    /// Interval in seconds between executions.
+    pub every: u64,
+    /// Initial delay in seconds before the first execution.
+    #[serde(default)]
+    pub after: Option<u64>,
+}
+
+/// On-disk monitor configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorConfig {
+    pub port: u16,
+}
+
+/// On-disk agent definition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub name: String,
+    pub role: String,
+    pub description: String,
+    pub command: String,
+    pub prompt: Option<String>,
+    pub prompt_file: Option<String>,
+    pub ttl: Option<u64>,
+}
+
+/// On-disk main agent definition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainAgentConfig {
+    pub command: String,
+    pub model: Option<String>,
+    pub prompt: Option<String>,
+    pub prompt_file: Option<String>,
+}
+
+/// Resolve an agent config by reading prompt_file if specified.
+fn resolve_agent_config(
+    agent: &AgentConfig,
+    project_root: &Path,
+) -> Result<ResolvedAgentConfig, DispatchError> {
+    let prompt = match (&agent.prompt, &agent.prompt_file) {
+        (Some(_), Some(_)) => {
+            return Err(DispatchError::AgentConfigError {
+                name: agent.name.clone(),
+                reason: "cannot specify both 'prompt' and 'prompt_file'".into(),
+            });
+        }
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(path)) => {
+            let full_path = project_root.join(path);
+            let content = std::fs::read_to_string(&full_path).map_err(|_| {
+                DispatchError::PromptFileNotFound {
+                    name: agent.name.clone(),
+                    path: full_path,
+                }
+            })?;
+            Some(content)
+        }
+        (None, None) => None,
+    };
+
+    Ok(ResolvedAgentConfig {
+        name: agent.name.clone(),
+        role: agent.role.clone(),
+        description: agent.description.clone(),
+        command: agent.command.clone(),
+        prompt,
+        ttl: agent.ttl,
+    })
+}
+
+/// Resolve the main agent prompt_file if specified.
+fn resolve_main_agent_prompt(
+    main: &MainAgentConfig,
+    project_root: &Path,
+) -> Result<Option<String>, DispatchError> {
+    match (&main.prompt, &main.prompt_file) {
+        (Some(_), Some(_)) => Err(DispatchError::AgentConfigError {
+            name: "main_agent".into(),
+            reason: "cannot specify both 'prompt' and 'prompt_file'".into(),
+        }),
+        (Some(p), None) => Ok(Some(p.clone())),
+        (None, Some(path)) => {
+            let full_path = project_root.join(path);
+            let content = std::fs::read_to_string(&full_path).map_err(|_| {
+                DispatchError::PromptFileNotFound {
+                    name: "main_agent".into(),
+                    path: full_path,
+                }
+            })?;
+            Ok(Some(content))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 /// Search upward from `start_dir` for `dispatch.config.toml`.
@@ -70,10 +209,39 @@ const CONFIG_TEMPLATE: &str = "\
 # Dispatch configuration
 # https://github.com/codesoda/dispatch-cli
 
+# Human-readable project name (shown in monitor dashboard).
+# name = \"My Project\"
+
 # Cell identity for this project.
 # If omitted, a stable ID is derived from the project directory path.
 # Override precedence: --cell-id flag > DISPATCH_CELL_ID env var > this value > derived
 # cell_id = \"my-project\"
+
+# Monitor dashboard — starts an HTTP dashboard on serve
+# [monitor]
+# port = 8384
+
+# Agent definitions — launched automatically by `dispatch serve`
+# [[agents]]
+# name = \"reviewer\"
+# role = \"code-reviewer\"
+# description = \"Reviews code changes\"
+# command = \"claude --model sonnet\"
+# prompt_file = \"prompts/reviewer.md\"
+# ttl = 3600
+
+# Main interactive agent — printed as a ready-to-paste command
+# [main_agent]
+# command = \"claude\"
+# model = \"opus\"
+# prompt = \"You are the lead agent for this project...\"
+
+# Scheduled heartbeats — commands run on a timer while the broker is running
+# [[heartbeats]]
+# name = \"check-prs\"
+# command = \"dispatch send --to $GITHUB_AGENT --body '{\\\"type\\\":\\\"check_prs\\\"}'\"
+# every = 120
+# after = 30  # optional: wait this long before the first execution
 ";
 
 /// Create a `dispatch.config.toml` in `cwd` with commented-out defaults.
@@ -141,12 +309,49 @@ fn resolve_config_inner(
         derive_cell_id(&project_root)
     };
 
-    let backend = config_file.and_then(|c| c.backend);
+    // Extract fields from config file
+    let (name, backend, monitor_config, raw_agents, main_agent_config, heartbeats) =
+        match config_file {
+            Some(c) => (
+                c.name,
+                c.backend,
+                c.monitor,
+                c.agents,
+                c.main_agent,
+                c.heartbeats,
+            ),
+            None => (None, None, None, vec![], None, vec![]),
+        };
+    let monitor_port = monitor_config.map(|m| m.port);
+
+    // Resolve agent prompt files
+    let agents: Vec<ResolvedAgentConfig> = raw_agents
+        .iter()
+        .map(|a| resolve_agent_config(a, &project_root))
+        .collect::<Result<_, _>>()?;
+
+    // Resolve main agent prompt file
+    let main_agent = if let Some(ref ma) = main_agent_config {
+        let resolved_prompt = resolve_main_agent_prompt(ma, &project_root)?;
+        Some(MainAgentConfig {
+            command: ma.command.clone(),
+            model: ma.model.clone(),
+            prompt: resolved_prompt,
+            prompt_file: None,
+        })
+    } else {
+        None
+    };
 
     Ok(ResolvedConfig {
+        name,
         cell_id,
         backend,
         project_root,
+        monitor_port,
+        agents,
+        main_agent,
+        heartbeats,
     })
 }
 

@@ -41,19 +41,14 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
 
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
 
-    // Extract monitor port before matching (Serve consumes it).
+    // Extract monitor port: CLI flag takes precedence over config.
     let monitor_port = if let Commands::Serve { monitor } = &cli.command {
-        *monitor
+        monitor.or(config.monitor_port)
     } else {
         None
     };
 
-    let backend = create_backend(
-        config.backend.as_deref(),
-        &config.project_root,
-        &config.cell_id,
-        monitor_port,
-    )?;
+    let backend = create_backend(&config, monitor_port)?;
 
     match cli.command {
         Commands::Serve { .. } => {
@@ -76,8 +71,14 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     capabilities,
                     ttl_secs: ttl,
                 },
-                Commands::Team => BrokerRequest::Team,
-                Commands::Send { to, body, from } => BrokerRequest::Send { to, body, from },
+                Commands::Team => BrokerRequest::Team {
+                    from: cli.from.clone(),
+                },
+                Commands::Send { to, body } => BrokerRequest::Send {
+                    to,
+                    body,
+                    from: cli.from.clone(),
+                },
                 Commands::Listen { worker_id, timeout } => BrokerRequest::Listen {
                     worker_id,
                     timeout_secs: timeout,

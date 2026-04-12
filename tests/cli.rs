@@ -1,13 +1,27 @@
-use std::process::{Child, Command};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use assert_cmd::cargo::CommandCargoExt;
 use tempfile::TempDir;
 
+/// RAII guard that kills the broker child process on drop.
+/// Ensures cleanup even if a test panics.
+struct BrokerGuard {
+    child: std::process::Child,
+}
+
+impl Drop for BrokerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Start a `dispatch serve` broker as a background process in the given
-/// temp directory with the given cell ID. Returns the child process handle.
-fn start_broker(dir: &TempDir, cell_id: &str) -> Child {
+/// temp directory with the given cell ID. Returns a guard that kills
+/// the broker when dropped.
+fn start_broker(dir: &TempDir, cell_id: &str) -> BrokerGuard {
     // Remove any stale socket from a previous test run so the broker
     // can bind cleanly.
     let socket =
@@ -26,7 +40,7 @@ fn start_broker(dir: &TempDir, cell_id: &str) -> Child {
         .expect("failed to start broker");
     for _ in 0..50 {
         if socket.exists() {
-            return child;
+            return BrokerGuard { child };
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -68,16 +82,13 @@ fn serve_creates_socket_file() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-serve-socket";
 
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
     let socket =
         std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
     assert!(
         socket.exists(),
         "socket file should exist while broker runs"
     );
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 // ── Register + Team round-trip ────────────────────────────────────────
@@ -86,7 +97,7 @@ fn serve_creates_socket_file() {
 fn register_returns_worker_id() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-register";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     let output = dispatch_cmd(&dir, cell_id)
         .args([
@@ -111,16 +122,13 @@ fn register_returns_worker_id() {
         json["worker_id"].is_string(),
         "response should contain worker_id"
     );
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 #[test]
 fn team_lists_registered_workers() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-team";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     // Register a worker first.
     dispatch_cmd(&dir, cell_id)
@@ -157,9 +165,6 @@ fn team_lists_registered_workers() {
     assert_eq!(workers[0]["name"], "bob");
     assert_eq!(workers[0]["role"], "tester");
     assert_eq!(workers[0]["capabilities"][0], "rust");
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 // ── Send + Listen round-trip ──────────────────────────────────────────
@@ -168,7 +173,7 @@ fn team_lists_registered_workers() {
 fn send_and_listen_round_trip() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-send-listen";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     // Register a worker.
     let reg_out = dispatch_cmd(&dir, cell_id)
@@ -225,9 +230,6 @@ fn send_and_listen_round_trip() {
     assert_eq!(listen_json["body"], "hello from test");
     assert_eq!(listen_json["from"], "test-harness");
     assert_eq!(listen_json["to"], worker_id);
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 // ── Error cases ───────────────────────────────────────────────────────
@@ -236,7 +238,7 @@ fn send_and_listen_round_trip() {
 fn send_to_invalid_worker_returns_error_response() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-send-invalid";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     // The broker returns a JSON error response (exit 0) when the
     // recipient worker does not exist. The CLI only exits non-zero
@@ -265,9 +267,6 @@ fn send_to_invalid_worker_returns_error_response() {
             .contains("nonexistent-worker"),
         "error message should mention the missing worker"
     );
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 // ── Heartbeat ─────────────────────────────────────────────────────────
@@ -276,7 +275,7 @@ fn send_to_invalid_worker_returns_error_response() {
 fn heartbeat_renews_worker_ttl() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-heartbeat";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     // Register a worker.
     let reg_out = dispatch_cmd(&dir, cell_id)
@@ -314,9 +313,6 @@ fn heartbeat_renews_worker_ttl() {
         hb_json["expires_at"].is_number(),
         "should return expires_at timestamp"
     );
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 // ── Listen timeout ────────────────────────────────────────────────────
@@ -325,7 +321,7 @@ fn heartbeat_renews_worker_ttl() {
 fn listen_times_out_with_no_messages() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-listen-timeout";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     // Register a worker.
     let reg_out = dispatch_cmd(&dir, cell_id)
@@ -372,9 +368,6 @@ fn listen_times_out_with_no_messages() {
         json.get("expires_at").is_none(),
         "timeout should not contain expires_at"
     );
-
-    broker.kill().ok();
-    broker.wait().ok();
 }
 
 // ── stdout/stderr separation ──────────────────────────────────────────
@@ -383,7 +376,7 @@ fn listen_times_out_with_no_messages() {
 fn stdout_is_json_stderr_is_empty_on_success() {
     let dir = TempDir::new().unwrap();
     let cell_id = "test-stdio-sep";
-    let mut broker = start_broker(&dir, cell_id);
+    let _broker = start_broker(&dir, cell_id);
 
     let output = dispatch_cmd(&dir, cell_id)
         .arg("team")
@@ -402,7 +395,4 @@ fn stdout_is_json_stderr_is_empty_on_success() {
         stderr.is_empty(),
         "stderr should be empty on success, got: {stderr}"
     );
-
-    broker.kill().ok();
-    broker.wait().ok();
 }

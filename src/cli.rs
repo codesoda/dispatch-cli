@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub cell_id: Option<String>,
 
+    /// Identify the calling worker (renews TTL on all commands, used as sender on send)
+    #[arg(long, global = true)]
+    pub from: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -70,10 +74,6 @@ pub enum Commands {
         /// Message body
         #[arg(long)]
         body: String,
-
-        /// Sender identity (optional)
-        #[arg(long)]
-        from: Option<String>,
     },
 
     /// Long-poll for incoming messages

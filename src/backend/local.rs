@@ -25,6 +25,9 @@ pub struct BrokerEvent {
     pub kind: String,
     pub worker_id: String,
     pub detail: String,
+    /// Full structured payload for the event (shown in web UI and console).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
     pub timestamp: u64,
 }
 
@@ -34,16 +37,14 @@ pub struct BrokerEvent {
 /// over a UDS, send one JSON-line request, and receive one JSON-line
 /// response before the connection is closed.
 pub struct LocalBackend {
-    project_root: PathBuf,
-    cell_id: String,
+    config: crate::config::ResolvedConfig,
     monitor_port: Option<u16>,
 }
 
 impl LocalBackend {
-    pub fn new(project_root: &Path, cell_id: &str, monitor_port: Option<u16>) -> Self {
+    pub fn new(config: &crate::config::ResolvedConfig, monitor_port: Option<u16>) -> Self {
         Self {
-            project_root: project_root.to_path_buf(),
-            cell_id: cell_id.to_string(),
+            config: config.clone(),
             monitor_port,
         }
     }
@@ -54,21 +55,21 @@ impl super::Backend for LocalBackend {
     /// Start the broker server on a Unix domain socket, blocking until
     /// a shutdown signal (SIGINT/SIGTERM) is received.
     async fn serve(&self) -> Result<(), DispatchError> {
-        serve(&self.project_root, &self.cell_id, self.monitor_port).await
+        serve(&self.config, self.monitor_port).await
     }
 
     /// Send a request to the broker over a Unix domain socket and
     /// return the response.
-    #[instrument(skip(self, request), fields(cell_id = %self.cell_id))]
+    #[instrument(skip(self, request), fields(cell_id = %self.config.cell_id))]
     async fn send_request(&self, request: &BrokerRequest) -> Result<BrokerResponse, DispatchError> {
-        let sock = socket_path(&self.project_root, &self.cell_id);
+        let sock = socket_path(&self.config.project_root, &self.config.cell_id);
 
         let stream = UnixStream::connect(&sock).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound
                 || e.kind() == std::io::ErrorKind::ConnectionRefused
             {
                 DispatchError::BrokerNotRunning {
-                    cell_id: self.cell_id.clone(),
+                    cell_id: self.config.cell_id.clone(),
                 }
             } else {
                 DispatchError::ConnectionFailed {
@@ -119,6 +120,12 @@ pub struct BrokerState {
     pub mailboxes: HashMap<String, VecDeque<Message>>,
     /// Per-worker notification channels for long-poll wakeup.
     pub notifiers: HashMap<String, Arc<Notify>>,
+    /// Total number of messages sent through the broker.
+    pub messages_sent: u64,
+    /// Total number of messages delivered to listeners.
+    pub messages_delivered: u64,
+    /// Total number of requests handled.
+    pub requests_handled: u64,
 }
 
 impl BrokerState {
@@ -285,10 +292,11 @@ async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<(), Di
 /// Returns when a shutdown signal (SIGINT/SIGTERM) is received.
 #[instrument(skip_all, fields(cell_id, socket_path))]
 pub async fn serve(
-    project_root: &Path,
-    cell_id: &str,
+    config: &crate::config::ResolvedConfig,
     monitor_port: Option<u16>,
 ) -> Result<(), DispatchError> {
+    let cell_id = &config.cell_id;
+    let project_root = &config.project_root;
     let socket = socket_path(project_root, cell_id);
 
     // Ensure parent directory exists.
@@ -312,25 +320,76 @@ pub async fn serve(
     let state = Arc::new(Mutex::new(BrokerState::new()));
     let (event_tx, _) = broadcast::channel::<BrokerEvent>(256);
 
+    // Shutdown signal shared with the monitor dashboard.
+    let monitor_shutdown = Arc::new(Notify::new());
+
     // Optionally start the HTTP monitor dashboard.
-    if let Some(port) = monitor_port {
+    let monitor_url = if let Some(port) = monitor_port {
         let monitor_state = super::monitor::MonitorState {
             broker: Arc::clone(&state),
             events: event_tx.clone(),
+            shutdown: Arc::clone(&monitor_shutdown),
+            name: config.name.clone(),
+            cell_id: cell_id.clone(),
+            started_at: now_secs(),
+            agents: config.agents.clone(),
+            main_agent: config.main_agent.clone(),
+            heartbeats: config.heartbeats.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = super::monitor::run_monitor(port, monitor_state).await {
                 tracing::error!(error = %e, "monitor server error");
             }
         });
-        eprintln!("dispatch serve: monitor dashboard at http://localhost:{port}");
+        let url = format!("http://localhost:{port}");
+        eprintln!("dispatch serve: monitor dashboard at {url}");
+        Some(url)
+    } else {
+        None
+    };
+
+    // Launch configured agents.
+    let mut orchestrator = super::orchestrator::AgentOrchestrator::new(
+        cell_id,
+        &socket,
+        monitor_url.clone(),
+        project_root,
+    );
+    if !config.agents.is_empty() {
+        orchestrator.launch_all(&config.agents).await?;
     }
 
-    // Run until shutdown signal.
+    // Start configured heartbeat timers.
+    if !config.heartbeats.is_empty() {
+        orchestrator.start_heartbeats(&config.heartbeats, &event_tx);
+    }
+
+    // Print the main agent launch command.
+    if let Some(ref main_agent) = config.main_agent {
+        let cmd = super::orchestrator::build_main_agent_command(
+            main_agent,
+            cell_id,
+            monitor_url.as_deref(),
+        );
+        eprintln!("\ndispatch serve: ready. Start the main session:\n");
+        eprintln!("  {cmd}\n");
+    }
+
+    // Run until shutdown signal (OS signal or monitor UI).
     let result = tokio::select! {
         res = accept_loop(&listener, state, event_tx) => res,
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
+            eprintln!("dispatch serve: shutting down agents...");
+            orchestrator.shutdown_all().await;
+            eprintln!("dispatch serve: shutting down");
+            Ok(())
+        }
+        _ = monitor_shutdown.notified() => {
+            tracing::info!("shutdown requested via monitor");
+            eprintln!("dispatch serve: shutdown requested from monitor");
+            eprintln!("dispatch serve: shutting down agents...");
+            orchestrator.shutdown_all().await;
             eprintln!("dispatch serve: shutting down");
             Ok(())
         }
@@ -405,13 +464,36 @@ async fn handle_connection(
 }
 
 /// Emit a broker event (best-effort, ignores send failures).
-fn emit_event(tx: &broadcast::Sender<BrokerEvent>, kind: &str, worker_id: &str, detail: &str) {
+/// Also prints a human-readable line to stderr for the serve console.
+fn emit_event(
+    tx: &broadcast::Sender<BrokerEvent>,
+    kind: &str,
+    worker_id: &str,
+    detail: &str,
+    payload: Option<serde_json::Value>,
+) {
+    let ts = chrono_ts();
+    if let Some(ref p) = payload {
+        eprintln!("[{ts}] {kind:>10}  {worker_id}  {detail}  {p}");
+    } else {
+        eprintln!("[{ts}] {kind:>10}  {worker_id}  {detail}");
+    }
     let _ = tx.send(BrokerEvent {
         kind: kind.to_string(),
         worker_id: worker_id.to_string(),
         detail: detail.to_string(),
+        payload,
         timestamp: now_secs(),
     });
+}
+
+/// Format current time as HH:MM:SS for console output.
+fn chrono_ts() -> String {
+    let secs = now_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// Route a parsed request to the appropriate handler.
@@ -420,6 +502,10 @@ async fn handle_request(
     state: Arc<Mutex<BrokerState>>,
     event_tx: &broadcast::Sender<BrokerEvent>,
 ) -> BrokerResponse {
+    {
+        let mut s = state.lock().await;
+        s.requests_handled += 1;
+    }
     match request {
         BrokerRequest::Register {
             name,
@@ -442,13 +528,23 @@ async fn handle_request(
                 "register",
                 &worker_id,
                 &format!("{name} ({role})"),
+                Some(serde_json::json!({
+                    "name": name,
+                    "role": role,
+                })),
             );
             BrokerResponse::Ok {
                 payload: ResponsePayload::WorkerRegistered { worker_id },
             }
         }
-        BrokerRequest::Team => {
+        BrokerRequest::Team { from } => {
             let mut state = state.lock().await;
+            // Renew caller's TTL if identified.
+            if let Some(ref caller_id) = from {
+                if let Some(w) = state.workers.get_mut(caller_id) {
+                    w.expires_at = now_secs() + DEFAULT_WORKER_TTL_SECS;
+                }
+            }
             let workers = state.list_workers();
             tracing::info!(count = workers.len(), "team listing");
             BrokerResponse::Ok {
@@ -457,14 +553,39 @@ async fn handle_request(
         }
         BrokerRequest::Send { to, body, from } => {
             let mut state = state.lock().await;
+            // Renew sender's TTL if they're a registered worker.
+            if let Some(ref sender_id) = from {
+                if let Some(w) = state.workers.get_mut(sender_id) {
+                    w.expires_at = now_secs() + DEFAULT_WORKER_TTL_SECS;
+                }
+            }
+            let body_clone = body.clone();
+            let from_clone = from.clone();
             match state.send_message(to.clone(), body, from) {
                 Some(message_id) => {
+                    state.messages_sent += 1;
                     tracing::info!(message_id = %message_id, to = %to, "message queued");
+                    // Truncate body for display (full body in payload).
+                    let preview = if body_clone.len() > 120 {
+                        format!("{}...", &body_clone[..120])
+                    } else {
+                        body_clone.clone()
+                    };
                     emit_event(
                         event_tx,
                         "send",
                         &to,
-                        &format!("message {}", &message_id[..8]),
+                        &format!(
+                            "from {} → {}",
+                            from_clone.as_deref().unwrap_or("anonymous"),
+                            &to
+                        ),
+                        Some(serde_json::json!({
+                            "from": from_clone,
+                            "to": to,
+                            "body": preview,
+                            "message_id": &message_id[..8],
+                        })),
                     );
                     BrokerResponse::Ok {
                         payload: ResponsePayload::MessageAck { message_id },
@@ -490,7 +611,7 @@ async fn handle_request(
                 let mut s = state.lock().await;
                 let expired = s.evict_expired();
                 for id in &expired {
-                    emit_event(event_tx, "expire", id, "worker expired");
+                    emit_event(event_tx, "expire", id, "worker expired", None);
                 }
                 if !s.workers.contains_key(&worker_id) {
                     return BrokerResponse::Error {
@@ -508,12 +629,30 @@ async fn handle_request(
 
             // If a message was immediately available, return it.
             if let Some(msg) = immediate_msg {
+                {
+                    state.lock().await.messages_delivered += 1;
+                }
                 tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: immediate delivery");
+                let body_preview = if msg.body.len() > 120 {
+                    format!("{}...", &msg.body[..120])
+                } else {
+                    msg.body.clone()
+                };
                 emit_event(
                     event_tx,
                     "deliver",
                     &worker_id,
-                    &format!("message {}", &msg.message_id[..8]),
+                    &format!(
+                        "from {} → {}",
+                        msg.from.as_deref().unwrap_or("anonymous"),
+                        &worker_id
+                    ),
+                    Some(serde_json::json!({
+                        "from": msg.from,
+                        "to": msg.to,
+                        "body": body_preview,
+                        "message_id": &msg.message_id[..8],
+                    })),
                 );
                 return BrokerResponse::Ok {
                     payload: ResponsePayload::Message {
@@ -533,12 +672,28 @@ async fn handle_request(
                 // Notified — try to pop a message.
                 let mut s = state.lock().await;
                 if let Some(msg) = s.pop_message(&worker_id) {
+                    s.messages_delivered += 1;
                     tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: delivered after wait");
+                    let body_preview = if msg.body.len() > 120 {
+                        format!("{}...", &msg.body[..120])
+                    } else {
+                        msg.body.clone()
+                    };
                     emit_event(
                         event_tx,
                         "deliver",
                         &worker_id,
-                        &format!("message {}", &msg.message_id[..8]),
+                        &format!(
+                            "from {} → {}",
+                            msg.from.as_deref().unwrap_or("anonymous"),
+                            &worker_id
+                        ),
+                        Some(serde_json::json!({
+                            "from": msg.from,
+                            "to": msg.to,
+                            "body": body_preview,
+                            "message_id": &msg.message_id[..8],
+                        })),
                     );
                     BrokerResponse::Ok {
                         payload: ResponsePayload::Message {
@@ -568,7 +723,7 @@ async fn handle_request(
             match state.heartbeat_worker(&worker_id) {
                 Some(expires_at) => {
                     tracing::info!(worker_id = %worker_id, expires_at, "heartbeat renewed");
-                    emit_event(event_tx, "heartbeat", &worker_id, "TTL renewed");
+                    emit_event(event_tx, "heartbeat", &worker_id, "TTL renewed", None);
                     BrokerResponse::Ok {
                         payload: ResponsePayload::HeartbeatAck {
                             worker_id,
@@ -605,17 +760,35 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::config::ResolvedConfig;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Create a minimal ResolvedConfig for testing.
+    fn test_config(project_root: &Path, cell_id: &str) -> ResolvedConfig {
+        ResolvedConfig {
+            name: None,
+            cell_id: cell_id.to_string(),
+            backend: None,
+            project_root: project_root.to_path_buf(),
+            monitor_port: None,
+            agents: vec![],
+            main_agent: None,
+            heartbeats: vec![],
+        }
+    }
 
     // ---- Client-side tests (formerly in client.rs) ----
 
     #[tokio::test]
     async fn test_client_broker_not_running() {
         let tmp = TempDir::new().unwrap();
-        let backend = LocalBackend::new(tmp.path(), "nonexistent-cell", None);
+        let config = test_config(tmp.path(), "nonexistent-cell");
+        let backend = LocalBackend::new(&config, None);
 
-        let result = backend.send_request(&BrokerRequest::Team).await;
+        let result = backend
+            .send_request(&BrokerRequest::Team { from: None })
+            .await;
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -634,13 +807,17 @@ mod tests {
 
         // Start broker in background.
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "client-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait for broker to start.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let backend = LocalBackend::new(&project_root, cell_id, None);
-        let response = backend.send_request(&BrokerRequest::Team).await;
+        let cfg = test_config(&project_root, cell_id);
+        let backend = LocalBackend::new(&cfg, None);
+        let response = backend
+            .send_request(&BrokerRequest::Team { from: None })
+            .await;
         assert!(response.is_ok(), "expected Ok response, got: {response:?}");
 
         let resp = response.unwrap();
@@ -726,7 +903,8 @@ mod tests {
 
         // Start broker in background.
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "test-cell", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait briefly for the server to bind.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -772,7 +950,7 @@ mod tests {
         });
 
         // Try to start second broker — should fail.
-        let result = serve(&project_root, cell_id, None).await;
+        let result = serve(&test_config(&project_root, cell_id), None).await;
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -806,7 +984,8 @@ mod tests {
 
         // Starting serve should clean up the stale socket and bind fresh.
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "restart-cell", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait briefly for the server to bind.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -905,7 +1084,8 @@ mod tests {
 
         // Start broker.
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "reg-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Send register request via raw socket.
@@ -949,9 +1129,11 @@ mod tests {
     async fn test_register_capability_storage_via_broker() {
         let tmp = TempDir::new().unwrap();
         let project_root = tmp.path().to_path_buf();
+        let cell_id = "cap-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "cap-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, "cap-test");
@@ -1082,7 +1264,8 @@ mod tests {
         let cell_id = "team-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "team-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1121,7 +1304,8 @@ mod tests {
         let cell_id = "hb-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "hb-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1153,7 +1337,8 @@ mod tests {
         let cell_id = "hb-err-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "hb-err-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1252,7 +1437,8 @@ mod tests {
         let cell_id = "send-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "send-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1293,7 +1479,8 @@ mod tests {
         let cell_id = "send-err-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "send-err-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1366,7 +1553,8 @@ mod tests {
         let cell_id = "listen-imm-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "listen-imm-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1412,7 +1600,8 @@ mod tests {
         let cell_id = "listen-to-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "listen-to-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1451,7 +1640,8 @@ mod tests {
         let cell_id = "listen-lp-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "listen-lp-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1503,7 +1693,8 @@ mod tests {
         let cell_id = "listen-ttl-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "listen-ttl-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1551,7 +1742,8 @@ mod tests {
         let cell_id = "listen-err-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "listen-err-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1580,7 +1772,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&root, "listen-fifo-test", None).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -1625,7 +1817,8 @@ mod tests {
         let cell_id = "send-multi-test";
 
         let root = project_root.clone();
-        let serve_handle = tokio::spawn(async move { serve(&root, "send-multi-test", None).await });
+        let serve_handle =
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
