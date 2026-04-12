@@ -34,6 +34,15 @@ pub enum DispatchError {
     #[error("connection failed: {reason}")]
     ConnectionFailed { reason: String },
 
+    #[error("agent config error for \"{name}\": {reason}")]
+    AgentConfigError { name: String, reason: String },
+
+    #[error("failed to launch agent \"{name}\": {reason}")]
+    AgentLaunchFailed { name: String, reason: String },
+
+    #[error("prompt file not found for agent \"{name}\": {path}")]
+    PromptFileNotFound { name: String, path: PathBuf },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

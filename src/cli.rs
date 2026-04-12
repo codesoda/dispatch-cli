@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub cell_id: Option<String>,
 
+    /// Identify the calling worker (renews TTL on all commands, used as sender on send)
+    #[arg(long, global = true)]
+    pub from: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -29,7 +33,11 @@ pub enum Commands {
     Init,
 
     /// Start the embedded broker server on a Unix domain socket
-    Serve,
+    Serve {
+        /// Start an HTTP monitor dashboard on this port
+        #[arg(long)]
+        monitor: Option<u16>,
+    },
 
     /// Register a worker with the broker
     Register {
@@ -48,6 +56,10 @@ pub enum Commands {
         /// Worker capabilities (repeatable)
         #[arg(long = "capability")]
         capabilities: Vec<String>,
+
+        /// Worker TTL in seconds (default: 300)
+        #[arg(long)]
+        ttl: Option<u64>,
     },
 
     /// List active workers in the current cell
@@ -62,10 +74,6 @@ pub enum Commands {
         /// Message body
         #[arg(long)]
         body: String,
-
-        /// Sender identity (optional)
-        #[arg(long)]
-        from: Option<String>,
     },
 
     /// Long-poll for incoming messages
