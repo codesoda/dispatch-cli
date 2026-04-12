@@ -29,7 +29,11 @@ pub enum Commands {
     Init,
 
     /// Start the embedded broker server on a Unix domain socket
-    Serve,
+    Serve {
+        /// Start an HTTP monitor dashboard on this port
+        #[arg(long)]
+        monitor: Option<u16>,
+    },
 
     /// Register a worker with the broker
     Register {
@@ -48,6 +52,10 @@ pub enum Commands {
         /// Worker capabilities (repeatable)
         #[arg(long = "capability")]
         capabilities: Vec<String>,
+
+        /// Worker TTL in seconds (default: 300)
+        #[arg(long)]
+        ttl: Option<u64>,
     },
 
     /// List active workers in the current cell

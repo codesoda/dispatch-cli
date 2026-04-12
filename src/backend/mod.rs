@@ -1,4 +1,5 @@
 pub mod local;
+pub mod monitor;
 
 use async_trait::async_trait;
 
@@ -27,9 +28,14 @@ pub fn create_backend(
     backend_name: Option<&str>,
     project_root: &std::path::Path,
     cell_id: &str,
+    monitor_port: Option<u16>,
 ) -> Result<Box<dyn Backend>, DispatchError> {
     match backend_name.unwrap_or("local") {
-        "local" => Ok(Box::new(local::LocalBackend::new(project_root, cell_id))),
+        "local" => Ok(Box::new(local::LocalBackend::new(
+            project_root,
+            cell_id,
+            monitor_port,
+        ))),
         other => Err(DispatchError::UnknownBackend {
             name: other.to_string(),
         }),

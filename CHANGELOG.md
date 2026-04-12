@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-12
+
+### Added
+- `dispatch serve --monitor <PORT>` — optional HTTP dashboard showing live team list and event stream via SSE
+- Dark-themed monitor UI embedded in the binary (no external files), auto-refreshes team every 2s
+
 ## [0.1.1] - 2026-04-11
 
 ### Fixed
@@ -29,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Binary integration tests for all CLI commands
 - GitHub Actions CI workflow (fmt, clippy, build, test)
 
-[Unreleased]: https://github.com/codesoda/dispatch-cli/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/codesoda/dispatch-cli/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/codesoda/dispatch-cli/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/codesoda/dispatch-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/codesoda/dispatch-cli/releases/tag/v0.1.0

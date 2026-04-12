@@ -20,6 +20,8 @@ pub enum BrokerRequest {
         role: String,
         description: String,
         capabilities: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttl_secs: Option<u64>,
     },
     /// List active workers.
     Team,
@@ -109,6 +111,7 @@ mod tests {
                 role: "builder".into(),
                 description: "test".into(),
                 capabilities: vec!["rust".into()],
+                ttl_secs: None,
             },
             BrokerRequest::Team,
             BrokerRequest::Send {

@@ -41,30 +41,40 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
 
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
 
+    // Extract monitor port before matching (Serve consumes it).
+    let monitor_port = if let Commands::Serve { monitor } = &cli.command {
+        *monitor
+    } else {
+        None
+    };
+
     let backend = create_backend(
         config.backend.as_deref(),
         &config.project_root,
         &config.cell_id,
+        monitor_port,
     )?;
 
     match cli.command {
-        Commands::Serve => {
+        Commands::Serve { .. } => {
             backend.serve().await?;
         }
         cmd => {
             let request = match cmd {
                 Commands::Init => unreachable!(),
-                Commands::Serve => unreachable!(),
+                Commands::Serve { .. } => unreachable!(),
                 Commands::Register {
                     name,
                     role,
                     description,
                     capabilities,
+                    ttl,
                 } => BrokerRequest::Register {
                     name,
                     role,
                     description,
                     capabilities,
+                    ttl_secs: ttl,
                 },
                 Commands::Team => BrokerRequest::Team,
                 Commands::Send { to, body, from } => BrokerRequest::Send { to, body, from },
