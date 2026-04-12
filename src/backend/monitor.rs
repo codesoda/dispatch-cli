@@ -40,7 +40,7 @@ pub async fn run_monitor(
         .route("/api/shutdown", axum::routing::post(api_shutdown))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "monitor dashboard listening");
     axum::serve(listener, app).await?;
     Ok(())

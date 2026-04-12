@@ -565,12 +565,6 @@ async fn handle_request(
                 Some(message_id) => {
                     state.messages_sent += 1;
                     tracing::info!(message_id = %message_id, to = %to, "message queued");
-                    // Truncate body for display (full body in payload).
-                    let preview = if body_clone.len() > 120 {
-                        format!("{}...", &body_clone[..120])
-                    } else {
-                        body_clone.clone()
-                    };
                     emit_event(
                         event_tx,
                         "send",
@@ -583,7 +577,7 @@ async fn handle_request(
                         Some(serde_json::json!({
                             "from": from_clone,
                             "to": to,
-                            "body": preview,
+                            "body": body_clone,
                             "message_id": &message_id[..8],
                         })),
                     );
@@ -633,11 +627,6 @@ async fn handle_request(
                     state.lock().await.messages_delivered += 1;
                 }
                 tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: immediate delivery");
-                let body_preview = if msg.body.len() > 120 {
-                    format!("{}...", &msg.body[..120])
-                } else {
-                    msg.body.clone()
-                };
                 emit_event(
                     event_tx,
                     "deliver",
@@ -650,7 +639,7 @@ async fn handle_request(
                     Some(serde_json::json!({
                         "from": msg.from,
                         "to": msg.to,
-                        "body": body_preview,
+                        "body": msg.body,
                         "message_id": &msg.message_id[..8],
                     })),
                 );
@@ -674,11 +663,6 @@ async fn handle_request(
                 if let Some(msg) = s.pop_message(&worker_id) {
                     s.messages_delivered += 1;
                     tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: delivered after wait");
-                    let body_preview = if msg.body.len() > 120 {
-                        format!("{}...", &msg.body[..120])
-                    } else {
-                        msg.body.clone()
-                    };
                     emit_event(
                         event_tx,
                         "deliver",
@@ -691,7 +675,7 @@ async fn handle_request(
                         Some(serde_json::json!({
                             "from": msg.from,
                             "to": msg.to,
-                            "body": body_preview,
+                            "body": msg.body,
                             "message_id": &msg.message_id[..8],
                         })),
                     );
