@@ -11,6 +11,7 @@
   .header { padding: 10px 16px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
   .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; }
   .status-dot.stopped { background: #f85149; }
+  .status-dot.warning { background: #d29922; }
   .header h1 { font-size: 14px; font-weight: 600; color: #58a6ff; }
   .header .cell { font-size: 11px; color: #484f58; }
   .header .spacer { flex: 1; }
@@ -22,13 +23,14 @@
   .layout { display: flex; flex: 1; overflow: hidden; }
 
   /* Sidebar */
-  .sidebar { width: 220px; min-width: 220px; border-right: 1px solid #21262d; display: flex; flex-direction: column; overflow-y: auto; }
+  .sidebar { width: 240px; min-width: 240px; border-right: 1px solid #21262d; display: flex; flex-direction: column; overflow-y: auto; }
   .sidebar .section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #484f58; padding: 12px 14px 4px; }
   .sidebar .nav-item { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font-size: 12px; cursor: pointer; color: #8b949e; border-left: 2px solid transparent; }
   .sidebar .nav-item:hover { background: #161b22; color: #c9d1d9; }
   .sidebar .nav-item.active { background: #161b22; color: #c9d1d9; border-left-color: #58a6ff; }
   .sidebar .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
   .sidebar .nav-item .dot.live { background: #3fb950; }
+  .sidebar .nav-item .dot.starting { background: #d29922; }
   .sidebar .nav-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sidebar .nav-item .role-tag { font-size: 10px; color: #484f58; }
 
@@ -61,11 +63,18 @@
   .kind-register { color: #3fb950; }
   .kind-send { color: #d29922; }
   .kind-deliver { color: #58a6ff; }
-  .kind-heartbeat { color: #484f58; }
+  .kind-heartbeat { color: #d2a8ff; }
   .kind-expire { color: #f85149; }
 
   /* Agent detail view */
   .agent-detail { flex: 1; overflow-y: auto; padding: 16px; }
+  .agent-controls { display: flex; gap: 8px; margin-bottom: 12px; }
+  .agent-controls .ctrl-btn { font-family: inherit; font-size: 11px; padding: 4px 12px; border-radius: 4px; cursor: pointer; border: 1px solid; }
+  .ctrl-btn.start { background: transparent; border-color: #3fb950; color: #3fb950; }
+  .ctrl-btn.start:hover { background: #3fb95020; }
+  .ctrl-btn.stop { background: transparent; border-color: #f85149; color: #f85149; }
+  .ctrl-btn.stop:hover { background: #f8514920; }
+  .ctrl-btn:disabled { opacity: 0.4; cursor: default; }
   .agent-detail .tab-bar { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid #21262d; }
   .agent-detail .tab { padding: 6px 16px; font-size: 11px; color: #8b949e; cursor: pointer; border-bottom: 2px solid transparent; }
   .agent-detail .tab:hover { color: #c9d1d9; }
@@ -74,6 +83,22 @@
   .config-section .config-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #484f58; margin-bottom: 4px; }
   .config-section .config-value { font-size: 12px; color: #c9d1d9; background: #161b22; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
   .config-section .config-value.command { color: #d2a8ff; }
+
+  /* Spawn form */
+  .spawn-form { padding: 20px; overflow-y: auto; flex: 1; }
+  .spawn-form h2 { font-size: 14px; color: #c9d1d9; margin-bottom: 16px; }
+  .form-group { margin-bottom: 14px; }
+  .form-group label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #484f58; margin-bottom: 4px; }
+  .form-group input, .form-group textarea { width: 100%; font-family: inherit; font-size: 12px; background: #161b22; color: #c9d1d9; border: 1px solid #21262d; border-radius: 4px; padding: 8px; }
+  .form-group input:focus, .form-group textarea:focus { outline: none; border-color: #58a6ff; }
+  .form-group textarea { min-height: 200px; resize: vertical; }
+  .form-group .file-hint { font-size: 10px; color: #484f58; margin-top: 4px; }
+  .spawn-btn { font-family: inherit; font-size: 12px; padding: 6px 20px; border-radius: 4px; cursor: pointer; background: #238636; border: 1px solid #238636; color: #fff; }
+  .spawn-btn:hover { background: #2ea043; }
+  .spawn-btn:disabled { opacity: 0.4; cursor: default; }
+
+  /* Heartbeat detail */
+  .hb-detail { flex: 1; overflow-y: auto; padding: 16px; }
 
   .empty { color: #484f58; font-style: italic; font-size: 12px; }
   .hidden { display: none !important; }
@@ -96,9 +121,16 @@
     <div class="nav-item" data-view="all" onclick="selectView('all')">
       <span class="name">All Events</span>
     </div>
+    <div class="nav-item hidden" data-view="spawn" id="spawn-nav" onclick="selectView('spawn')">
+      <span class="name">Spawn Agent</span>
+    </div>
     <div class="section-label">Agents</div>
     <div id="agent-list">
       <div class="nav-item empty" style="cursor:default">No agents yet</div>
+    </div>
+    <div id="heartbeat-section" class="hidden">
+      <div class="section-label">Heartbeats</div>
+      <div id="heartbeat-list"></div>
     </div>
   </div>
   <div class="main">
@@ -127,6 +159,7 @@
     </div>
     <!-- Agent detail view -->
     <div class="agent-detail hidden" id="view-agent">
+      <div class="agent-controls" id="agent-controls"></div>
       <div class="tab-bar">
         <div class="tab active" data-tab="config" onclick="selectAgentTab('config')">Config</div>
         <div class="tab" data-tab="events" onclick="selectAgentTab('events')">Events</div>
@@ -138,33 +171,57 @@
         <div class="empty">No events yet</div>
       </div>
     </div>
+    <!-- Spawn agent form -->
+    <div class="spawn-form hidden" id="view-spawn">
+      <h2>Spawn Ad-hoc Agent</h2>
+      <div class="form-group">
+        <label>Name (optional)</label>
+        <input type="text" id="spawn-name" placeholder="auto-generated if empty">
+      </div>
+      <div class="form-group">
+        <label>Prompt</label>
+        <textarea id="spawn-prompt" placeholder="Enter the agent prompt..."></textarea>
+        <div class="file-hint">Or load from file: <input type="file" accept=".md,.txt" onchange="loadPromptFile(this)"></div>
+      </div>
+      <button class="spawn-btn" onclick="spawnAgent()">Spawn Agent</button>
+    </div>
+    <!-- Heartbeat detail view -->
+    <div class="hb-detail hidden" id="view-heartbeat">
+      <div id="hb-config-panel"></div>
+      <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:#484f58;margin:16px 0 8px;">Execution Log</h3>
+      <div id="hb-events-panel"><div class="empty">No executions yet</div></div>
+    </div>
   </div>
 </div>
 <script>
 // --- State ---
 let serverAlive = true;
 let currentView = 'dashboard';
-let selectedAgent = null; // worker_id
-let allEvents = []; // all events cached
+let selectedAgent = null; // agent name (for merged view)
+let selectedAgentWorkerId = null; // worker_id if registered
+let selectedHeartbeat = null;
+let allEvents = [];
 const MAX_EVENTS = 1000;
 let agentConfigs = []; // from /api/agents
+let heartbeatConfigs = []; // from /api/agents
 let teamWorkers = []; // from /api/team
-// Sparkline: 60 buckets, each 1 second
+let runningAgents = []; // from /api/agents/status
+let configuredAgents = []; // from /api/agents/status
+let agentDefaultsAvailable = false;
 const SPARK_BUCKETS = 60;
 let sparkData = new Array(SPARK_BUCKETS).fill(0);
-let sparkInterval = null;
-// Server timestamps for client-side ticking
-let serverStartedAt = 0; // Unix seconds
-let serverTimeDrift = 0; // server_time - client_time (to correct clock skew)
+let serverStartedAt = 0;
+let serverTimeDrift = 0;
 
 // --- Initialization ---
 async function init() {
-  await Promise.all([fetchAgentConfigs(), refreshTeam(), pingServer()]);
+  await Promise.all([fetchAgentConfigs(), fetchAgentStatus(), refreshTeam(), pingServer()]);
   setupSSE();
   setInterval(refreshTeam, 2000);
+  setInterval(fetchAgentStatus, 3000);
   setInterval(pingServer, 5000);
-  setInterval(tickUI, 1000); // tick uptime + TTL every second
-  sparkInterval = setInterval(tickSparkline, 1000);
+  setInterval(tickUI, 1000);
+  setInterval(tickSparkline, 1000);
 }
 
 // --- SSE ---
@@ -188,9 +245,23 @@ async function fetchAgentConfigs() {
     const resp = await fetch('/api/agents');
     const data = await resp.json();
     agentConfigs = data.agents || [];
+    heartbeatConfigs = data.heartbeats || [];
     if (data.main_agent) {
       agentConfigs.unshift({ ...data.main_agent, name: 'main', role: 'main-agent', description: 'Main interactive agent', _isMain: true });
     }
+  } catch(e) {}
+}
+
+async function fetchAgentStatus() {
+  try {
+    const resp = await fetch('/api/agents/status');
+    const data = await resp.json();
+    runningAgents = data.running || [];
+    configuredAgents = data.configured || [];
+    agentDefaultsAvailable = data.agent_defaults_available || false;
+    // Show/hide spawn nav
+    document.getElementById('spawn-nav').classList.toggle('hidden', !agentDefaultsAvailable);
+    renderSidebar();
   } catch(e) {}
 }
 
@@ -208,11 +279,9 @@ async function pingServer() {
     if (!resp.ok) { markDisconnected(); return; }
     markConnected();
     const h = await resp.json();
-    // Store timestamps for client-side ticking
     serverStartedAt = h.started_at || 0;
     const clientNow = Math.floor(Date.now() / 1000);
     serverTimeDrift = (h.server_time || clientNow) - clientNow;
-    // Update static fields
     const name = h.name || 'Dispatch Monitor';
     document.getElementById('title').textContent = name;
     document.title = serverAlive ? name : '[offline] ' + name;
@@ -222,7 +291,7 @@ async function pingServer() {
     document.getElementById('dash-delivered').textContent = h.messages_delivered || 0;
     document.getElementById('dash-requests').textContent = h.requests_handled || 0;
     document.getElementById('dash-version').textContent = 'v' + (h.version || '?');
-    tickUI(); // immediate update
+    tickUI();
   } catch(e) { markDisconnected(); }
 }
 
@@ -233,8 +302,7 @@ function markDisconnected() {
   document.getElementById('status-dot').classList.add('stopped');
   document.getElementById('stop-btn').disabled = true;
   document.getElementById('stop-btn').textContent = 'Offline';
-  const name = document.getElementById('title').textContent;
-  document.title = '[offline] ' + name;
+  document.title = '[offline] ' + document.getElementById('title').textContent;
 }
 function markConnected() {
   if (serverAlive) return;
@@ -248,49 +316,122 @@ function markConnected() {
 // --- Sidebar ---
 function renderSidebar() {
   const list = document.getElementById('agent-list');
-  if (teamWorkers.length === 0 && agentConfigs.length === 0) {
-    list.innerHTML = '<div class="nav-item empty" style="cursor:default">No agents yet</div>';
-    return;
+  // Build merged agent list: start with configured agents, then add any running agents not in config
+  const seen = new Set();
+  let agents = [];
+  for (const cfg of configuredAgents) {
+    seen.add(cfg.name);
+    const running = runningAgents.find(r => r.name === cfg.name);
+    const worker = teamWorkers.find(w => w.name === cfg.name);
+    agents.push({ name: cfg.name, role: cfg.role, isRunning: running && running.running, isRegistered: !!worker, workerId: worker ? worker.id : null });
   }
-  // Match team workers to agent configs by name
-  let html = '';
+  // Ad-hoc agents (running but not in config)
+  for (const r of runningAgents) {
+    if (!seen.has(r.name)) {
+      seen.add(r.name);
+      const worker = teamWorkers.find(w => w.name === r.name);
+      agents.push({ name: r.name, role: r.role, isRunning: r.running, isRegistered: !!worker, workerId: worker ? worker.id : null, isAdhoc: true });
+    }
+  }
+  // Workers registered but not in config and not running (manually registered)
   for (const w of teamWorkers) {
-    const isActive = selectedAgent === w.id && currentView === 'agent';
-    const isLive = true; // they're in the team list, so alive
-    html += `<div class="nav-item${isActive ? ' active' : ''}" data-view="agent" data-worker-id="${esc(w.id)}" onclick="selectAgent('${esc(w.id)}')">`;
-    html += `<span class="dot${isLive ? ' live' : ''}"></span>`;
-    html += `<span class="name">${esc(w.name)}</span>`;
-    html += `<span class="role-tag">${esc(w.role)}</span>`;
-    html += `</div>`;
+    if (!seen.has(w.name)) {
+      seen.add(w.name);
+      agents.push({ name: w.name, role: w.role, isRunning: false, isRegistered: true, workerId: w.id });
+    }
   }
-  list.innerHTML = html || '<div class="nav-item empty" style="cursor:default">No agents yet</div>';
+
+  if (agents.length === 0) {
+    list.innerHTML = '<div class="nav-item empty" style="cursor:default">No agents yet</div>';
+  } else {
+    let html = '';
+    for (const a of agents) {
+      const isActive = currentView === 'agent' && selectedAgent === a.name;
+      let dotClass = 'dot';
+      if (a.isRunning && a.isRegistered) dotClass += ' live';
+      else if (a.isRunning) dotClass += ' starting';
+      // gray dot for stopped
+      html += `<div class="nav-item${isActive ? ' active' : ''}" onclick="selectAgentByName('${esc(a.name)}')">`;
+      html += `<span class="${dotClass}"></span>`;
+      html += `<span class="name">${esc(a.name)}</span>`;
+      html += `<span class="role-tag">${esc(a.role)}</span>`;
+      html += `</div>`;
+    }
+    list.innerHTML = html;
+  }
+
+  // Heartbeats section
+  const hbSection = document.getElementById('heartbeat-section');
+  const hbList = document.getElementById('heartbeat-list');
+  if (heartbeatConfigs.length > 0) {
+    hbSection.classList.remove('hidden');
+    let hbHtml = '';
+    for (const hb of heartbeatConfigs) {
+      const isActive = currentView === 'heartbeat' && selectedHeartbeat === hb.name;
+      hbHtml += `<div class="nav-item${isActive ? ' active' : ''}" onclick="selectHeartbeat('${esc(hb.name)}')">`;
+      hbHtml += `<span class="dot live"></span>`;
+      hbHtml += `<span class="name">${esc(hb.name)}</span>`;
+      hbHtml += `<span class="role-tag">${hb.every}s</span>`;
+      hbHtml += `</div>`;
+    }
+    hbList.innerHTML = hbHtml;
+  } else {
+    hbSection.classList.add('hidden');
+  }
 }
 
 // --- View switching ---
 function selectView(view) {
   currentView = view;
   selectedAgent = null;
-  document.querySelectorAll('.sidebar .nav-item').forEach(el => el.classList.remove('active'));
-  const navEl = document.querySelector(`.sidebar .nav-item[data-view="${view}"]`);
-  if (navEl) navEl.classList.add('active');
+  selectedAgentWorkerId = null;
+  selectedHeartbeat = null;
+  updateActiveNav();
   showView(view);
   renderCurrentView();
 }
 
-function selectAgent(workerId) {
+function selectAgentByName(name) {
   currentView = 'agent';
-  selectedAgent = workerId;
-  document.querySelectorAll('.sidebar .nav-item').forEach(el => el.classList.remove('active'));
-  const navEl = document.querySelector(`.sidebar .nav-item[data-worker-id="${CSS.escape(workerId)}"]`);
-  if (navEl) navEl.classList.add('active');
+  selectedAgent = name;
+  selectedHeartbeat = null;
+  // Find worker_id if registered
+  const worker = teamWorkers.find(w => w.name === name);
+  selectedAgentWorkerId = worker ? worker.id : null;
+  updateActiveNav();
   showView('agent');
+  agentTab = 'config';
+  document.querySelectorAll('.agent-detail .tab').forEach(el => el.classList.toggle('active', el.dataset.tab === 'config'));
+  document.getElementById('agent-config-panel').classList.remove('hidden');
+  document.getElementById('agent-events-panel').classList.add('hidden');
   renderCurrentView();
+}
+
+function selectHeartbeat(name) {
+  currentView = 'heartbeat';
+  selectedHeartbeat = name;
+  selectedAgent = null;
+  selectedAgentWorkerId = null;
+  updateActiveNav();
+  showView('heartbeat');
+  renderCurrentView();
+}
+
+function updateActiveNav() {
+  document.querySelectorAll('.sidebar .nav-item').forEach(el => el.classList.remove('active'));
+  if (currentView === 'dashboard' || currentView === 'all' || currentView === 'spawn') {
+    const navEl = document.querySelector(`.sidebar .nav-item[data-view="${currentView}"]`);
+    if (navEl) navEl.classList.add('active');
+  }
+  // Agent/heartbeat active states handled by renderSidebar
 }
 
 function showView(view) {
   document.getElementById('view-dashboard').classList.toggle('hidden', view !== 'dashboard');
   document.getElementById('view-all').classList.toggle('hidden', view !== 'all');
   document.getElementById('view-agent').classList.toggle('hidden', view !== 'agent');
+  document.getElementById('view-spawn').classList.toggle('hidden', view !== 'spawn');
+  document.getElementById('view-heartbeat').classList.toggle('hidden', view !== 'heartbeat');
 }
 
 // --- Agent detail tabs ---
@@ -308,11 +449,12 @@ function renderCurrentView() {
   if (currentView === 'dashboard') renderDashboard();
   else if (currentView === 'all') renderAllEvents();
   else if (currentView === 'agent') renderAgentDetail();
+  else if (currentView === 'heartbeat') renderHeartbeatDetail();
+  renderSidebar();
 }
 
 function renderDashboard() {
   renderSparkline();
-  // Recent events (last 20)
   const container = document.getElementById('recent-events');
   const recent = allEvents.slice(0, 20);
   if (recent.length === 0) {
@@ -333,40 +475,97 @@ function renderAllEvents() {
 
 function renderAgentDetail() {
   if (!selectedAgent) return;
-  const worker = teamWorkers.find(w => w.id === selectedAgent);
-  if (!worker) return;
+  const worker = teamWorkers.find(w => w.name === selectedAgent);
+  const agentCfg = agentConfigs.find(a => a.name === selectedAgent);
+  const running = runningAgents.find(r => r.name === selectedAgent);
+  const isRunning = running && running.running;
+  const isConfigured = configuredAgents.some(c => c.name === selectedAgent);
+
+  // Controls
+  const controls = document.getElementById('agent-controls');
+  let ctrlHtml = '';
+  if (isRunning) {
+    ctrlHtml = `<button class="ctrl-btn stop" onclick="stopAgent('${esc(selectedAgent)}')">Stop Agent</button>`;
+  } else if (isConfigured) {
+    ctrlHtml = `<button class="ctrl-btn start" onclick="startAgent('${esc(selectedAgent)}')">Start Agent</button>`;
+  }
+  controls.innerHTML = ctrlHtml;
 
   // Config panel
   const configPanel = document.getElementById('agent-config-panel');
-  const agentCfg = agentConfigs.find(a => a.name === worker.name);
   let cfgHtml = '';
-  cfgHtml += configBlock('Name', worker.name);
-  cfgHtml += configBlock('Role', worker.role);
-  cfgHtml += configBlock('Description', worker.description);
-  cfgHtml += configBlock('Worker ID', worker.id);
-  const now = Math.floor(Date.now() / 1000) + serverTimeDrift;
-  const ttlSecs = Math.max(0, worker.expires_at - now);
-  cfgHtml += `<div class="config-section"><div class="config-label">TTL</div><div class="config-value"><span data-expires-at="${worker.expires_at}">${formatDuration(ttlSecs)}</span></div></div>`;
-  cfgHtml += configBlock('Capabilities', worker.capabilities.join(', ') || 'none');
+  cfgHtml += configBlock('Name', selectedAgent);
+  // Determine combined status
+  let status;
+  if (isRunning && worker) status = 'Running';
+  else if (isRunning) status = 'Starting...';
+  else if (worker) status = 'Process stopped (registration expiring)';
+  else status = 'Stopped';
+
+  if (worker) {
+    cfgHtml += configBlock('Role', worker.role);
+    cfgHtml += configBlock('Description', worker.description);
+    cfgHtml += configBlock('Worker ID', worker.id);
+    // Only show TTL when the process is running — a stopped agent's TTL is just a countdown to cleanup
+    if (isRunning) {
+      const now = Math.floor(Date.now() / 1000) + serverTimeDrift;
+      const ttlSecs = Math.max(0, worker.expires_at - now);
+      cfgHtml += `<div class="config-section"><div class="config-label">TTL</div><div class="config-value"><span data-expires-at="${worker.expires_at}">${formatDuration(ttlSecs)}</span></div></div>`;
+    }
+    cfgHtml += configBlock('Capabilities', worker.capabilities.join(', ') || 'none');
+  } else if (agentCfg) {
+    cfgHtml += configBlock('Role', agentCfg.role || '--');
+    cfgHtml += configBlock('Description', agentCfg.description || '--');
+  }
+  cfgHtml += configBlock('Status', status);
+  if (isRunning) {
+    cfgHtml += configBlock('PID', String(running.pid));
+  }
   if (agentCfg) {
     cfgHtml += configBlock('Command', agentCfg.command || '--', true);
     if (agentCfg.prompt) cfgHtml += configBlock('Prompt', agentCfg.prompt);
   }
   configPanel.innerHTML = cfgHtml;
 
-  // Events panel
   if (agentTab === 'events') renderAgentEvents();
 }
 
 function renderAgentEvents() {
   const panel = document.getElementById('agent-events-panel');
   if (!selectedAgent) { panel.innerHTML = '<div class="empty">Select an agent</div>'; return; }
-  const filtered = allEvents.filter(ev => ev.worker_id === selectedAgent);
+  // Filter by worker_id if registered, or by name in payload
+  const filtered = allEvents.filter(ev => {
+    if (selectedAgentWorkerId && ev.worker_id === selectedAgentWorkerId) return true;
+    if (ev.payload && ev.payload.name === selectedAgent) return true;
+    return false;
+  });
   if (filtered.length === 0) {
     panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
     return;
   }
   panel.innerHTML = filtered.map(renderEvent).join('');
+}
+
+function renderHeartbeatDetail() {
+  if (!selectedHeartbeat) return;
+  const hb = heartbeatConfigs.find(h => h.name === selectedHeartbeat);
+  if (!hb) return;
+
+  const configPanel = document.getElementById('hb-config-panel');
+  let cfgHtml = '';
+  cfgHtml += configBlock('Name', hb.name);
+  cfgHtml += configBlock('Command', hb.command, true);
+  cfgHtml += configBlock('Interval', hb.every + 's');
+  if (hb.after) cfgHtml += configBlock('Initial Delay', hb.after + 's');
+  configPanel.innerHTML = cfgHtml;
+
+  const eventsPanel = document.getElementById('hb-events-panel');
+  const filtered = allEvents.filter(ev => ev.kind === 'heartbeat' && ev.payload && ev.payload.name === selectedHeartbeat);
+  if (filtered.length === 0) {
+    eventsPanel.innerHTML = '<div class="empty">No executions yet</div>';
+    return;
+  }
+  eventsPanel.innerHTML = filtered.map(renderEvent).join('');
 }
 
 function configBlock(label, value, isCommand) {
@@ -394,6 +593,9 @@ function formatPayload(kind, p) {
   if (kind === 'register') {
     return `<span class="label">name:</span> ${esc(p.name||'')} <span class="label">role:</span> ${esc(p.role||'')}`;
   }
+  if (kind === 'heartbeat') {
+    return `<span class="label">name:</span> ${esc(p.name||'')} <span class="label">every:</span> ${p.every||'?'}s`;
+  }
   return esc(JSON.stringify(p));
 }
 
@@ -416,10 +618,8 @@ function renderSparkline() {
 function tickUI() {
   if (!serverStartedAt) return;
   const now = Math.floor(Date.now() / 1000) + serverTimeDrift;
-  // Uptime
   const uptime = Math.max(0, now - serverStartedAt);
   document.getElementById('dash-uptime').textContent = formatDuration(uptime);
-  // TTL countdown on sidebar agents (if visible) and agent detail
   document.querySelectorAll('[data-expires-at]').forEach(el => {
     const exp = parseInt(el.dataset.expiresAt, 10);
     const ttl = Math.max(0, exp - now);
@@ -441,15 +641,68 @@ function formatDuration(secs) {
   return secs + 's';
 }
 
+// --- Agent start/stop ---
+async function stopAgent(name) {
+  if (!confirm(`Stop agent "${name}"?`)) return;
+  await fetch('/api/agents/stop', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name}),
+  });
+  await fetchAgentStatus();
+  await refreshTeam();
+  renderCurrentView();
+}
+
+async function startAgent(name) {
+  await fetch('/api/agents/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name}),
+  });
+  await fetchAgentStatus();
+  renderCurrentView();
+}
+
+// --- Spawn ad-hoc agent ---
+function loadPromptFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { document.getElementById('spawn-prompt').value = reader.result; };
+  reader.readAsText(file);
+}
+
+async function spawnAgent() {
+  const name = document.getElementById('spawn-name').value.trim();
+  const prompt = document.getElementById('spawn-prompt').value.trim();
+  if (!prompt) { alert('Prompt is required'); return; }
+  const body = { prompt };
+  if (name) body.name = name;
+  const resp = await fetch('/api/agents/spawn', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (resp.ok) {
+    const data = await resp.json();
+    document.getElementById('spawn-name').value = '';
+    document.getElementById('spawn-prompt').value = '';
+    await fetchAgentStatus();
+    selectAgentByName(data.name);
+  } else {
+    const err = await resp.json().catch(() => ({}));
+    alert(err.error || 'Failed to spawn agent');
+  }
+}
+
 // --- Stop server ---
 async function stopServer() {
   if (!confirm('Stop the dispatch server? This will shut down all agents.')) return;
   const btn = document.getElementById('stop-btn');
   btn.disabled = true;
   btn.textContent = 'Stopping...';
-  try {
-    await fetch('/api/shutdown', { method: 'POST' });
-  } catch(e) {}
+  try { await fetch('/api/shutdown', { method: 'POST' }); } catch(e) {}
   markDisconnected();
 }
 

@@ -323,8 +323,20 @@ pub async fn serve(
     // Shutdown signal shared with the monitor dashboard.
     let monitor_shutdown = Arc::new(Notify::new());
 
+    // Determine monitor URL before creating orchestrator (agents need it as env var).
+    let monitor_url = monitor_port.map(|port| format!("http://localhost:{port}"));
+
+    // Create shared orchestrator (must exist before monitor starts so HTTP handlers can use it).
+    let orchestrator: super::orchestrator::SharedOrchestrator =
+        Arc::new(Mutex::new(super::orchestrator::AgentOrchestrator::new(
+            cell_id,
+            &socket,
+            monitor_url.clone(),
+            project_root,
+        )));
+
     // Optionally start the HTTP monitor dashboard.
-    let monitor_url = if let Some(port) = monitor_port {
+    if let Some(port) = monitor_port {
         let monitor_state = super::monitor::MonitorState {
             broker: Arc::clone(&state),
             events: event_tx.clone(),
@@ -335,33 +347,45 @@ pub async fn serve(
             agents: config.agents.clone(),
             main_agent: config.main_agent.clone(),
             heartbeats: config.heartbeats.clone(),
+            orchestrator: Arc::clone(&orchestrator),
+            agent_defaults: config.agent_defaults.clone(),
+            event_log: Arc::new(Mutex::new(Vec::new())),
         };
         tokio::spawn(async move {
             if let Err(e) = super::monitor::run_monitor(port, monitor_state).await {
                 tracing::error!(error = %e, "monitor server error");
             }
         });
-        let url = format!("http://localhost:{port}");
+        let url = monitor_url.as_ref().unwrap();
         eprintln!("dispatch serve: monitor dashboard at {url}");
-        Some(url)
-    } else {
-        None
-    };
-
-    // Launch configured agents.
-    let mut orchestrator = super::orchestrator::AgentOrchestrator::new(
-        cell_id,
-        &socket,
-        monitor_url.clone(),
-        project_root,
-    );
-    if !config.agents.is_empty() {
-        orchestrator.launch_all(&config.agents).await?;
+        if config.monitor_launch {
+            let url = url.clone();
+            tokio::spawn(async move {
+                // Small delay to let the server bind before opening.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let cmd = if cfg!(target_os = "macos") {
+                    "open"
+                } else {
+                    "xdg-open"
+                };
+                let _ = tokio::process::Command::new(cmd)
+                    .arg(&url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            });
+        }
     }
-
-    // Start configured heartbeat timers.
-    if !config.heartbeats.is_empty() {
-        orchestrator.start_heartbeats(&config.heartbeats, &event_tx);
+    {
+        let mut orch = orchestrator.lock().await;
+        if !config.agents.is_empty() {
+            orch.launch_all(&config.agents).await?;
+        }
+        if !config.heartbeats.is_empty() {
+            orch.start_heartbeats(&config.heartbeats, &event_tx);
+        }
     }
 
     // Print the main agent launch command.
@@ -381,7 +405,7 @@ pub async fn serve(
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
             eprintln!("dispatch serve: shutting down agents...");
-            orchestrator.shutdown_all().await;
+            orchestrator.lock().await.shutdown_all().await;
             eprintln!("dispatch serve: shutting down");
             Ok(())
         }
@@ -389,7 +413,7 @@ pub async fn serve(
             tracing::info!("shutdown requested via monitor");
             eprintln!("dispatch serve: shutdown requested from monitor");
             eprintln!("dispatch serve: shutting down agents...");
-            orchestrator.shutdown_all().await;
+            orchestrator.lock().await.shutdown_all().await;
             eprintln!("dispatch serve: shutting down");
             Ok(())
         }
@@ -759,6 +783,8 @@ mod tests {
             agents: vec![],
             main_agent: None,
             heartbeats: vec![],
+            monitor_launch: false,
+            agent_defaults: None,
         }
     }
 

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 use crate::config::ResolvedAgentConfig;
 use crate::errors::DispatchError;
@@ -47,6 +49,9 @@ struct RunningHeartbeat {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Shared handle to the orchestrator, accessible from both serve() and monitor HTTP handlers.
+pub type SharedOrchestrator = Arc<Mutex<AgentOrchestrator>>;
+
 /// Manages the lifecycle of agent subprocesses and heartbeat timers.
 pub struct AgentOrchestrator {
     agents: Vec<RunningAgent>,
@@ -91,16 +96,21 @@ impl AgentOrchestrator {
     }
 
     /// Build the full shell command for an agent.
+    /// Substitutes agent name/role into the comms template so the LLM sees concrete values.
     fn build_command(config: &ResolvedAgentConfig) -> String {
         let base = &config.command;
 
         // For claude/codex commands, append the prompt with comms instructions
         let is_llm = base.starts_with("claude") || base.starts_with("codex");
         if is_llm {
+            // Replace env var references with actual values so the LLM prompt is concrete
+            let comms = DISPATCH_COMMS
+                .replace("$DISPATCH_AGENT_NAME", &config.name)
+                .replace("$DISPATCH_AGENT_ROLE", &config.role);
             let full_prompt = if let Some(ref prompt) = config.prompt {
-                format!("{DISPATCH_COMMS}\n\n---\n\n{prompt}")
+                format!("{comms}\n\n---\n\n{prompt}")
             } else {
-                DISPATCH_COMMS.to_string()
+                comms
             };
             format!("{base} -p {}", shell_escape(&full_prompt))
         } else {

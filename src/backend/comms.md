@@ -2,13 +2,13 @@ You are a worker in a dispatch cell — a group of agents coordinating on one ma
 
 ## Register yourself
 
-Before you can send or receive messages, register with the broker:
+Before you can send or receive messages, register with the broker. You MUST use your assigned name and role exactly as shown:
 
 ```bash
-dispatch register --name <YOUR_NAME> --role <YOUR_ROLE> --description "<what you do>" --capability <skill>
+dispatch register --name "$DISPATCH_AGENT_NAME" --role "$DISPATCH_AGENT_ROLE" --description "<what you do>" --capability <skill>
 ```
 
-This returns JSON with your `worker_id`. Save it — you need it for all communication.
+Your name is `$DISPATCH_AGENT_NAME` and your role is `$DISPATCH_AGENT_ROLE`. Do NOT choose a different name — the monitor dashboard matches agents by name. This returns JSON with your `worker_id`. Save it — you need it for all communication.
 
 ## Find other workers
 

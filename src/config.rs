@@ -20,12 +20,16 @@ pub struct ResolvedConfig {
     pub project_root: PathBuf,
     /// Monitor dashboard port (from config or CLI flag).
     pub monitor_port: Option<u16>,
+    /// Auto-open the monitor in the default browser.
+    pub monitor_launch: bool,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Main interactive agent (printed as a command, not auto-launched).
     pub main_agent: Option<MainAgentConfig>,
     /// Scheduled heartbeat commands.
     pub heartbeats: Vec<HeartbeatConfig>,
+    /// Defaults for ad-hoc agents spawned from the monitor UI.
+    pub agent_defaults: Option<AgentDefaultsConfig>,
 }
 
 /// Agent config after prompt_file has been resolved to prompt text.
@@ -59,6 +63,8 @@ pub struct ConfigFile {
     /// Scheduled heartbeat commands.
     #[serde(default)]
     pub heartbeats: Vec<HeartbeatConfig>,
+    /// Defaults for ad-hoc agents spawned from the monitor UI.
+    pub agent_defaults: Option<AgentDefaultsConfig>,
 }
 
 /// On-disk heartbeat (scheduled command) definition.
@@ -76,11 +82,28 @@ pub struct HeartbeatConfig {
     pub after: Option<u64>,
 }
 
+/// Defaults for ad-hoc agents spawned from the monitor UI.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDefaultsConfig {
+    /// Default command to run (e.g. "claude --model sonnet").
+    pub command: String,
+    /// Default role for ad-hoc agents.
+    pub role: Option<String>,
+    /// Default description.
+    pub description: Option<String>,
+    /// Default TTL in seconds.
+    pub ttl: Option<u64>,
+}
+
 /// On-disk monitor configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
     pub port: u16,
+    /// Auto-open the monitor dashboard in the default browser.
+    #[serde(default)]
+    pub launch: bool,
 }
 
 /// On-disk agent definition.
@@ -220,6 +243,7 @@ const CONFIG_TEMPLATE: &str = "\
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
+# launch = true  # auto-open dashboard in browser on serve
 
 # Agent definitions — launched automatically by `dispatch serve`
 # [[agents]]
@@ -242,6 +266,13 @@ const CONFIG_TEMPLATE: &str = "\
 # command = \"dispatch send --to $GITHUB_AGENT --body '{\\\"type\\\":\\\"check_prs\\\"}'\"
 # every = 120
 # after = 30  # optional: wait this long before the first execution
+
+# Defaults for ad-hoc agents spawned from the monitor UI
+# [agent_defaults]
+# command = \"claude --model sonnet --dangerously-skip-permissions\"
+# role = \"adhoc\"
+# description = \"Ad-hoc agent spawned from monitor\"
+# ttl = 3600
 ";
 
 /// Create a `dispatch.config.toml` in `cwd` with commented-out defaults.
@@ -310,7 +341,7 @@ fn resolve_config_inner(
     };
 
     // Extract fields from config file
-    let (name, backend, monitor_config, raw_agents, main_agent_config, heartbeats) =
+    let (name, backend, monitor_config, raw_agents, main_agent_config, heartbeats, agent_defaults) =
         match config_file {
             Some(c) => (
                 c.name,
@@ -319,9 +350,11 @@ fn resolve_config_inner(
                 c.agents,
                 c.main_agent,
                 c.heartbeats,
+                c.agent_defaults,
             ),
-            None => (None, None, None, vec![], None, vec![]),
+            None => (None, None, None, vec![], None, vec![], None),
         };
+    let monitor_launch = monitor_config.as_ref().is_some_and(|m| m.launch);
     let monitor_port = monitor_config.map(|m| m.port);
 
     // Resolve agent prompt files
@@ -349,9 +382,11 @@ fn resolve_config_inner(
         backend,
         project_root,
         monitor_port,
+        monitor_launch,
         agents,
         main_agent,
         heartbeats,
+        agent_defaults,
     })
 }
 
