@@ -20,6 +20,8 @@ pub struct ResolvedConfig {
     pub project_root: PathBuf,
     /// Monitor dashboard port (from config or CLI flag).
     pub monitor_port: Option<u16>,
+    /// Open the monitor dashboard in a browser on serve.
+    pub monitor_open: bool,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Main interactive agent (printed as a command, not auto-launched).
@@ -81,6 +83,9 @@ pub struct HeartbeatConfig {
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
     pub port: u16,
+    /// Open the dashboard in the default browser on serve.
+    #[serde(default)]
+    pub open: bool,
 }
 
 /// On-disk agent definition.
@@ -167,18 +172,14 @@ fn resolve_main_agent_prompt(
     }
 }
 
-/// Search upward from `start_dir` for `dispatch.config.toml`.
+/// Find `dispatch.config.toml` in the current directory.
 /// Returns the path to the config file and the directory containing it.
-pub fn find_config_file(start_dir: &Path) -> Option<(PathBuf, PathBuf)> {
-    let mut current = start_dir.to_path_buf();
-    loop {
-        let candidate = current.join("dispatch.config.toml");
-        if candidate.is_file() {
-            return Some((candidate, current));
-        }
-        if !current.pop() {
-            return None;
-        }
+pub fn find_config_file(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let candidate = cwd.join("dispatch.config.toml");
+    if candidate.is_file() {
+        Some((candidate, cwd.to_path_buf()))
+    } else {
+        None
     }
 }
 
@@ -220,6 +221,7 @@ const CONFIG_TEMPLATE: &str = "\
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
+# open = true  # open the dashboard in your default browser
 
 # Agent definitions — launched automatically by `dispatch serve`
 # [[agents]]
@@ -256,42 +258,41 @@ pub fn init_config(cwd: &Path) -> Result<PathBuf, DispatchError> {
         return Err(DispatchError::ConfigAlreadyExists { path: config_path });
     }
 
-    // Check for config in a parent directory (skip cwd itself)
-    if let Some(parent) = cwd.parent() {
-        if let Some((parent_config, _)) = find_config_file(parent) {
-            eprintln!(
-                "Note: found existing config at {}, creating a new one in the current directory",
-                parent_config.display()
-            );
-        }
-    }
-
     std::fs::write(&config_path, CONFIG_TEMPLATE)?;
     Ok(config_path)
 }
 
 /// Resolve configuration with full precedence:
 /// CLI flag > env var > config file > derived fallback.
+///
+/// If `cli_config_path` is provided, that file is loaded directly and
+/// `project_root` is set to its parent directory.  Otherwise we look for
+/// `dispatch.config.toml` in `cwd`.
 pub fn resolve_config(
     cli_cell_id: Option<&str>,
-    start_dir: &Path,
+    cli_config_path: Option<&Path>,
+    cwd: &Path,
 ) -> Result<ResolvedConfig, DispatchError> {
     let env_cell_id = env::var("DISPATCH_CELL_ID").ok();
-    resolve_config_inner(cli_cell_id, env_cell_id.as_deref(), start_dir)
+    resolve_config_inner(cli_cell_id, env_cell_id.as_deref(), cli_config_path, cwd)
 }
 
 fn resolve_config_inner(
     cli_cell_id: Option<&str>,
     env_cell_id: Option<&str>,
-    start_dir: &Path,
+    cli_config_path: Option<&Path>,
+    cwd: &Path,
 ) -> Result<ResolvedConfig, DispatchError> {
-    // Try to find and load config file
-    let (config_file, project_root) = if let Some((config_path, root)) = find_config_file(start_dir)
-    {
+    // Locate config: explicit --config path, or dispatch.config.toml in cwd.
+    let (config_file, project_root) = if let Some(path) = cli_config_path {
+        let config = load_config_file(path)?;
+        let root = path.parent().unwrap_or(cwd).to_path_buf();
+        (Some(config), root)
+    } else if let Some((config_path, root)) = find_config_file(cwd) {
         let config = load_config_file(&config_path)?;
         (Some(config), root)
     } else {
-        (None, start_dir.to_path_buf())
+        (None, cwd.to_path_buf())
     };
 
     // Resolve cell_id with precedence: CLI > env > config > derived
@@ -322,7 +323,8 @@ fn resolve_config_inner(
             ),
             None => (None, None, None, vec![], None, vec![]),
         };
-    let monitor_port = monitor_config.map(|m| m.port);
+    let monitor_port = monitor_config.as_ref().map(|m| m.port);
+    let monitor_open = monitor_config.as_ref().is_some_and(|m| m.open);
 
     // Resolve agent prompt files
     let agents: Vec<ResolvedAgentConfig> = raw_agents
@@ -349,6 +351,7 @@ fn resolve_config_inner(
         backend,
         project_root,
         monitor_port,
+        monitor_open,
         agents,
         main_agent,
         heartbeats,
@@ -375,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_config_in_parent_dir() {
+    fn test_find_config_does_not_walk_parents() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("dispatch.config.toml");
         fs::write(&config_path, "").unwrap();
@@ -384,10 +387,7 @@ mod tests {
         fs::create_dir(&child).unwrap();
 
         let result = find_config_file(&child);
-        assert!(result.is_some());
-        let (path, root) = result.unwrap();
-        assert_eq!(path, config_path);
-        assert_eq!(root, tmp.path().to_path_buf());
+        assert!(result.is_none());
     }
 
     #[test]
@@ -449,7 +449,7 @@ backend = "https://example.com"
         let config_path = tmp.path().join("dispatch.config.toml");
         fs::write(&config_path, r#"cell_id = "from-config""#).unwrap();
 
-        let resolved = resolve_config_inner(Some("from-cli"), None, tmp.path()).unwrap();
+        let resolved = resolve_config_inner(Some("from-cli"), None, None, tmp.path()).unwrap();
         assert_eq!(resolved.cell_id, "from-cli");
     }
 
@@ -459,7 +459,7 @@ backend = "https://example.com"
         let config_path = tmp.path().join("dispatch.config.toml");
         fs::write(&config_path, r#"cell_id = "from-config""#).unwrap();
 
-        let resolved = resolve_config_inner(None, Some("from-env"), tmp.path()).unwrap();
+        let resolved = resolve_config_inner(None, Some("from-env"), None, tmp.path()).unwrap();
         assert_eq!(resolved.cell_id, "from-env");
     }
 
@@ -469,7 +469,7 @@ backend = "https://example.com"
         let config_path = tmp.path().join("dispatch.config.toml");
         fs::write(&config_path, r#"cell_id = "from-config""#).unwrap();
 
-        let resolved = resolve_config_inner(None, None, tmp.path()).unwrap();
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
         assert_eq!(resolved.cell_id, "from-config");
     }
 
@@ -477,7 +477,7 @@ backend = "https://example.com"
     fn test_resolve_config_derived_fallback() {
         let tmp = TempDir::new().unwrap();
 
-        let resolved = resolve_config_inner(None, None, tmp.path()).unwrap();
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
         assert!(resolved.cell_id.starts_with("cell-"));
     }
 
@@ -486,7 +486,7 @@ backend = "https://example.com"
         let tmp = TempDir::new().unwrap();
 
         let resolved =
-            resolve_config_inner(Some("from-cli"), Some("from-env"), tmp.path()).unwrap();
+            resolve_config_inner(Some("from-cli"), Some("from-env"), None, tmp.path()).unwrap();
         assert_eq!(resolved.cell_id, "from-cli");
     }
 
@@ -524,33 +524,16 @@ backend = "https://example.com"
     }
 
     #[test]
-    fn test_init_config_with_parent_config() {
+    fn test_resolve_config_explicit_config_path() {
         let tmp = TempDir::new().unwrap();
-        // Config in parent
-        let parent_config = tmp.path().join("dispatch.config.toml");
-        fs::write(&parent_config, "").unwrap();
+        let config_dir = tmp.path().join("other");
+        fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("dispatch.config.toml");
+        fs::write(&config_path, r#"cell_id = "explicit""#).unwrap();
 
-        // Init in child — should succeed despite parent config
-        let child = tmp.path().join("subdir");
-        fs::create_dir(&child).unwrap();
-
-        let result = init_config(&child);
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert_eq!(path, child.join("dispatch.config.toml"));
-        assert!(path.is_file());
-    }
-
-    #[test]
-    fn test_resolve_config_project_root_with_config() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let child = tmp.path().join("sub");
-        fs::create_dir(&child).unwrap();
-
-        let resolved = resolve_config_inner(None, None, &child).unwrap();
-        assert_eq!(resolved.project_root, tmp.path().to_path_buf());
+        // cwd is tmp root, config is in other/ — project_root should be other/
+        let resolved = resolve_config_inner(None, None, Some(&config_path), tmp.path()).unwrap();
+        assert_eq!(resolved.cell_id, "explicit");
+        assert_eq!(resolved.project_root, config_dir);
     }
 }

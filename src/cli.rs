@@ -15,6 +15,10 @@ Exit codes:
 Docs: https://github.com/codesoda/dispatch"
 )]
 pub struct Cli {
+    /// Path to dispatch.config.toml (default: ./dispatch.config.toml)
+    #[arg(long, global = true)]
+    pub config: Option<std::path::PathBuf>,
+
     /// Override the cell identity (takes precedence over env var and config)
     #[arg(long, global = true)]
     pub cell_id: Option<String>,
