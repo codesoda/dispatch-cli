@@ -343,6 +343,11 @@ pub async fn serve(
         });
         let url = format!("http://localhost:{port}");
         eprintln!("dispatch serve: monitor dashboard at {url}");
+        if config.monitor_open {
+            if let Err(e) = open::that(&url) {
+                tracing::warn!(error = %e, "failed to open monitor in browser");
+            }
+        }
         Some(url)
     } else {
         None
@@ -756,6 +761,7 @@ mod tests {
             backend: None,
             project_root: project_root.to_path_buf(),
             monitor_port: None,
+            monitor_open: false,
             agents: vec![],
             main_agent: None,
             heartbeats: vec![],

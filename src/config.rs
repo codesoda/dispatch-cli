@@ -20,6 +20,8 @@ pub struct ResolvedConfig {
     pub project_root: PathBuf,
     /// Monitor dashboard port (from config or CLI flag).
     pub monitor_port: Option<u16>,
+    /// Open the monitor dashboard in a browser on serve.
+    pub monitor_open: bool,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Main interactive agent (printed as a command, not auto-launched).
@@ -81,6 +83,9 @@ pub struct HeartbeatConfig {
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
     pub port: u16,
+    /// Open the dashboard in the default browser on serve.
+    #[serde(default)]
+    pub open: bool,
 }
 
 /// On-disk agent definition.
@@ -220,6 +225,7 @@ const CONFIG_TEMPLATE: &str = "\
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
+# open = true  # open the dashboard in your default browser
 
 # Agent definitions — launched automatically by `dispatch serve`
 # [[agents]]
@@ -322,7 +328,8 @@ fn resolve_config_inner(
             ),
             None => (None, None, None, vec![], None, vec![]),
         };
-    let monitor_port = monitor_config.map(|m| m.port);
+    let monitor_port = monitor_config.as_ref().map(|m| m.port);
+    let monitor_open = monitor_config.as_ref().map_or(false, |m| m.open);
 
     // Resolve agent prompt files
     let agents: Vec<ResolvedAgentConfig> = raw_agents
@@ -349,6 +356,7 @@ fn resolve_config_inner(
         backend,
         project_root,
         monitor_port,
+        monitor_open,
         agents,
         main_agent,
         heartbeats,

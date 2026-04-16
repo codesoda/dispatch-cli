@@ -1,6 +1,6 @@
 [package]
 name = "dispatch"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Multi-agent, multi-vendor orchestration system"
 
@@ -22,6 +22,7 @@ async-trait = "0.1.89"
 axum = "0.8"
 futures-util = "0.3"
 libc = "0.2"
+open = "5.3.3"
 
 [profile.release]
 strip = true
