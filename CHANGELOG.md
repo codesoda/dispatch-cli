@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `open` option in `[monitor]` config — automatically opens the dashboard in your default browser on `dispatch serve`
+- `--config <PATH>` global flag — specify an explicit config file path instead of requiring `dispatch.config.toml` in the current directory
+
+### Changed
+- Config file lookup no longer walks parent directories — it checks the current directory only, or uses the explicit `--config` path
+- `project_root` is set to the directory containing the config file, so `prompt_file` and other relative paths resolve from the config location
 
 ## [0.3.0] - 2026-04-13
 

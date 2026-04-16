@@ -37,7 +37,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         return Ok(());
     }
 
-    let config = resolve_config(cli.cell_id.as_deref(), &cwd)?;
+    let config = resolve_config(cli.cell_id.as_deref(), cli.config.as_deref(), &cwd)?;
 
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
 
