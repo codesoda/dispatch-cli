@@ -1,7 +1,8 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Html;
 use axum::routing::get;
@@ -24,6 +25,8 @@ pub struct MonitorState {
     pub agents: Vec<crate::config::ResolvedAgentConfig>,
     pub main_agent: Option<crate::config::MainAgentConfig>,
     pub heartbeats: Vec<crate::config::HeartbeatConfig>,
+    pub log_dir: PathBuf,
+    pub monitor_url: Option<String>,
 }
 
 /// Start the HTTP monitor dashboard on the given port.
@@ -37,6 +40,7 @@ pub async fn run_monitor(
         .route("/api/events", get(api_events))
         .route("/api/health", get(api_health))
         .route("/api/agents", get(api_agents))
+        .route("/api/logs/{agent}", get(api_logs))
         .route("/api/shutdown", axum::routing::post(api_shutdown))
         .with_state(state);
 
@@ -61,6 +65,7 @@ async fn api_team(State(state): State<MonitorState>) -> axum::Json<Vec<crate::pr
         let _ = state.events.send(super::local::BrokerEvent {
             kind: "expire".to_string(),
             worker_id: id.clone(),
+            worker_name: None,
             detail: "worker expired".to_string(),
             payload: None,
             timestamp: super::local::now_secs(),
@@ -121,6 +126,11 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
         .agents
         .iter()
         .map(|a| {
+            let launch_cmd = super::orchestrator::build_agent_command(
+                a,
+                &state.cell_id,
+                state.monitor_url.as_deref(),
+            );
             serde_json::json!({
                 "name": a.name,
                 "role": a.role,
@@ -128,14 +138,21 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
                 "command": a.command,
                 "prompt": a.prompt,
                 "ttl": a.ttl,
+                "launch_command": launch_cmd,
             })
         })
         .collect();
     let main_agent = state.main_agent.as_ref().map(|m| {
+        let launch_cmd = super::orchestrator::build_main_agent_command(
+            m,
+            &state.cell_id,
+            state.monitor_url.as_deref(),
+        );
         serde_json::json!({
             "command": m.command,
             "model": m.model,
             "prompt": m.prompt,
+            "launch_command": launch_cmd,
         })
     });
     let heartbeats: Vec<serde_json::Value> = state
@@ -154,6 +171,50 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
         "main_agent": main_agent,
         "heartbeats": heartbeats,
     }))
+}
+
+/// Query params for the logs endpoint.
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    /// Number of lines to return from the tail of the file.
+    #[serde(default = "default_log_lines")]
+    lines: usize,
+}
+fn default_log_lines() -> usize {
+    200
+}
+
+/// Return the tail of an agent's log file.
+async fn api_logs(
+    State(state): State<MonitorState>,
+    Path(agent): Path<String>,
+    Query(query): Query<LogQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Sanitise agent name to prevent path traversal.
+    if agent.contains('/') || agent.contains('\\') || agent.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
+    }
+
+    let log_path = state.log_dir.join(format!("{agent}.log"));
+    let content = match std::fs::read_to_string(&log_path) {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, "log file not found").into_response(),
+    };
+
+    // Return the last N lines.
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(query.lines);
+    let tail: String = lines[start..].join("\n");
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        tail,
+    )
+        .into_response()
 }
 
 /// Trigger a graceful server shutdown from the monitor UI.

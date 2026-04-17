@@ -40,7 +40,7 @@ dispatch heartbeat --worker-id <YOUR_WORKER_ID>
 dispatch listen --worker-id <YOUR_WORKER_ID> --timeout 120
 ```
 
-Always send a heartbeat before listening. Workers expire after 5 minutes without a heartbeat. The listen command long-polls — it blocks until a message arrives or the timeout is reached.
+Always send a heartbeat before listening. Workers expire after 1 hour without a heartbeat (configurable via `--ttl` on register or `default_ttl` in config). The listen command long-polls — it blocks until a message arrives or the timeout is reached.
 
 If you get `"status":"timeout"`, just heartbeat and listen again.
 

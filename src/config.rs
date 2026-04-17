@@ -18,10 +18,14 @@ pub struct ResolvedConfig {
     pub backend: Option<String>,
     /// The project root (directory containing dispatch.config.toml, or cwd).
     pub project_root: PathBuf,
+    /// Working directory for agents. Defaults to project_root, overridden by `cwd` in config.
+    pub agent_cwd: PathBuf,
     /// Monitor dashboard port (from config or CLI flag).
     pub monitor_port: Option<u16>,
     /// Open the monitor dashboard in a browser on serve.
     pub monitor_open: bool,
+    /// Default TTL in seconds for agents that don't specify one.
+    pub default_ttl: Option<u64>,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Main interactive agent (printed as a command, not auto-launched).
@@ -38,6 +42,10 @@ pub struct ResolvedAgentConfig {
     pub description: String,
     pub command: String,
     pub prompt: Option<String>,
+    /// The resolved absolute path to the prompt file, if one was specified.
+    /// Used by `{prompt_file}` substitution to reference the file directly
+    /// instead of writing to a temp file.
+    pub prompt_file_path: Option<PathBuf>,
     pub ttl: Option<u64>,
 }
 
@@ -51,6 +59,12 @@ pub struct ConfigFile {
     pub cell_id: Option<String>,
     /// Backend URL.
     pub backend: Option<String>,
+    /// Working directory for agents. Relative paths are resolved from the
+    /// config file's directory. If omitted, agents run from the config
+    /// file's directory.
+    pub cwd: Option<String>,
+    /// Default TTL in seconds for agents that don't specify one.
+    pub default_ttl: Option<u64>,
     /// Monitor dashboard configuration.
     pub monitor: Option<MonitorConfig>,
     /// Agent definitions to launch on serve.
@@ -116,25 +130,27 @@ fn resolve_agent_config(
     agent: &AgentConfig,
     project_root: &Path,
 ) -> Result<ResolvedAgentConfig, DispatchError> {
-    let prompt = match (&agent.prompt, &agent.prompt_file) {
+    let (prompt, prompt_file_path) = match (&agent.prompt, &agent.prompt_file) {
         (Some(_), Some(_)) => {
             return Err(DispatchError::AgentConfigError {
                 name: agent.name.clone(),
                 reason: "cannot specify both 'prompt' and 'prompt_file'".into(),
             });
         }
-        (Some(p), None) => Some(p.clone()),
+        (Some(p), None) => (Some(p.clone()), None),
         (None, Some(path)) => {
             let full_path = project_root.join(path);
             let content = std::fs::read_to_string(&full_path).map_err(|_| {
                 DispatchError::PromptFileNotFound {
                     name: agent.name.clone(),
-                    path: full_path,
+                    path: full_path.clone(),
                 }
             })?;
-            Some(content)
+            // Canonicalize to absolute path so {prompt_file} works regardless of agent cwd
+            let abs_path = full_path.canonicalize().unwrap_or(full_path);
+            (Some(content), Some(abs_path))
         }
-        (None, None) => None,
+        (None, None) => (None, None),
     };
 
     Ok(ResolvedAgentConfig {
@@ -143,34 +159,12 @@ fn resolve_agent_config(
         description: agent.description.clone(),
         command: agent.command.clone(),
         prompt,
+        prompt_file_path,
         ttl: agent.ttl,
     })
 }
 
-/// Resolve the main agent prompt_file if specified.
-fn resolve_main_agent_prompt(
-    main: &MainAgentConfig,
-    project_root: &Path,
-) -> Result<Option<String>, DispatchError> {
-    match (&main.prompt, &main.prompt_file) {
-        (Some(_), Some(_)) => Err(DispatchError::AgentConfigError {
-            name: "main_agent".into(),
-            reason: "cannot specify both 'prompt' and 'prompt_file'".into(),
-        }),
-        (Some(p), None) => Ok(Some(p.clone())),
-        (None, Some(path)) => {
-            let full_path = project_root.join(path);
-            let content = std::fs::read_to_string(&full_path).map_err(|_| {
-                DispatchError::PromptFileNotFound {
-                    name: "main_agent".into(),
-                    path: full_path,
-                }
-            })?;
-            Ok(Some(content))
-        }
-        (None, None) => Ok(None),
-    }
-}
+
 
 /// Find `dispatch.config.toml` in the current directory.
 /// Returns the path to the config file and the directory containing it.
@@ -217,6 +211,9 @@ const CONFIG_TEMPLATE: &str = "\
 # If omitted, a stable ID is derived from the project directory path.
 # Override precedence: --cell-id flag > DISPATCH_CELL_ID env var > this value > derived
 # cell_id = \"my-project\"
+
+# Default TTL in seconds for agents that don't specify their own (default: 3600)
+# default_ttl = 3600
 
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
@@ -311,18 +308,28 @@ fn resolve_config_inner(
     };
 
     // Extract fields from config file
-    let (name, backend, monitor_config, raw_agents, main_agent_config, heartbeats) =
+    let (name, backend, default_ttl, config_cwd, monitor_config, raw_agents, main_agent_config, heartbeats) =
         match config_file {
             Some(c) => (
                 c.name,
                 c.backend,
+                c.default_ttl,
+                c.cwd,
                 c.monitor,
                 c.agents,
                 c.main_agent,
                 c.heartbeats,
             ),
-            None => (None, None, None, vec![], None, vec![]),
+            None => (None, None, None, None, None, vec![], None, vec![]),
         };
+
+    // Resolve agent working directory: config cwd (relative to project_root) or project_root
+    let agent_cwd = if let Some(ref cwd_path) = config_cwd {
+        let resolved = project_root.join(cwd_path);
+        resolved.canonicalize().unwrap_or(resolved)
+    } else {
+        project_root.clone()
+    };
     let monitor_port = monitor_config.as_ref().map(|m| m.port);
     let monitor_open = monitor_config.as_ref().is_some_and(|m| m.open);
 
@@ -332,15 +339,24 @@ fn resolve_config_inner(
         .map(|a| resolve_agent_config(a, &project_root))
         .collect::<Result<_, _>>()?;
 
-    // Resolve main agent prompt file
+    // Validate main agent config (check prompt_file exists if specified, but don't read it).
     let main_agent = if let Some(ref ma) = main_agent_config {
-        let resolved_prompt = resolve_main_agent_prompt(ma, &project_root)?;
-        Some(MainAgentConfig {
-            command: ma.command.clone(),
-            model: ma.model.clone(),
-            prompt: resolved_prompt,
-            prompt_file: None,
-        })
+        if ma.prompt.is_some() && ma.prompt_file.is_some() {
+            return Err(DispatchError::AgentConfigError {
+                name: "main_agent".into(),
+                reason: "cannot specify both 'prompt' and 'prompt_file'".into(),
+            });
+        }
+        if let Some(ref path) = ma.prompt_file {
+            let full_path = project_root.join(path);
+            if !full_path.exists() {
+                return Err(DispatchError::PromptFileNotFound {
+                    name: "main_agent".into(),
+                    path: full_path,
+                });
+            }
+        }
+        Some(ma.clone())
     } else {
         None
     };
@@ -350,8 +366,10 @@ fn resolve_config_inner(
         cell_id,
         backend,
         project_root,
+        agent_cwd,
         monitor_port,
         monitor_open,
+        default_ttl,
         agents,
         main_agent,
         heartbeats,

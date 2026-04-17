@@ -41,6 +41,10 @@ pub enum Commands {
         /// Start an HTTP monitor dashboard on this port
         #[arg(long)]
         monitor: Option<u16>,
+
+        /// Auto-launch configured agents (default: print commands only)
+        #[arg(long)]
+        launch: bool,
     },
 
     /// Register a worker with the broker
@@ -61,9 +65,13 @@ pub enum Commands {
         #[arg(long = "capability")]
         capabilities: Vec<String>,
 
-        /// Worker TTL in seconds (default: 300)
+        /// Worker TTL in seconds (default: 3600)
         #[arg(long)]
         ttl: Option<u64>,
+
+        /// Evict any existing worker with the same name before registering
+        #[arg(long)]
+        evict: bool,
     },
 
     /// List active workers in the current cell

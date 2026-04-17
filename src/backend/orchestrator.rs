@@ -21,9 +21,6 @@ async fn kill_process_group(pid: u32) {
     }
 }
 
-/// Standard dispatch-comms instructions embedded at compile time.
-const DISPATCH_COMMS: &str = include_str!("comms.md");
-
 /// Info about a running agent for external queries.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentInfo {
@@ -55,6 +52,7 @@ pub struct AgentOrchestrator {
     socket_path: PathBuf,
     monitor_url: Option<String>,
     project_root: PathBuf,
+    log_dir: PathBuf,
 }
 
 impl AgentOrchestrator {
@@ -64,6 +62,7 @@ impl AgentOrchestrator {
         monitor_url: Option<String>,
         project_root: &Path,
     ) -> Self {
+        let log_dir = project_root.join("logs");
         Self {
             agents: Vec::new(),
             heartbeats: Vec::new(),
@@ -71,6 +70,7 @@ impl AgentOrchestrator {
             socket_path: socket_path.to_path_buf(),
             monitor_url,
             project_root: project_root.to_path_buf(),
+            log_dir,
         }
     }
 
@@ -91,25 +91,43 @@ impl AgentOrchestrator {
     }
 
     /// Build the full shell command for an agent.
-    fn build_command(config: &ResolvedAgentConfig) -> String {
+    ///
+    /// If the command contains `{prompt}`, it is replaced with the shell-escaped
+    /// prompt text. If it contains `{prompt_file}`, it is replaced with the path
+    /// to a temporary file containing the prompt. Otherwise, for known LLM
+    /// commands (claude/codex), the prompt is appended as a positional argument.
+    pub(super) fn build_command(config: &ResolvedAgentConfig) -> String {
         let base = &config.command;
 
-        // For claude/codex commands, append the prompt with comms instructions
-        let is_llm = base.starts_with("claude") || base.starts_with("codex");
-        if is_llm {
-            let full_prompt = if let Some(ref prompt) = config.prompt {
-                format!("{DISPATCH_COMMS}\n\n---\n\n{prompt}")
+        if let Some(ref prompt) = config.prompt {
+            if base.contains("{prompt}") {
+                return base.replace("{prompt}", &shell_escape(prompt));
+            }
+            if base.contains("{prompt_file}") {
+                // Use the original file path if available, otherwise write to temp
+                let path = if let Some(ref p) = config.prompt_file_path {
+                    p.display().to_string()
+                } else {
+                    write_prompt_tempfile(prompt, &config.name)
+                };
+                return base.replace("{prompt_file}", &path);
+            }
+            // Fallback: append prompt as a positional argument for LLM commands
+            let is_llm = base.starts_with("claude") || base.starts_with("codex");
+            if is_llm {
+                format!("{base} {}", shell_escape(prompt))
             } else {
-                DISPATCH_COMMS.to_string()
-            };
-            format!("{base} -p {}", shell_escape(&full_prompt))
+                base.clone()
+            }
         } else {
-            // Shell commands run as-is with env vars
             base.clone()
         }
     }
 
     /// Spawn a single agent as a subprocess.
+    ///
+    /// Stdout and stderr are redirected to `logs/<agent-name>.log` relative to
+    /// the project root so that agent output can be inspected after the fact.
     pub async fn spawn_agent(&mut self, config: &ResolvedAgentConfig) -> Result<(), DispatchError> {
         let env_vars = self.env_vars(&config.name, &config.role);
         let full_command = Self::build_command(config);
@@ -117,9 +135,29 @@ impl AgentOrchestrator {
         tracing::info!(
             agent = %config.name,
             role = %config.role,
-            command = %config.command,
+            command = %full_command,
             "launching agent"
         );
+
+        // Ensure log directory exists and open a per-agent log file.
+        std::fs::create_dir_all(&self.log_dir).map_err(|e| DispatchError::AgentLaunchFailed {
+            name: config.name.clone(),
+            reason: format!("failed to create log dir {}: {e}", self.log_dir.display()),
+        })?;
+        let log_path = self.log_dir.join(format!("{}.log", config.name));
+        let log_file = std::fs::File::create(&log_path).map_err(|e| {
+            DispatchError::AgentLaunchFailed {
+                name: config.name.clone(),
+                reason: format!("failed to create log file {}: {e}", log_path.display()),
+            }
+        })?;
+        // Clone the file handle so stdout and stderr write to the same file.
+        let log_file_err = log_file.try_clone().map_err(|e| {
+            DispatchError::AgentLaunchFailed {
+                name: config.name.clone(),
+                reason: format!("failed to clone log file handle: {e}"),
+            }
+        })?;
 
         let child = Command::new("sh")
             .arg("-c")
@@ -127,8 +165,8 @@ impl AgentOrchestrator {
             .envs(&env_vars)
             .current_dir(&self.project_root)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(log_file_err))
             .process_group(0) // Own process group so we can kill the whole tree.
             .spawn()
             .map_err(|e| DispatchError::AgentLaunchFailed {
@@ -138,8 +176,8 @@ impl AgentOrchestrator {
 
         let pid = child.id().unwrap_or(0);
         eprintln!(
-            "dispatch serve: launched agent '{}' (role={}, pid={})",
-            config.name, config.role, pid
+            "dispatch serve: launched agent '{}' (role={}, pid={}, log={})",
+            config.name, config.role, pid, log_path.display()
         );
 
         self.agents.push(RunningAgent {
@@ -244,6 +282,7 @@ impl AgentOrchestrator {
                     let _ = event_tx.send(super::local::BrokerEvent {
                         kind: "heartbeat".into(),
                         worker_id: String::new(),
+                        worker_name: None,
                         detail,
                         payload: Some(serde_json::json!({
                             "name": hb_name,
@@ -298,6 +337,28 @@ impl AgentOrchestrator {
     }
 }
 
+/// Build an agent command string for the user to paste.
+///
+/// Includes the dispatch env vars and the resolved command with prompt substitution.
+pub fn build_agent_command(
+    config: &ResolvedAgentConfig,
+    cell_id: &str,
+    monitor_url: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        format!("DISPATCH_CELL_ID={cell_id}"),
+        format!("DISPATCH_AGENT_NAME={}", config.name),
+        format!("DISPATCH_AGENT_ROLE={}", config.role),
+    ];
+
+    if let Some(url) = monitor_url {
+        parts.push(format!("DISPATCH_MONITOR_URL={url}"));
+    }
+
+    parts.push(AgentOrchestrator::build_command(config));
+    parts.join(" ")
+}
+
 /// Build the main agent command string for the user to paste.
 pub fn build_main_agent_command(
     main: &crate::config::MainAgentConfig,
@@ -310,23 +371,37 @@ pub fn build_main_agent_command(
         parts.push(format!("DISPATCH_MONITOR_URL={url}"));
     }
 
-    parts.push(main.command.clone());
+    let mut cmd = main.command.clone();
 
     if let Some(ref model) = main.model {
-        parts.push(format!("--model {model}"));
+        cmd.push_str(&format!(" --model {model}"));
     }
 
-    if let Some(ref prompt) = main.prompt {
-        let full_prompt = format!("{DISPATCH_COMMS}\n\n---\n\n{prompt}");
-        parts.push(format!("\"{}\"", full_prompt.replace('"', "\\\"")));
-    } else {
-        parts.push(format!("\"{}\"", DISPATCH_COMMS.replace('"', "\\\"")));
+    if let Some(ref prompt_file) = main.prompt_file {
+        // Tell the agent to read the prompt file rather than inlining it.
+        let msg = format!("Read and follow the instructions in {prompt_file}");
+        cmd.push_str(&format!(" \"{}\"", msg.replace('"', "\\\"")));
+    } else if let Some(ref prompt) = main.prompt {
+        cmd.push_str(&format!(" \"{}\"", prompt.replace('"', "\\\"")));
     }
 
+    parts.push(cmd);
     parts.join(" ")
 }
 
 /// Shell-escape a string for use in `sh -c` commands.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Write a prompt to a temporary file and return the path as a string.
+/// The file is placed in the OS temp directory and named by agent to aid debugging.
+fn write_prompt_tempfile(prompt: &str, agent_name: &str) -> String {
+    let path = std::env::temp_dir().join(format!("dispatch-prompt-{agent_name}.md"));
+    std::fs::write(&path, prompt).unwrap_or_else(|e| {
+        eprintln!(
+            "dispatch: warning: failed to write prompt tempfile for '{agent_name}': {e}"
+        );
+    });
+    path.display().to_string()
 }

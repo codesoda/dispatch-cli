@@ -22,6 +22,9 @@ pub enum BrokerRequest {
         capabilities: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ttl_secs: Option<u64>,
+        /// If true, evict any existing worker with the same name.
+        #[serde(default)]
+        evict: bool,
     },
     /// List active workers.
     Team {
@@ -64,6 +67,8 @@ pub struct Worker {
     pub role: String,
     pub description: String,
     pub capabilities: Vec<String>,
+    /// TTL duration in seconds (used to renew `expires_at` on heartbeat).
+    pub ttl_secs: u64,
     /// Unix timestamp (seconds) when this worker's TTL expires.
     pub expires_at: u64,
 }
@@ -115,6 +120,7 @@ mod tests {
                 description: "test".into(),
                 capabilities: vec!["rust".into()],
                 ttl_secs: None,
+                evict: false,
             },
             BrokerRequest::Team { from: None },
             BrokerRequest::Send {
@@ -159,6 +165,7 @@ mod tests {
                     role: "builder".into(),
                     description: "test worker".into(),
                     capabilities: vec![],
+                    ttl_secs: 300,
                     expires_at: 1000,
                 }],
             },

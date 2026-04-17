@@ -29,6 +29,8 @@
   .sidebar .nav-item.active { background: #161b22; color: #c9d1d9; border-left-color: #58a6ff; }
   .sidebar .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
   .sidebar .nav-item .dot.live { background: #3fb950; }
+  .sidebar .nav-item .dot.pending { background: #484f58; animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
   .sidebar .nav-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sidebar .nav-item .role-tag { font-size: 10px; color: #484f58; }
 
@@ -74,6 +76,17 @@
   .config-section .config-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #484f58; margin-bottom: 4px; }
   .config-section .config-value { font-size: 12px; color: #c9d1d9; background: #161b22; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
   .config-section .config-value.command { color: #d2a8ff; }
+
+  /* Copy command */
+  .copy-cmd { position: relative; }
+  .copy-cmd .copy-btn { position: absolute; top: 6px; right: 6px; background: #21262d; border: 1px solid #30363d; color: #8b949e; font-family: inherit; font-size: 10px; padding: 2px 8px; border-radius: 3px; cursor: pointer; }
+  .copy-cmd .copy-btn:hover { color: #c9d1d9; border-color: #484f58; }
+  .status-badge { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+  .status-badge.registered { background: #3fb95020; color: #3fb950; }
+  .status-badge.pending { background: #484f5820; color: #484f58; }
+
+  /* Log output */
+  .log-output { font-size: 11px; color: #8b949e; background: #0d1117; padding: 12px; border: 1px solid #21262d; border-radius: 6px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; flex: 1; max-height: calc(100vh - 180px); margin: 0; }
 
   .empty { color: #484f58; font-style: italic; font-size: 12px; }
   .hidden { display: none !important; }
@@ -130,12 +143,16 @@
       <div class="tab-bar">
         <div class="tab active" data-tab="config" onclick="selectAgentTab('config')">Config</div>
         <div class="tab" data-tab="events" onclick="selectAgentTab('events')">Events</div>
+        <div class="tab" data-tab="logs" onclick="selectAgentTab('logs')">Logs</div>
       </div>
       <div id="agent-config-panel">
         <div class="empty">Select an agent</div>
       </div>
       <div id="agent-events-panel" class="hidden">
         <div class="empty">No events yet</div>
+      </div>
+      <div id="agent-logs-panel" class="hidden">
+        <pre class="log-output" id="agent-log-content">Loading...</pre>
       </div>
     </div>
   </div>
@@ -248,28 +265,56 @@ function markConnected() {
 // --- Sidebar ---
 function renderSidebar() {
   const list = document.getElementById('agent-list');
-  if (teamWorkers.length === 0 && agentConfigs.length === 0) {
-    list.innerHTML = '<div class="nav-item empty" style="cursor:default">No agents yet</div>';
-    return;
-  }
-  // Match team workers to agent configs by name
+  // Build a merged list: configured agents + any registered workers not in config
+  const seen = new Set();
   let html = '';
+
+  // Show configured agents first (they're always expected)
+  for (const cfg of agentConfigs) {
+    if (cfg._isMain) continue; // main agent shown separately
+    seen.add(cfg.name);
+    const worker = teamWorkers.find(w => w.name === cfg.name);
+    const isLive = !!worker;
+    const isActive = selectedAgent === cfg.name && currentView === 'agent';
+    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(cfg.name)}" onclick="selectAgentByName('${esc(cfg.name)}')">`;
+    html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
+    html += `<span class="name">${esc(cfg.name)}</span>`;
+    html += `<span class="role-tag">${esc(cfg.role)}</span>`;
+    html += `</div>`;
+  }
+
+  // Show any registered workers not in config (e.g. manually registered)
   for (const w of teamWorkers) {
-    const isActive = selectedAgent === w.id && currentView === 'agent';
-    const isLive = true; // they're in the team list, so alive
-    html += `<div class="nav-item${isActive ? ' active' : ''}" data-view="agent" data-worker-id="${esc(w.id)}" onclick="selectAgent('${esc(w.id)}')">`;
-    html += `<span class="dot${isLive ? ' live' : ''}"></span>`;
+    if (seen.has(w.name)) continue;
+    const isActive = selectedAgent === w.name && currentView === 'agent';
+    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(w.name)}" onclick="selectAgentByName('${esc(w.name)}')">`;
+    html += `<span class="dot live"></span>`;
     html += `<span class="name">${esc(w.name)}</span>`;
     html += `<span class="role-tag">${esc(w.role)}</span>`;
     html += `</div>`;
   }
-  list.innerHTML = html || '<div class="nav-item empty" style="cursor:default">No agents yet</div>';
+
+  // Main agent
+  const mainCfg = agentConfigs.find(a => a._isMain);
+  if (mainCfg) {
+    const mainWorker = teamWorkers.find(w => w.role === 'main-agent' || w.name === 'main');
+    const isLive = !!mainWorker;
+    const isActive = selectedAgent === 'main' && currentView === 'agent';
+    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="main" onclick="selectAgentByName('main')">`;
+    html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
+    html += `<span class="name">main</span>`;
+    html += `<span class="role-tag">coordinator</span>`;
+    html += `</div>`;
+  }
+
+  list.innerHTML = html || '<div class="nav-item empty" style="cursor:default">No agents configured</div>';
 }
 
 // --- View switching ---
 function selectView(view) {
   currentView = view;
   selectedAgent = null;
+  if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
   document.querySelectorAll('.sidebar .nav-item').forEach(el => el.classList.remove('active'));
   const navEl = document.querySelector(`.sidebar .nav-item[data-view="${view}"]`);
   if (navEl) navEl.classList.add('active');
@@ -277,11 +322,11 @@ function selectView(view) {
   renderCurrentView();
 }
 
-function selectAgent(workerId) {
+function selectAgentByName(name) {
   currentView = 'agent';
-  selectedAgent = workerId;
+  selectedAgent = name;
   document.querySelectorAll('.sidebar .nav-item').forEach(el => el.classList.remove('active'));
-  const navEl = document.querySelector(`.sidebar .nav-item[data-worker-id="${CSS.escape(workerId)}"]`);
+  const navEl = document.querySelector(`.sidebar .nav-item[data-agent-name="${CSS.escape(name)}"]`);
   if (navEl) navEl.classList.add('active');
   showView('agent');
   renderCurrentView();
@@ -295,12 +340,45 @@ function showView(view) {
 
 // --- Agent detail tabs ---
 let agentTab = 'config';
+let logPollInterval = null;
 function selectAgentTab(tab) {
   agentTab = tab;
   document.querySelectorAll('.agent-detail .tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.getElementById('agent-config-panel').classList.toggle('hidden', tab !== 'config');
   document.getElementById('agent-events-panel').classList.toggle('hidden', tab !== 'events');
+  document.getElementById('agent-logs-panel').classList.toggle('hidden', tab !== 'logs');
   if (tab === 'events') renderAgentEvents();
+  // Start/stop log polling
+  if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
+  if (tab === 'logs') {
+    fetchAgentLogs();
+    logPollInterval = setInterval(fetchAgentLogs, 2000);
+  }
+}
+
+function copyLaunchCmd() {
+  const block = document.getElementById('launch-cmd-block');
+  const code = block?.querySelector('code');
+  if (!code) return;
+  navigator.clipboard.writeText(code.textContent).then(() => {
+    const btn = block.querySelector('.copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+  });
+}
+
+async function fetchAgentLogs() {
+  if (!selectedAgent) return;
+  const agentName = selectedAgent;
+  const el = document.getElementById('agent-log-content');
+  try {
+    const resp = await fetch(`/api/logs/${encodeURIComponent(agentName)}?lines=500`);
+    if (!resp.ok) { el.textContent = 'No log file found for this agent.'; return; }
+    const text = await resp.text();
+    const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    el.textContent = text || '(empty)';
+    if (wasAtBottom) el.scrollTop = el.scrollHeight;
+  } catch(e) { el.textContent = 'Failed to fetch logs.'; }
 }
 
 // --- Rendering ---
@@ -333,25 +411,43 @@ function renderAllEvents() {
 
 function renderAgentDetail() {
   if (!selectedAgent) return;
-  const worker = teamWorkers.find(w => w.id === selectedAgent);
-  if (!worker) return;
+  const agentName = selectedAgent;
+  const agentCfg = agentConfigs.find(a => a.name === agentName);
+  const worker = teamWorkers.find(w => w.name === agentName);
+
+  if (!agentCfg && !worker) return;
 
   // Config panel
   const configPanel = document.getElementById('agent-config-panel');
-  const agentCfg = agentConfigs.find(a => a.name === worker.name);
   let cfgHtml = '';
-  cfgHtml += configBlock('Name', worker.name);
-  cfgHtml += configBlock('Role', worker.role);
-  cfgHtml += configBlock('Description', worker.description);
-  cfgHtml += configBlock('Worker ID', worker.id);
-  const now = Math.floor(Date.now() / 1000) + serverTimeDrift;
-  const ttlSecs = Math.max(0, worker.expires_at - now);
-  cfgHtml += `<div class="config-section"><div class="config-label">TTL</div><div class="config-value"><span data-expires-at="${worker.expires_at}">${formatDuration(ttlSecs)}</span></div></div>`;
-  cfgHtml += configBlock('Capabilities', worker.capabilities.join(', ') || 'none');
+
+  // Status badge
+  const isRegistered = !!worker;
+  cfgHtml += `<div class="config-section"><div class="config-label">Status</div><div class="config-value"><span class="status-badge ${isRegistered ? 'registered' : 'pending'}">${isRegistered ? 'Registered' : 'Waiting to register'}</span></div></div>`;
+
+  cfgHtml += configBlock('Name', agentCfg?.name || worker?.name || agentName);
+  cfgHtml += configBlock('Role', agentCfg?.role || worker?.role || '--');
+  cfgHtml += configBlock('Description', agentCfg?.description || worker?.description || '--');
+
+  if (worker) {
+    cfgHtml += configBlock('Worker ID', worker.id);
+    const now = Math.floor(Date.now() / 1000) + serverTimeDrift;
+    const ttlSecs = Math.max(0, worker.expires_at - now);
+    cfgHtml += `<div class="config-section"><div class="config-label">TTL</div><div class="config-value"><span data-expires-at="${worker.expires_at}">${formatDuration(ttlSecs)}</span></div></div>`;
+    cfgHtml += configBlock('Capabilities', worker.capabilities.join(', ') || 'none');
+  }
+
   if (agentCfg) {
     cfgHtml += configBlock('Command', agentCfg.command || '--', true);
     if (agentCfg.prompt) cfgHtml += configBlock('Prompt', agentCfg.prompt);
   }
+
+  // Launch command (copyable)
+  const launchCmd = agentCfg?.launch_command;
+  if (launchCmd) {
+    cfgHtml += `<div class="config-section"><div class="config-label">Launch Command</div><div class="config-value command copy-cmd" id="launch-cmd-block"><code>${esc(launchCmd)}</code><button class="copy-btn" onclick="copyLaunchCmd()">Copy</button></div></div>`;
+  }
+
   configPanel.innerHTML = cfgHtml;
 
   // Events panel
@@ -361,7 +457,10 @@ function renderAgentDetail() {
 function renderAgentEvents() {
   const panel = document.getElementById('agent-events-panel');
   if (!selectedAgent) { panel.innerHTML = '<div class="empty">Select an agent</div>'; return; }
-  const filtered = allEvents.filter(ev => ev.worker_id === selectedAgent);
+  // Find the worker ID(s) for this agent name to filter events
+  const worker = teamWorkers.find(w => w.name === selectedAgent);
+  const workerId = worker?.id;
+  const filtered = workerId ? allEvents.filter(ev => ev.worker_id === workerId) : [];
   if (filtered.length === 0) {
     panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
     return;
@@ -373,9 +472,17 @@ function configBlock(label, value, isCommand) {
   return `<div class="config-section"><div class="config-label">${esc(label)}</div><div class="config-value${isCommand ? ' command' : ''}">${esc(value || '--')}</div></div>`;
 }
 
+function resolveWorkerName(workerId) {
+  if (!workerId) return null;
+  const w = teamWorkers.find(w => w.id === workerId);
+  return w ? w.name : null;
+}
+
 function renderEvent(ev) {
   const ts = ev._ts.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  let html = `<div class="event"><div class="event-header"><span class="ts">${ts}</span><span class="kind kind-${esc(ev.kind)}">${esc(ev.kind)}</span><span class="detail">${esc(ev.detail)}</span></div>`;
+  const workerName = ev.worker_name || resolveWorkerName(ev.worker_id);
+  const workerLabel = workerName ? `<span style="color:#58a6ff">${esc(workerName)}</span>` : `<span style="color:#484f58">${esc(ev.worker_id.slice(0,8))}...</span>`;
+  let html = `<div class="event"><div class="event-header"><span class="ts">${ts}</span><span class="kind kind-${esc(ev.kind)}">${esc(ev.kind)}</span>${workerLabel}<span class="detail">${esc(ev.detail)}</span></div>`;
   if (ev.payload) {
     html += `<div class="payload">${formatPayload(ev.kind, ev.payload)}</div>`;
   }
@@ -385,9 +492,9 @@ function renderEvent(ev) {
 
 function formatPayload(kind, p) {
   if (kind === 'send' || kind === 'deliver') {
-    const from = p.from ? esc(p.from.slice(0,8)) + '...' : 'anonymous';
-    const to = p.to ? esc(p.to.slice(0,8)) + '...' : '?';
-    let s = `<span class="label">from:</span> ${from} <span class="label">to:</span> ${to}`;
+    const fromName = p.from ? (resolveWorkerName(p.from) || p.from.slice(0,8) + '...') : 'anonymous';
+    const toName = p.to ? (resolveWorkerName(p.to) || p.to.slice(0,8) + '...') : '?';
+    let s = `<span class="label">from:</span> ${esc(fromName)} <span class="label">to:</span> ${esc(toName)}`;
     if (p.body) s += `<br><span class="body-text">${esc(p.body)}</span>`;
     return s;
   }
