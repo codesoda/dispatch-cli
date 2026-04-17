@@ -31,13 +31,29 @@ Both methods symlink into `~/.local/bin/` by default. Pass `--skip-symlink` to o
 dispatch serve
 
 # Register a worker
-dispatch register --name my-worker --role coder --description "Writes code"
+dispatch register --name my-worker --role coder \
+  --description "Writes code" --capability rust
 
 # Send a message to a worker
-dispatch send --to <worker-id> --body "Hello, worker!"
+dispatch send --to <worker-id> --body '{"type":"task","detail":"implement login"}'
 
 # Listen for messages (long-poll)
 dispatch listen --worker-id <worker-id>
+
+# Acknowledge a received message
+dispatch ack --worker-id <worker-id> --message-id <msg-id> --note "starting work"
+
+# Publish status while working
+dispatch heartbeat --worker-id <worker-id> --status "implementing login 2/5"
+
+# Check what everyone's doing
+dispatch status
+
+# View recent broker events
+dispatch events --since 10m
+
+# Inspect a worker's inbox without consuming
+dispatch messages --worker-id <worker-id>
 ```
 
 ## Architecture
@@ -51,14 +67,26 @@ Dispatch runs as a **cell** — a single broker process that coordinates workers
 
 ## Commands
 
+### Core
+
 | Command | Description |
 |---------|-------------|
-| `dispatch serve` | Start the embedded broker |
-| `dispatch register` | Register a worker with name, role, and capabilities |
+| `dispatch init` | Create a `dispatch.config.toml` in the current directory |
+| `dispatch serve` | Start the broker (prints agent commands; use `--launch` to auto-start) |
+| `dispatch register` | Register a worker (`--evict` replaces existing by name) |
 | `dispatch team` | List active workers |
 | `dispatch send` | Send a direct message to a worker |
 | `dispatch listen` | Long-poll for incoming messages |
-| `dispatch heartbeat` | Renew worker liveness TTL |
+| `dispatch heartbeat` | Renew worker TTL (add `--status "doing X"` to publish status) |
+
+### Introspection
+
+| Command | Description |
+|---------|-------------|
+| `dispatch ack` | Acknowledge receipt of a message (`--message-id`, `--note`) |
+| `dispatch status` | View worker status taglines (or `--clear` to wipe) |
+| `dispatch events` | Query event history (`--type`, `--worker`, `--since`, `--limit`) |
+| `dispatch messages` | Inspect message history (`--worker-id`, `--unacked`, `--sent`) |
 
 ## Configuration
 
