@@ -85,7 +85,21 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     worker_id,
                     timeout_secs: timeout,
                 },
-                Commands::Heartbeat { worker_id } => BrokerRequest::Heartbeat { worker_id },
+                Commands::Status { worker_id, clear } => {
+                    BrokerRequest::Status { worker_id, clear }
+                }
+                Commands::Ack {
+                    worker_id,
+                    message_id,
+                    note,
+                } => BrokerRequest::Ack {
+                    worker_id,
+                    message_id,
+                    note,
+                },
+                Commands::Heartbeat { worker_id, status } => {
+                    BrokerRequest::Heartbeat { worker_id, status }
+                }
             };
             let response = backend.send_request(&request).await?;
             let json = serde_json::to_string(&response)?;

@@ -99,10 +99,40 @@ pub enum Commands {
         timeout: u64,
     },
 
+    /// Query worker status
+    Status {
+        /// Show status for a specific worker
+        #[arg(long)]
+        worker_id: Option<String>,
+
+        /// Clear the worker's status (requires --worker-id)
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Acknowledge receipt of a message
+    Ack {
+        /// Worker ID that received the message
+        #[arg(long)]
+        worker_id: String,
+
+        /// Message ID to acknowledge
+        #[arg(long)]
+        message_id: String,
+
+        /// Optional note (e.g. "starting implementation")
+        #[arg(long)]
+        note: Option<String>,
+    },
+
     /// Renew worker liveness TTL
     Heartbeat {
         /// Worker ID to heartbeat
         #[arg(long)]
         worker_id: String,
+
+        /// Set a status tagline (e.g. "Running e2e tests 3/10")
+        #[arg(long)]
+        status: Option<String>,
     },
 }

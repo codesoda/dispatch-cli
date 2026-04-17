@@ -42,8 +42,38 @@ pub enum BrokerRequest {
         worker_id: String,
         timeout_secs: u64,
     },
-    /// Renew a worker's liveness TTL.
-    Heartbeat { worker_id: String },
+    /// Renew a worker's liveness TTL, optionally updating status.
+    Heartbeat {
+        worker_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// Acknowledge receipt of a message.
+    Ack {
+        worker_id: String,
+        message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// Query worker status or clear a worker's status.
+    Status {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worker_id: Option<String>,
+        #[serde(default)]
+        clear: bool,
+    },
+}
+
+/// Summary of a worker's status for the status query response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatus {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status_at: Option<u64>,
 }
 
 /// A response sent from the broker back to the client.
@@ -71,6 +101,12 @@ pub struct Worker {
     pub ttl_secs: u64,
     /// Unix timestamp (seconds) when this worker's TTL expires.
     pub expires_at: u64,
+    /// Human-readable status tagline (e.g. "Running e2e tests 3/10").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    /// Unix timestamp when `last_status` was last set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status_at: Option<u64>,
 }
 
 /// The payload inside a successful response, varies by request type.
@@ -96,6 +132,14 @@ pub enum ResponsePayload {
     WorkerRegistered { worker_id: String },
     /// A message delivered or queued.
     MessageAck { message_id: String },
+    /// Message acknowledgement confirmed. The `ack_confirmed` field distinguishes
+    /// this from `MessageAck` during untagged deserialization.
+    AckConfirm {
+        message_id: String,
+        ack_confirmed: bool,
+    },
+    /// Worker status query result.
+    StatusResult { workers: Vec<WorkerStatus> },
     /// Listen timed out with no messages.
     Timeout { worker_id: String },
     /// Map of arbitrary key-value data (used as a flexible response shape).
@@ -134,6 +178,7 @@ mod tests {
             },
             BrokerRequest::Heartbeat {
                 worker_id: "w1".into(),
+                status: None,
             },
         ];
         for req in &cases {
@@ -167,6 +212,8 @@ mod tests {
                     capabilities: vec![],
                     ttl_secs: 300,
                     expires_at: 1000,
+                    last_status: None,
+                    last_status_at: None,
                 }],
             },
             ResponsePayload::HeartbeatAck {

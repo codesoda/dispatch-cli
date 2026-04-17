@@ -116,6 +116,15 @@ impl super::Backend for LocalBackend {
 // Broker state
 // ---------------------------------------------------------------------------
 
+/// Record of a message acknowledgement.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AckRecord {
+    pub message_id: String,
+    pub worker_id: String,
+    pub note: Option<String>,
+    pub acked_at: u64,
+}
+
 /// In-memory broker state.
 #[derive(Debug)]
 pub struct BrokerState {
@@ -125,6 +134,8 @@ pub struct BrokerState {
     pub mailboxes: HashMap<String, VecDeque<Message>>,
     /// Per-worker notification channels for long-poll wakeup.
     pub notifiers: HashMap<String, Arc<Notify>>,
+    /// Message acknowledgement log keyed by message ID.
+    pub ack_log: HashMap<String, AckRecord>,
     /// Default TTL for workers that don't specify one.
     pub default_ttl: u64,
     /// Total number of messages sent through the broker.
@@ -151,6 +162,7 @@ impl BrokerState {
             workers: HashMap::new(),
             mailboxes: HashMap::new(),
             notifiers: HashMap::new(),
+            ack_log: HashMap::new(),
             default_ttl,
             messages_sent: 0,
             messages_delivered: 0,
@@ -197,6 +209,8 @@ impl BrokerState {
             capabilities,
             ttl_secs: ttl,
             expires_at: now + ttl,
+            last_status: None,
+            last_status_at: None,
         };
         self.workers.insert(id.clone(), worker);
         id
@@ -231,16 +245,86 @@ impl BrokerState {
         self.workers.get(worker_id).map(|w| w.name.as_str())
     }
 
-    /// Renew a worker's TTL. Returns the new expiry timestamp, or None if not found/expired.
-    pub fn heartbeat_worker(&mut self, worker_id: &str) -> Option<u64> {
+    /// Renew a worker's TTL and optionally update status.
+    /// Returns the new expiry timestamp, or None if not found/expired.
+    pub fn heartbeat_worker(&mut self, worker_id: &str, status: Option<String>) -> Option<u64> {
         self.evict_expired();
         if let Some(worker) = self.workers.get_mut(worker_id) {
-            let new_expiry = now_secs() + worker.ttl_secs;
-            worker.expires_at = new_expiry;
-            Some(new_expiry)
+            let now = now_secs();
+            worker.expires_at = now + worker.ttl_secs;
+            if let Some(s) = status {
+                worker.last_status = Some(s);
+                worker.last_status_at = Some(now);
+            }
+            Some(worker.expires_at)
         } else {
             None
         }
+    }
+
+    /// Get status summaries for all active workers or a specific worker.
+    pub fn get_status(&mut self, worker_id: Option<&str>) -> Vec<crate::protocol::WorkerStatus> {
+        self.evict_expired();
+        match worker_id {
+            Some(id) => self
+                .workers
+                .get(id)
+                .map(|w| vec![crate::protocol::WorkerStatus {
+                    id: w.id.clone(),
+                    name: w.name.clone(),
+                    role: w.role.clone(),
+                    last_status: w.last_status.clone(),
+                    last_status_at: w.last_status_at,
+                }])
+                .unwrap_or_default(),
+            None => self
+                .workers
+                .values()
+                .map(|w| crate::protocol::WorkerStatus {
+                    id: w.id.clone(),
+                    name: w.name.clone(),
+                    role: w.role.clone(),
+                    last_status: w.last_status.clone(),
+                    last_status_at: w.last_status_at,
+                })
+                .collect(),
+        }
+    }
+
+    /// Clear a worker's status without affecting registration.
+    pub fn clear_status(&mut self, worker_id: &str) -> Result<(), String> {
+        self.evict_expired();
+        if let Some(worker) = self.workers.get_mut(worker_id) {
+            worker.last_status = None;
+            worker.last_status_at = None;
+            Ok(())
+        } else {
+            Err(format!("worker not found or expired: {worker_id}"))
+        }
+    }
+
+    /// Record an acknowledgement for a message.
+    /// Returns an error string if the worker doesn't exist.
+    pub fn ack_message(
+        &mut self,
+        worker_id: &str,
+        message_id: &str,
+        note: Option<String>,
+    ) -> Result<(), String> {
+        self.evict_expired();
+        if !self.workers.contains_key(worker_id) {
+            return Err(format!("worker not found or expired: {worker_id}"));
+        }
+        self.ack_log.insert(
+            message_id.to_string(),
+            AckRecord {
+                message_id: message_id.to_string(),
+                worker_id: worker_id.to_string(),
+                note,
+                acked_at: now_secs(),
+            },
+        );
+        Ok(())
     }
 
     /// Queue a message in a worker's mailbox. Returns the message ID, or None if the
@@ -786,12 +870,21 @@ async fn handle_request(
                 }
             }
         }
-        BrokerRequest::Heartbeat { worker_id } => {
+        BrokerRequest::Heartbeat { worker_id, status } => {
             let mut state = state.lock().await;
-            match state.heartbeat_worker(&worker_id) {
+            let has_status = status.is_some();
+            let status_clone = status.clone();
+            match state.heartbeat_worker(&worker_id, status) {
                 Some(expires_at) => {
+                    let detail = if has_status { "TTL renewed + status updated" } else { "TTL renewed" };
                     tracing::info!(worker_id = %worker_id, expires_at, "heartbeat renewed");
-                    emit_event(event_tx, "heartbeat", &worker_id, "TTL renewed", None);
+                    emit_event(
+                        event_tx,
+                        "heartbeat",
+                        &worker_id,
+                        detail,
+                        status_clone.map(|s| serde_json::json!({ "status": s })),
+                    );
                     BrokerResponse::Ok {
                         payload: ResponsePayload::HeartbeatAck {
                             worker_id,
@@ -802,6 +895,60 @@ async fn handle_request(
                 None => BrokerResponse::Error {
                     message: format!("worker not found or expired: {worker_id}"),
                 },
+            }
+        }
+        BrokerRequest::Ack {
+            worker_id,
+            message_id,
+            note,
+        } => {
+            let mut state = state.lock().await;
+            let note_clone = note.clone();
+            match state.ack_message(&worker_id, &message_id, note) {
+                Ok(()) => {
+                    tracing::info!(worker_id = %worker_id, message_id = %message_id, "message acked");
+                    emit_event(
+                        event_tx,
+                        "ack",
+                        &worker_id,
+                        &format!("acked {}", &message_id[..message_id.len().min(8)]),
+                        Some(serde_json::json!({
+                            "message_id": message_id,
+                            "note": note_clone,
+                        })),
+                    );
+                    BrokerResponse::Ok {
+                        payload: ResponsePayload::AckConfirm {
+                            message_id,
+                            ack_confirmed: true,
+                        },
+                    }
+                }
+                Err(msg) => BrokerResponse::Error { message: msg },
+            }
+        }
+        BrokerRequest::Status { worker_id, clear } => {
+            let mut state = state.lock().await;
+            if clear {
+                match worker_id {
+                    Some(id) => match state.clear_status(&id) {
+                        Ok(()) => {
+                            tracing::info!(worker_id = %id, "status cleared");
+                            BrokerResponse::Ok {
+                                payload: ResponsePayload::Ack {},
+                            }
+                        }
+                        Err(msg) => BrokerResponse::Error { message: msg },
+                    },
+                    None => BrokerResponse::Error {
+                        message: "--clear requires --worker-id".to_string(),
+                    },
+                }
+            } else {
+                let workers = state.get_status(worker_id.as_deref());
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::StatusResult { workers },
+                }
             }
         }
     }
@@ -1304,7 +1451,7 @@ mod tests {
         // Manually lower the expiry to simulate time passing.
         state.workers.get_mut(&id).unwrap().expires_at = now_secs() + 10;
 
-        let new_expiry = state.heartbeat_worker(&id).unwrap();
+        let new_expiry = state.heartbeat_worker(&id, None).unwrap();
         assert!(
             new_expiry >= original_expiry,
             "heartbeat should renew to at least the original TTL"
@@ -1314,7 +1461,7 @@ mod tests {
     #[test]
     fn test_heartbeat_worker_not_found() {
         let mut state = BrokerState::new();
-        assert!(state.heartbeat_worker("nonexistent").is_none());
+        assert!(state.heartbeat_worker("nonexistent", None).is_none());
     }
 
     #[test]
@@ -1331,7 +1478,7 @@ mod tests {
         state.workers.get_mut(&id).unwrap().expires_at = 0;
 
         assert!(
-            state.heartbeat_worker(&id).is_none(),
+            state.heartbeat_worker(&id, None).is_none(),
             "heartbeat for expired worker should return None"
         );
     }
