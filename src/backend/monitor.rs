@@ -41,6 +41,8 @@ pub async fn run_monitor(
         .route("/api/health", get(api_health))
         .route("/api/agents", get(api_agents))
         .route("/api/logs/{agent}", get(api_logs))
+        .route("/api/events/history", get(api_events_history))
+        .route("/api/messages/{worker}", get(api_messages))
         .route("/api/shutdown", axum::routing::post(api_shutdown))
         .with_state(state);
 
@@ -216,6 +218,70 @@ async fn api_logs(
         tail,
     )
         .into_response()
+}
+
+/// Query params for the events history endpoint.
+#[derive(serde::Deserialize)]
+struct EventsQuery {
+    since: Option<u64>,
+    until: Option<u64>,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    worker: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Return filtered event history as JSON.
+async fn api_events_history(
+    State(state): State<MonitorState>,
+    Query(query): Query<EventsQuery>,
+) -> axum::Json<serde_json::Value> {
+    let broker = state.broker.lock().await;
+    let events = broker.query_events(
+        query.since,
+        query.until,
+        query.event_type.as_deref(),
+        query.worker.as_deref(),
+        query.limit,
+    );
+    let events_json: Vec<serde_json::Value> = events
+        .into_iter()
+        .map(|e| serde_json::to_value(e).unwrap_or_default())
+        .collect();
+    axum::Json(serde_json::json!({ "events": events_json }))
+}
+
+/// Query params for the messages endpoint.
+#[derive(serde::Deserialize)]
+struct MessagesQuery {
+    #[serde(default)]
+    unacked: bool,
+    #[serde(default)]
+    sent: bool,
+    since: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// Return message history for a worker as JSON.
+async fn api_messages(
+    State(state): State<MonitorState>,
+    Path(worker): Path<String>,
+    Query(query): Query<MessagesQuery>,
+) -> axum::Json<serde_json::Value> {
+    let broker = state.broker.lock().await;
+    let messages = broker.query_messages(
+        &worker,
+        query.unacked,
+        query.sent,
+        query.since,
+        query.limit,
+        None,
+    );
+    let messages: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|m| serde_json::to_value(m).unwrap_or_default())
+        .collect();
+    axum::Json(serde_json::json!({ "messages": messages }))
 }
 
 /// Trigger a graceful server shutdown from the monitor UI.

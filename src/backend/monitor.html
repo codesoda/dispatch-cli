@@ -33,6 +33,7 @@
   @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
   .sidebar .nav-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sidebar .nav-item .role-tag { font-size: 10px; color: #484f58; }
+  .sidebar .nav-item .status-tag { font-size: 9px; color: #79c0ff; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; margin-top: 1px; }
 
   /* Main content */
   .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -65,6 +66,8 @@
   .kind-deliver { color: #58a6ff; }
   .kind-heartbeat { color: #484f58; }
   .kind-expire { color: #f85149; }
+  .kind-ack { color: #a371f7; }
+  .kind-status { color: #79c0ff; }
 
   /* Agent detail view */
   .agent-detail { flex: 1; overflow-y: auto; padding: 16px; }
@@ -76,6 +79,17 @@
   .config-section .config-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #484f58; margin-bottom: 4px; }
   .config-section .config-value { font-size: 12px; color: #c9d1d9; background: #161b22; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
   .config-section .config-value.command { color: #d2a8ff; }
+
+  /* Message list */
+  .msg-item { font-size: 11px; padding: 8px; border-bottom: 1px solid #161b22; }
+  .msg-item .msg-header { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+  .msg-item .msg-id { color: #484f58; font-size: 10px; }
+  .msg-item .msg-dir { color: #8b949e; font-size: 10px; }
+  .msg-item .msg-badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+  .msg-item .msg-badge.sent { background: #d2992220; color: #d29922; }
+  .msg-item .msg-badge.delivered { background: #58a6ff20; color: #58a6ff; }
+  .msg-item .msg-badge.acked { background: #a371f720; color: #a371f7; }
+  .msg-item .msg-body { color: #c9d1d9; font-size: 11px; background: #0d1117; padding: 6px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; }
 
   /* Copy command */
   .copy-cmd { position: relative; }
@@ -143,6 +157,7 @@
       <div class="tab-bar">
         <div class="tab active" data-tab="config" onclick="selectAgentTab('config')">Config</div>
         <div class="tab" data-tab="events" onclick="selectAgentTab('events')">Events</div>
+        <div class="tab" data-tab="messages" onclick="selectAgentTab('messages')">Messages</div>
         <div class="tab" data-tab="logs" onclick="selectAgentTab('logs')">Logs</div>
       </div>
       <div id="agent-config-panel">
@@ -150,6 +165,9 @@
       </div>
       <div id="agent-events-panel" class="hidden">
         <div class="empty">No events yet</div>
+      </div>
+      <div id="agent-messages-panel" class="hidden">
+        <div class="empty">Loading messages...</div>
       </div>
       <div id="agent-logs-panel" class="hidden">
         <pre class="log-output" id="agent-log-content">Loading...</pre>
@@ -275,23 +293,25 @@ function renderSidebar() {
     seen.add(cfg.name);
     const worker = teamWorkers.find(w => w.name === cfg.name);
     const isLive = !!worker;
+    const statusText = worker?.last_status || '';
     const isActive = selectedAgent === cfg.name && currentView === 'agent';
     html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(cfg.name)}" onclick="selectAgentByName('${esc(cfg.name)}')">`;
     html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
-    html += `<span class="name">${esc(cfg.name)}</span>`;
-    html += `<span class="role-tag">${esc(cfg.role)}</span>`;
-    html += `</div>`;
+    html += `<div style="flex:1;overflow:hidden"><span class="name">${esc(cfg.name)}</span><span class="role-tag">${esc(cfg.role)}</span>`;
+    if (statusText) html += `<span class="status-tag">${esc(statusText)}</span>`;
+    html += `</div></div>`;
   }
 
   // Show any registered workers not in config (e.g. manually registered)
   for (const w of teamWorkers) {
     if (seen.has(w.name)) continue;
+    const statusText = w.last_status || '';
     const isActive = selectedAgent === w.name && currentView === 'agent';
     html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(w.name)}" onclick="selectAgentByName('${esc(w.name)}')">`;
     html += `<span class="dot live"></span>`;
-    html += `<span class="name">${esc(w.name)}</span>`;
-    html += `<span class="role-tag">${esc(w.role)}</span>`;
-    html += `</div>`;
+    html += `<div style="flex:1;overflow:hidden"><span class="name">${esc(w.name)}</span><span class="role-tag">${esc(w.role)}</span>`;
+    if (statusText) html += `<span class="status-tag">${esc(statusText)}</span>`;
+    html += `</div></div>`;
   }
 
   // Main agent
@@ -315,6 +335,7 @@ function selectView(view) {
   currentView = view;
   selectedAgent = null;
   if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
+  if (msgPollInterval) { clearInterval(msgPollInterval); msgPollInterval = null; }
   document.querySelectorAll('.sidebar .nav-item').forEach(el => el.classList.remove('active'));
   const navEl = document.querySelector(`.sidebar .nav-item[data-view="${view}"]`);
   if (navEl) navEl.classList.add('active');
@@ -341,11 +362,13 @@ function showView(view) {
 // --- Agent detail tabs ---
 let agentTab = 'config';
 let logPollInterval = null;
+let msgPollInterval = null;
 function selectAgentTab(tab) {
   agentTab = tab;
   document.querySelectorAll('.agent-detail .tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
   document.getElementById('agent-config-panel').classList.toggle('hidden', tab !== 'config');
   document.getElementById('agent-events-panel').classList.toggle('hidden', tab !== 'events');
+  document.getElementById('agent-messages-panel').classList.toggle('hidden', tab !== 'messages');
   document.getElementById('agent-logs-panel').classList.toggle('hidden', tab !== 'logs');
   if (tab === 'events') renderAgentEvents();
   // Start/stop log polling
@@ -353,6 +376,12 @@ function selectAgentTab(tab) {
   if (tab === 'logs') {
     fetchAgentLogs();
     logPollInterval = setInterval(fetchAgentLogs, 2000);
+  }
+  // Start/stop message polling
+  if (msgPollInterval) { clearInterval(msgPollInterval); msgPollInterval = null; }
+  if (tab === 'messages') {
+    fetchAgentMessages();
+    msgPollInterval = setInterval(fetchAgentMessages, 3000);
   }
 }
 
@@ -379,6 +408,36 @@ async function fetchAgentLogs() {
     el.textContent = text || '(empty)';
     if (wasAtBottom) el.scrollTop = el.scrollHeight;
   } catch(e) { el.textContent = 'Failed to fetch logs.'; }
+}
+
+async function fetchAgentMessages() {
+  if (!selectedAgent) return;
+  const worker = teamWorkers.find(w => w.name === selectedAgent);
+  const panel = document.getElementById('agent-messages-panel');
+  if (!worker) { panel.innerHTML = '<div class="empty">Agent not registered yet — no messages.</div>'; return; }
+  try {
+    const resp = await fetch(`/api/messages/${encodeURIComponent(worker.id)}?limit=50`);
+    if (!resp.ok) { panel.innerHTML = '<div class="empty">Failed to fetch messages.</div>'; return; }
+    const data = await resp.json();
+    const msgs = data.messages || [];
+    if (msgs.length === 0) { panel.innerHTML = '<div class="empty">No messages yet.</div>'; return; }
+    panel.innerHTML = msgs.map(renderMessage).join('');
+  } catch(e) { panel.innerHTML = '<div class="empty">Failed to fetch messages.</div>'; }
+}
+
+function renderMessage(msg) {
+  const fromName = msg.from ? (resolveWorkerName(msg.from) || msg.from.slice(0,8) + '...') : 'anonymous';
+  const toName = resolveWorkerName(msg.to) || msg.to.slice(0,8) + '...';
+  // Determine badge
+  let badge = '<span class="msg-badge sent">sent</span>';
+  if (msg.acked_at) badge = '<span class="msg-badge acked">acked</span>';
+  else if (msg.delivered_at) badge = '<span class="msg-badge delivered">delivered</span>';
+  const ts = msg.sent_at ? new Date(msg.sent_at * 1000).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+  let html = `<div class="msg-item">`;
+  html += `<div class="msg-header"><span class="ts" style="color:#484f58;font-size:10px">${ts}</span> ${badge} <span class="msg-dir">${esc(fromName)} → ${esc(toName)}</span> <span class="msg-id">${esc(msg.message_id.slice(0,8))}</span></div>`;
+  if (msg.body) html += `<div class="msg-body">${esc(msg.body)}</div>`;
+  html += `</div>`;
+  return html;
 }
 
 // --- Rendering ---
@@ -435,6 +494,10 @@ function renderAgentDetail() {
     const ttlSecs = Math.max(0, worker.expires_at - now);
     cfgHtml += `<div class="config-section"><div class="config-label">TTL</div><div class="config-value"><span data-expires-at="${worker.expires_at}">${formatDuration(ttlSecs)}</span></div></div>`;
     cfgHtml += configBlock('Capabilities', worker.capabilities.join(', ') || 'none');
+    if (worker.last_status) {
+      const statusAge = worker.last_status_at ? formatDuration(Math.max(0, now - worker.last_status_at)) + ' ago' : '';
+      cfgHtml += `<div class="config-section"><div class="config-label">Status</div><div class="config-value" style="color:#79c0ff">${esc(worker.last_status)} <span style="color:#484f58;font-size:10px">${statusAge}</span></div></div>`;
+    }
   }
 
   if (agentCfg) {
@@ -454,18 +517,35 @@ function renderAgentDetail() {
   if (agentTab === 'events') renderAgentEvents();
 }
 
-function renderAgentEvents() {
+async function renderAgentEvents() {
   const panel = document.getElementById('agent-events-panel');
   if (!selectedAgent) { panel.innerHTML = '<div class="empty">Select an agent</div>'; return; }
-  // Find the worker ID(s) for this agent name to filter events
   const worker = teamWorkers.find(w => w.name === selectedAgent);
   const workerId = worker?.id;
-  const filtered = workerId ? allEvents.filter(ev => ev.worker_id === workerId) : [];
-  if (filtered.length === 0) {
-    panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
+  if (!workerId) {
+    panel.innerHTML = '<div class="empty">Agent not registered yet — no events.</div>';
     return;
   }
-  panel.innerHTML = filtered.map(renderEvent).join('');
+  // Fetch full history from API, supplemented by any SSE events not yet in history
+  try {
+    const resp = await fetch(`/api/events/history?worker=${encodeURIComponent(workerId)}&limit=200`);
+    if (!resp.ok) { panel.innerHTML = '<div class="empty">Failed to fetch events.</div>'; return; }
+    const data = await resp.json();
+    const histEvents = (data.events || []).map(e => ({ ...e, _ts: new Date(e.timestamp * 1000) }));
+    if (histEvents.length === 0) {
+      panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
+      return;
+    }
+    panel.innerHTML = histEvents.map(renderEvent).join('');
+  } catch(e) {
+    // Fallback to SSE-cached events
+    const filtered = allEvents.filter(ev => ev.worker_id === workerId);
+    if (filtered.length === 0) {
+      panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
+      return;
+    }
+    panel.innerHTML = filtered.map(renderEvent).join('');
+  }
 }
 
 function configBlock(label, value, isCommand) {
@@ -500,6 +580,14 @@ function formatPayload(kind, p) {
   }
   if (kind === 'register') {
     return `<span class="label">name:</span> ${esc(p.name||'')} <span class="label">role:</span> ${esc(p.role||'')}`;
+  }
+  if (kind === 'ack') {
+    let s = `<span class="label">msg:</span> ${esc((p.message_id||'').slice(0,8))}`;
+    if (p.note) s += ` <span class="body-text">${esc(p.note)}</span>`;
+    return s;
+  }
+  if (kind === 'heartbeat' && p?.status) {
+    return `<span class="body-text">${esc(p.status)}</span>`;
   }
   return esc(JSON.stringify(p));
 }
