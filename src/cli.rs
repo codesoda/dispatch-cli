@@ -99,6 +99,56 @@ pub enum Commands {
         timeout: u64,
     },
 
+    /// Query event history
+    Events {
+        /// Filter by event type (register, send, deliver, ack, heartbeat, expire)
+        #[arg(long, name = "type")]
+        event_type: Option<String>,
+
+        /// Filter by worker ID
+        #[arg(long)]
+        worker: Option<String>,
+
+        /// Show events since timestamp (RFC3339 or relative: 5m, 1h, 30s)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Show events until timestamp (RFC3339 or relative)
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Maximum number of events to return (default: 100)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// Query message history (non-destructive)
+    Messages {
+        /// Worker ID to inspect messages for
+        #[arg(long)]
+        worker_id: String,
+
+        /// Show only delivered but unacked messages
+        #[arg(long)]
+        unacked: bool,
+
+        /// Show messages sent by this worker (instead of received)
+        #[arg(long)]
+        sent: bool,
+
+        /// Show messages since timestamp (RFC3339 or relative: 5m, 1h, 30s)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Maximum number of messages to return
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Look up a single message by ID
+        #[arg(long)]
+        id: Option<String>,
+    },
+
     /// Query worker status
     Status {
         /// Show status for a specific worker

@@ -280,6 +280,7 @@ impl AgentOrchestrator {
                         .unwrap_or_default()
                         .as_secs();
                     let _ = event_tx.send(super::local::BrokerEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
                         kind: "heartbeat".into(),
                         worker_id: String::new(),
                         worker_name: None,

@@ -63,6 +63,7 @@ async fn api_team(State(state): State<MonitorState>) -> axum::Json<Vec<crate::pr
     let expired = broker.evict_expired();
     for id in &expired {
         let _ = state.events.send(super::local::BrokerEvent {
+            id: uuid::Uuid::new_v4().to_string(),
             kind: "expire".to_string(),
             worker_id: id.clone(),
             worker_name: None,

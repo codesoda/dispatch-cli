@@ -19,9 +19,13 @@ const DEFAULT_WORKER_TTL_SECS: u64 = 3600;
 /// Default listen timeout in seconds.
 const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
 
+/// Default maximum number of events retained in history.
+const DEFAULT_EVENT_HISTORY_MAX: usize = 10_000;
+
 /// Event emitted by the broker for the monitor dashboard.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BrokerEvent {
+    pub id: String,
     pub kind: String,
     pub worker_id: String,
     /// Human-readable worker name (for display in UI).
@@ -136,6 +140,14 @@ pub struct BrokerState {
     pub notifiers: HashMap<String, Arc<Notify>>,
     /// Message acknowledgement log keyed by message ID.
     pub ack_log: HashMap<String, AckRecord>,
+    /// Bounded event history for queries.
+    pub event_history: VecDeque<BrokerEvent>,
+    /// Maximum number of events to retain.
+    pub event_history_max: usize,
+    /// Bounded message history for queries (non-destructive inspection).
+    pub message_history: VecDeque<Message>,
+    /// Maximum number of messages to retain in history.
+    pub message_history_max: usize,
     /// Default TTL for workers that don't specify one.
     pub default_ttl: u64,
     /// Total number of messages sent through the broker.
@@ -163,6 +175,10 @@ impl BrokerState {
             mailboxes: HashMap::new(),
             notifiers: HashMap::new(),
             ack_log: HashMap::new(),
+            event_history: VecDeque::new(),
+            event_history_max: DEFAULT_EVENT_HISTORY_MAX,
+            message_history: VecDeque::new(),
+            message_history_max: DEFAULT_EVENT_HISTORY_MAX,
             default_ttl,
             messages_sent: 0,
             messages_delivered: 0,
@@ -291,6 +307,38 @@ impl BrokerState {
         }
     }
 
+    /// Emit an event: broadcast it, record in history, and print to stderr.
+    pub fn emit_and_record(
+        &mut self,
+        tx: &broadcast::Sender<BrokerEvent>,
+        kind: &str,
+        worker_id: &str,
+        detail: &str,
+        payload: Option<serde_json::Value>,
+    ) {
+        let event = BrokerEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: kind.to_string(),
+            worker_id: worker_id.to_string(),
+            worker_name: self.worker_name(worker_id).map(|s| s.to_string()),
+            detail: detail.to_string(),
+            payload,
+            timestamp: now_secs(),
+        };
+        let ts = chrono_ts();
+        let display_name = event.worker_name.as_deref().unwrap_or(worker_id);
+        if let Some(ref p) = event.payload {
+            eprintln!("[{ts}] {:>10}  {display_name}  {}  {p}", event.kind, event.detail);
+        } else {
+            eprintln!("[{ts}] {:>10}  {display_name}  {}", event.kind, event.detail);
+        }
+        let _ = tx.send(event.clone());
+        self.event_history.push_back(event);
+        while self.event_history.len() > self.event_history_max {
+            self.event_history.pop_front();
+        }
+    }
+
     /// Clear a worker's status without affecting registration.
     pub fn clear_status(&mut self, worker_id: &str) -> Result<(), String> {
         self.evict_expired();
@@ -315,15 +363,24 @@ impl BrokerState {
         if !self.workers.contains_key(worker_id) {
             return Err(format!("worker not found or expired: {worker_id}"));
         }
+        let now = now_secs();
         self.ack_log.insert(
             message_id.to_string(),
             AckRecord {
                 message_id: message_id.to_string(),
                 worker_id: worker_id.to_string(),
                 note,
-                acked_at: now_secs(),
+                acked_at: now,
             },
         );
+        // Update acked_at in message history.
+        if let Some(hist) = self
+            .message_history
+            .iter_mut()
+            .find(|m| m.message_id == message_id)
+        {
+            hist.acked_at = Some(now);
+        }
         Ok(())
     }
 
@@ -339,13 +396,22 @@ impl BrokerState {
         if !self.workers.contains_key(&to) {
             return None;
         }
+        let now = now_secs();
         let message_id = uuid::Uuid::new_v4().to_string();
         let message = Message {
             message_id: message_id.clone(),
             from,
             to: to.clone(),
             body,
+            sent_at: Some(now),
+            delivered_at: None,
+            acked_at: None,
         };
+        // Record in history before moving into mailbox.
+        self.message_history.push_back(message.clone());
+        while self.message_history.len() > self.message_history_max {
+            self.message_history.pop_front();
+        }
         self.mailboxes
             .entry(to.clone())
             .or_default()
@@ -358,8 +424,85 @@ impl BrokerState {
     }
 
     /// Pop the next message from a worker's mailbox, if any.
+    /// Also marks the message as delivered in the history.
     pub fn pop_message(&mut self, worker_id: &str) -> Option<Message> {
-        self.mailboxes.get_mut(worker_id)?.pop_front()
+        let msg = self.mailboxes.get_mut(worker_id)?.pop_front()?;
+        // Update delivered_at in history.
+        let now = now_secs();
+        if let Some(hist) = self
+            .message_history
+            .iter_mut()
+            .find(|m| m.message_id == msg.message_id)
+        {
+            hist.delivered_at = Some(now);
+        }
+        Some(msg)
+    }
+
+    /// Query event history with optional filters.
+    pub fn query_events(
+        &self,
+        since: Option<u64>,
+        until: Option<u64>,
+        event_type: Option<&str>,
+        worker: Option<&str>,
+        limit: Option<usize>,
+    ) -> Vec<&BrokerEvent> {
+        let limit = limit.unwrap_or(100);
+        self.event_history
+            .iter()
+            .rev() // most recent first
+            .filter(|e| since.is_none_or(|ts| e.timestamp >= ts))
+            .filter(|e| until.is_none_or(|ts| e.timestamp <= ts))
+            .filter(|e| event_type.is_none_or(|t| e.kind == t))
+            .filter(|e| worker.is_none_or(|w| e.worker_id == w))
+            .take(limit)
+            .collect()
+    }
+
+    /// Query message history with optional filters.
+    pub fn query_messages(
+        &self,
+        worker_id: &str,
+        unacked: bool,
+        sent: bool,
+        since: Option<u64>,
+        limit: Option<usize>,
+        id: Option<&str>,
+    ) -> Vec<&Message> {
+        let limit = limit.unwrap_or(100);
+
+        // Single message by ID
+        if let Some(msg_id) = id {
+            return self
+                .message_history
+                .iter()
+                .filter(|m| m.message_id == msg_id)
+                .collect();
+        }
+
+        self.message_history
+            .iter()
+            .rev() // most recent first
+            .filter(|m| {
+                if sent {
+                    m.from.as_deref() == Some(worker_id)
+                } else {
+                    m.to == worker_id
+                }
+            })
+            .filter(|m| {
+                if unacked {
+                    m.delivered_at.is_some() && m.acked_at.is_none()
+                } else {
+                    true
+                }
+            })
+            .filter(|m| {
+                since.is_none_or(|ts| m.sent_at.unwrap_or(0) >= ts)
+            })
+            .take(limit)
+            .collect()
     }
 
     /// Get or create the Notify handle for a worker's mailbox.
@@ -628,30 +771,7 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Emit a broker event (best-effort, ignores send failures).
-/// Also prints a human-readable line to stderr for the serve console.
-fn emit_event(
-    tx: &broadcast::Sender<BrokerEvent>,
-    kind: &str,
-    worker_id: &str,
-    detail: &str,
-    payload: Option<serde_json::Value>,
-) {
-    let ts = chrono_ts();
-    if let Some(ref p) = payload {
-        eprintln!("[{ts}] {kind:>10}  {worker_id}  {detail}  {p}");
-    } else {
-        eprintln!("[{ts}] {kind:>10}  {worker_id}  {detail}");
-    }
-    let _ = tx.send(BrokerEvent {
-        kind: kind.to_string(),
-        worker_id: worker_id.to_string(),
-        worker_name: None,
-        detail: detail.to_string(),
-        payload,
-        timestamp: now_secs(),
-    });
-}
+
 
 /// Format current time as HH:MM:SS for console output.
 fn chrono_ts() -> String {
@@ -691,7 +811,7 @@ async fn handle_request(
                 evict,
             );
             tracing::info!(worker_id = %worker_id, "worker registered");
-            emit_event(
+            state.emit_and_record(
                 event_tx,
                 "register",
                 &worker_id,
@@ -733,7 +853,7 @@ async fn handle_request(
                 Some(message_id) => {
                     state.messages_sent += 1;
                     tracing::info!(message_id = %message_id, to = %to, "message queued");
-                    emit_event(
+                    state.emit_and_record(
                         event_tx,
                         "send",
                         &to,
@@ -773,7 +893,7 @@ async fn handle_request(
                 let mut s = state.lock().await;
                 let expired = s.evict_expired();
                 for id in &expired {
-                    emit_event(event_tx, "expire", id, "worker expired", None);
+                    s.emit_and_record(event_tx, "expire", id, "worker expired", None);
                 }
                 if !s.workers.contains_key(&worker_id) {
                     return BrokerResponse::Error {
@@ -792,25 +912,25 @@ async fn handle_request(
             // If a message was immediately available, return it.
             if let Some(msg) = immediate_msg {
                 {
-                    state.lock().await.messages_delivered += 1;
+                    let mut s = state.lock().await;
+                    s.messages_delivered += 1;
+                    s.emit_and_record(
+                        event_tx,
+                        "deliver",
+                        &worker_id,
+                        &format!(
+                            "from {} → {}",
+                            msg.from.as_deref().unwrap_or("anonymous"),
+                            &worker_id
+                        ),
+                        Some(serde_json::json!({
+                            "from": msg.from,
+                            "to": msg.to,
+                            "body": msg.body,
+                            "message_id": &msg.message_id[..8],
+                        })),
+                    );
                 }
-                tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: immediate delivery");
-                emit_event(
-                    event_tx,
-                    "deliver",
-                    &worker_id,
-                    &format!(
-                        "from {} → {}",
-                        msg.from.as_deref().unwrap_or("anonymous"),
-                        &worker_id
-                    ),
-                    Some(serde_json::json!({
-                        "from": msg.from,
-                        "to": msg.to,
-                        "body": msg.body,
-                        "message_id": &msg.message_id[..8],
-                    })),
-                );
                 return BrokerResponse::Ok {
                     payload: ResponsePayload::Message {
                         message_id: msg.message_id,
@@ -831,7 +951,7 @@ async fn handle_request(
                 if let Some(msg) = s.pop_message(&worker_id) {
                     s.messages_delivered += 1;
                     tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: delivered after wait");
-                    emit_event(
+                    s.emit_and_record(
                         event_tx,
                         "deliver",
                         &worker_id,
@@ -878,7 +998,7 @@ async fn handle_request(
                 Some(expires_at) => {
                     let detail = if has_status { "TTL renewed + status updated" } else { "TTL renewed" };
                     tracing::info!(worker_id = %worker_id, expires_at, "heartbeat renewed");
-                    emit_event(
+                    state.emit_and_record(
                         event_tx,
                         "heartbeat",
                         &worker_id,
@@ -907,7 +1027,7 @@ async fn handle_request(
             match state.ack_message(&worker_id, &message_id, note) {
                 Ok(()) => {
                     tracing::info!(worker_id = %worker_id, message_id = %message_id, "message acked");
-                    emit_event(
+                    state.emit_and_record(
                         event_tx,
                         "ack",
                         &worker_id,
@@ -949,6 +1069,53 @@ async fn handle_request(
                 BrokerResponse::Ok {
                     payload: ResponsePayload::StatusResult { workers },
                 }
+            }
+        }
+        BrokerRequest::Events {
+            since,
+            until,
+            event_type,
+            worker,
+            limit,
+        } => {
+            let state = state.lock().await;
+            let events = state.query_events(
+                since,
+                until,
+                event_type.as_deref(),
+                worker.as_deref(),
+                limit,
+            );
+            let events_json: Vec<serde_json::Value> = events
+                .into_iter()
+                .map(|e| serde_json::to_value(e).unwrap_or_default())
+                .collect();
+            BrokerResponse::Ok {
+                payload: ResponsePayload::EventList {
+                    events: events_json,
+                },
+            }
+        }
+        BrokerRequest::Messages {
+            worker_id,
+            unacked,
+            sent,
+            since,
+            limit,
+            id,
+        } => {
+            let state = state.lock().await;
+            let messages = state.query_messages(
+                &worker_id,
+                unacked,
+                sent,
+                since,
+                limit,
+                id.as_deref(),
+            );
+            let messages: Vec<Message> = messages.into_iter().cloned().collect();
+            BrokerResponse::Ok {
+                payload: ResponsePayload::MessageList { messages },
             }
         }
     }

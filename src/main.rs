@@ -1,4 +1,5 @@
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
@@ -7,6 +8,44 @@ use dispatch::cli::{Cli, Commands};
 use dispatch::config::resolve_config;
 use dispatch::logging::init_tracing;
 use dispatch::protocol::BrokerRequest;
+
+/// Parse a timestamp string as either a relative duration (e.g. "5m", "1h", "30s")
+/// or an absolute Unix timestamp. Returns a Unix timestamp in seconds.
+fn parse_timestamp(s: &str) -> Result<u64, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Try relative duration: number + suffix (s/m/h/d)
+    if let Some(num_str) = s.strip_suffix('s') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(now.saturating_sub(n));
+        }
+    }
+    if let Some(num_str) = s.strip_suffix('m') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(now.saturating_sub(n * 60));
+        }
+    }
+    if let Some(num_str) = s.strip_suffix('h') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(now.saturating_sub(n * 3600));
+        }
+    }
+    if let Some(num_str) = s.strip_suffix('d') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(now.saturating_sub(n * 86400));
+        }
+    }
+
+    // Try absolute Unix timestamp
+    if let Ok(ts) = s.parse::<u64>() {
+        return Ok(ts);
+    }
+
+    Err(format!("invalid timestamp: {s} (use relative like 5m/1h/30s or a Unix timestamp)"))
+}
 
 #[tokio::main]
 async fn main() {
@@ -85,6 +124,59 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     worker_id,
                     timeout_secs: timeout,
                 },
+                Commands::Events {
+                    event_type,
+                    worker,
+                    since,
+                    until,
+                    limit,
+                } => {
+                    let since = since
+                        .map(|s| parse_timestamp(&s))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("dispatch: {e}");
+                            process::exit(2);
+                        });
+                    let until = until
+                        .map(|s| parse_timestamp(&s))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("dispatch: {e}");
+                            process::exit(2);
+                        });
+                    BrokerRequest::Events {
+                        since,
+                        until,
+                        event_type,
+                        worker,
+                        limit,
+                    }
+                }
+                Commands::Messages {
+                    worker_id,
+                    unacked,
+                    sent,
+                    since,
+                    limit,
+                    id,
+                } => {
+                    let since = since
+                        .map(|s| parse_timestamp(&s))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("dispatch: {e}");
+                            process::exit(2);
+                        });
+                    BrokerRequest::Messages {
+                        worker_id,
+                        unacked,
+                        sent,
+                        since,
+                        limit,
+                        id,
+                    }
+                }
                 Commands::Status { worker_id, clear } => {
                     BrokerRequest::Status { worker_id, clear }
                 }

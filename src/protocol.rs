@@ -8,6 +8,15 @@ pub struct Message {
     pub from: Option<String>,
     pub to: String,
     pub body: String,
+    /// When the message was sent (queued by the broker).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<u64>,
+    /// When the message was delivered to the recipient via listen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<u64>,
+    /// When the message was acknowledged by the recipient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<u64>,
 }
 
 /// A request sent from a client to the broker over the Unix socket.
@@ -54,6 +63,33 @@ pub enum BrokerRequest {
         message_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+    },
+    /// Query event history.
+    Events {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        event_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// Query message history.
+    Messages {
+        worker_id: String,
+        #[serde(default)]
+        unacked: bool,
+        #[serde(default)]
+        sent: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// Query worker status or clear a worker's status.
     Status {
@@ -140,6 +176,12 @@ pub enum ResponsePayload {
     },
     /// Worker status query result.
     StatusResult { workers: Vec<WorkerStatus> },
+    /// Event history query result.
+    EventList {
+        events: Vec<serde_json::Value>,
+    },
+    /// Message history query result.
+    MessageList { messages: Vec<Message> },
     /// Listen timed out with no messages.
     Timeout { worker_id: String },
     /// Map of arbitrary key-value data (used as a flexible response shape).
