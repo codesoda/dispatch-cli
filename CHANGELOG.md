@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-19
+
+### Added
+- Adapter abstraction for agent launches — each `[[agents]]` entry declares `adapter = "command" | "claude" | "codex"` instead of embedding a shell one-liner
+- `extra_args = [...]` on agents — adapter-appended argv without touching the launch string
+- Per-agent `launch = true/false` flag (auto-start only agents with `launch = true`)
+- Prompt files now piped as stdin for the `claude` and `codex` adapters (no more `< {prompt_file}` shell redirect)
+- Introspection commands: `dispatch ack`, `dispatch status`, `dispatch heartbeat --status`, `dispatch events`, `dispatch messages`, `dispatch history`
+- Monitor UI: events history drawer, messages tab, status taglines, ack-aware row colors
+- Per-agent log files at `logs/<name>.log`
+
+### Changed
+- Agent configs require `adapter = "..."`; the old `command = "..."` shell-one-liner shape no longer parses and must be migrated
+
 ## [0.3.1] - 2026-04-16
 
 ### Added
