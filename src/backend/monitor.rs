@@ -61,11 +61,11 @@ async fn dashboard() -> Html<&'static str> {
 async fn api_team(State(state): State<MonitorState>) -> axum::Json<Vec<crate::protocol::Worker>> {
     let mut broker = state.broker.lock().await;
     let expired = broker.evict_expired();
-    for id in &expired {
+    for (id, name) in &expired {
         let _ = state.events.send(super::local::BrokerEvent {
             kind: "expire".to_string(),
             worker_id: id.clone(),
-            worker_name: None,
+            worker_name: Some(name.clone()),
             detail: "worker expired".to_string(),
             payload: None,
             timestamp: super::local::now_secs(),
@@ -184,6 +184,9 @@ fn default_log_lines() -> usize {
     200
 }
 
+/// Hard cap on `lines` to bound memory usage on a large log file.
+const MAX_LOG_LINES: usize = 5_000;
+
 /// Return the tail of an agent's log file.
 async fn api_logs(
     State(state): State<MonitorState>,
@@ -193,20 +196,22 @@ async fn api_logs(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    // Sanitise agent name to prevent path traversal.
-    if agent.contains('/') || agent.contains('\\') || agent.contains("..") {
+    // Allowlist agent name: must be a single non-empty filename component
+    // composed only of `[A-Za-z0-9_-]` so it cannot escape `log_dir`.
+    if !super::orchestrator::is_safe_name(&agent) {
         return (StatusCode::BAD_REQUEST, "invalid agent name").into_response();
     }
 
     let log_path = state.log_dir.join(format!("{agent}.log"));
-    let content = match std::fs::read_to_string(&log_path) {
+    let content = match tokio::fs::read_to_string(&log_path).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::NOT_FOUND, "log file not found").into_response(),
     };
 
-    // Return the last N lines.
+    // Return the last N lines, capped to MAX_LOG_LINES.
+    let requested = query.lines.min(MAX_LOG_LINES);
     let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(query.lines);
+    let start = lines.len().saturating_sub(requested);
     let tail: String = lines[start..].join("\n");
 
     (

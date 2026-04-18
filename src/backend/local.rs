@@ -207,21 +207,22 @@ impl BrokerState {
     }
 
     /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
-    /// Returns the IDs of workers that were evicted.
-    pub fn evict_expired(&mut self) -> Vec<String> {
+    /// Returns `(id, name)` pairs for the evicted workers so callers can populate
+    /// expire events with the worker's name (which is otherwise lost on removal).
+    pub fn evict_expired(&mut self) -> Vec<(String, String)> {
         let now = now_secs();
-        let expired_ids: Vec<String> = self
+        let expired: Vec<(String, String)> = self
             .workers
             .iter()
             .filter(|(_, w)| w.expires_at <= now)
-            .map(|(id, _)| id.clone())
+            .map(|(id, w)| (id.clone(), w.name.clone()))
             .collect();
-        for id in &expired_ids {
+        for (id, _) in &expired {
             self.workers.remove(id);
             self.mailboxes.remove(id);
             self.notifiers.remove(id);
         }
-        expired_ids
+        expired
     }
 
     /// Return a list of all active (non-expired) workers.
@@ -382,6 +383,10 @@ pub async fn serve(
     // Shutdown signal shared with the monitor dashboard.
     let monitor_shutdown = Arc::new(Notify::new());
 
+    // Single source of truth for the log directory — used by both the
+    // orchestrator (writes) and the monitor (reads via /api/logs/{agent}).
+    let log_dir = config.project_root.join("logs");
+
     // Optionally start the HTTP monitor dashboard.
     let monitor_url = if let Some(port) = monitor_port {
         let url = format!("http://localhost:{port}");
@@ -395,7 +400,7 @@ pub async fn serve(
             agents: config.agents.clone(),
             main_agent: config.main_agent.clone(),
             heartbeats: config.heartbeats.clone(),
-            log_dir: config.project_root.join("logs"),
+            log_dir: log_dir.clone(),
             monitor_url: Some(url.clone()),
         };
         tokio::spawn(async move {
@@ -420,6 +425,7 @@ pub async fn serve(
         &socket,
         monitor_url.clone(),
         &config.agent_cwd,
+        log_dir,
     );
 
     if launch_agents {
@@ -545,10 +551,15 @@ async fn handle_connection(
 
 /// Emit a broker event (best-effort, ignores send failures).
 /// Also prints a human-readable line to stderr for the serve console.
+///
+/// `worker_name` should be supplied whenever it can be looked up at the call
+/// site — once a worker is evicted the name is gone, so the UI relies on this
+/// being populated to show a human-readable label in the event stream.
 fn emit_event(
     tx: &broadcast::Sender<BrokerEvent>,
     kind: &str,
     worker_id: &str,
+    worker_name: Option<&str>,
     detail: &str,
     payload: Option<serde_json::Value>,
 ) {
@@ -561,7 +572,7 @@ fn emit_event(
     let _ = tx.send(BrokerEvent {
         kind: kind.to_string(),
         worker_id: worker_id.to_string(),
-        worker_name: None,
+        worker_name: worker_name.map(|s| s.to_string()),
         detail: detail.to_string(),
         payload,
         timestamp: now_secs(),
@@ -610,6 +621,7 @@ async fn handle_request(
                 event_tx,
                 "register",
                 &worker_id,
+                Some(&name),
                 &format!("{name} ({role})"),
                 Some(serde_json::json!({
                     "name": name,
@@ -644,6 +656,7 @@ async fn handle_request(
             }
             let body_clone = body.clone();
             let from_clone = from.clone();
+            let recipient_name = state.worker_name(&to).map(|s| s.to_string());
             match state.send_message(to.clone(), body, from) {
                 Some(message_id) => {
                     state.messages_sent += 1;
@@ -652,6 +665,7 @@ async fn handle_request(
                         event_tx,
                         "send",
                         &to,
+                        recipient_name.as_deref(),
                         &format!(
                             "from {} → {}",
                             from_clone.as_deref().unwrap_or("anonymous"),
@@ -684,11 +698,11 @@ async fn handle_request(
             };
 
             // Check worker exists and renew TTL; get notifier and try immediate pop.
-            let (notifier, immediate_msg) = {
+            let (notifier, immediate_msg, listener_name) = {
                 let mut s = state.lock().await;
                 let expired = s.evict_expired();
-                for id in &expired {
-                    emit_event(event_tx, "expire", id, "worker expired", None);
+                for (id, name) in &expired {
+                    emit_event(event_tx, "expire", id, Some(name), "worker expired", None);
                 }
                 if !s.workers.contains_key(&worker_id) {
                     return BrokerResponse::Error {
@@ -701,7 +715,8 @@ async fn handle_request(
                 }
                 let notifier = s.get_notifier(&worker_id);
                 let msg = s.pop_message(&worker_id);
-                (notifier, msg)
+                let name = s.worker_name(&worker_id).map(|s| s.to_string());
+                (notifier, msg, name)
             };
 
             // If a message was immediately available, return it.
@@ -714,6 +729,7 @@ async fn handle_request(
                     event_tx,
                     "deliver",
                     &worker_id,
+                    listener_name.as_deref(),
                     &format!(
                         "from {} → {}",
                         msg.from.as_deref().unwrap_or("anonymous"),
@@ -746,10 +762,12 @@ async fn handle_request(
                 if let Some(msg) = s.pop_message(&worker_id) {
                     s.messages_delivered += 1;
                     tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: delivered after wait");
+                    let name = s.worker_name(&worker_id).map(|s| s.to_string());
                     emit_event(
                         event_tx,
                         "deliver",
                         &worker_id,
+                        name.as_deref(),
                         &format!(
                             "from {} → {}",
                             msg.from.as_deref().unwrap_or("anonymous"),
@@ -790,7 +808,15 @@ async fn handle_request(
             match state.heartbeat_worker(&worker_id) {
                 Some(expires_at) => {
                     tracing::info!(worker_id = %worker_id, expires_at, "heartbeat renewed");
-                    emit_event(event_tx, "heartbeat", &worker_id, "TTL renewed", None);
+                    let name = state.worker_name(&worker_id).map(|s| s.to_string());
+                    emit_event(
+                        event_tx,
+                        "heartbeat",
+                        &worker_id,
+                        name.as_deref(),
+                        "TTL renewed",
+                        None,
+                    );
                     BrokerResponse::Ok {
                         payload: ResponsePayload::HeartbeatAck {
                             worker_id,

@@ -98,15 +98,15 @@
   <h1 id="title">Dispatch Monitor</h1>
   <span class="cell" id="cell-id"></span>
   <span class="spacer"></span>
-  <button class="stop-btn" id="stop-btn" onclick="stopServer()">Stop Server</button>
+  <button class="stop-btn" id="stop-btn">Stop Server</button>
 </div>
 <div class="layout">
   <div class="sidebar">
     <div class="section-label">Views</div>
-    <div class="nav-item active" data-view="dashboard" onclick="selectView('dashboard')">
+    <div class="nav-item active" data-view="dashboard">
       <span class="name">Dashboard</span>
     </div>
-    <div class="nav-item" data-view="all" onclick="selectView('all')">
+    <div class="nav-item" data-view="all">
       <span class="name">All Events</span>
     </div>
     <div class="section-label">Agents</div>
@@ -141,9 +141,9 @@
     <!-- Agent detail view -->
     <div class="agent-detail hidden" id="view-agent">
       <div class="tab-bar">
-        <div class="tab active" data-tab="config" onclick="selectAgentTab('config')">Config</div>
-        <div class="tab" data-tab="events" onclick="selectAgentTab('events')">Events</div>
-        <div class="tab" data-tab="logs" onclick="selectAgentTab('logs')">Logs</div>
+        <div class="tab active" data-tab="config">Config</div>
+        <div class="tab" data-tab="events">Events</div>
+        <div class="tab" data-tab="logs">Logs</div>
       </div>
       <div id="agent-config-panel">
         <div class="empty">Select an agent</div>
@@ -176,12 +176,38 @@ let serverTimeDrift = 0; // server_time - client_time (to correct clock skew)
 
 // --- Initialization ---
 async function init() {
+  setupEventListeners();
   await Promise.all([fetchAgentConfigs(), refreshTeam(), pingServer()]);
   setupSSE();
   setInterval(refreshTeam, 2000);
   setInterval(pingServer, 5000);
   setInterval(tickUI, 1000); // tick uptime + TTL every second
   sparkInterval = setInterval(tickSparkline, 1000);
+}
+
+// Wire up all click handlers via delegation. Agent names from config flow
+// through `data-*` attributes (HTML-escaped via `esc()`) and are read at
+// click time from `dataset` — never interpolated into JS or HTML strings,
+// so a name containing `'` or `<` cannot break out of context.
+function setupEventListeners() {
+  document.getElementById('stop-btn').addEventListener('click', stopServer);
+  document.querySelectorAll('.sidebar .nav-item[data-view]').forEach(el => {
+    el.addEventListener('click', () => selectView(el.dataset.view));
+  });
+  document.querySelectorAll('.agent-detail .tab[data-tab]').forEach(el => {
+    el.addEventListener('click', () => selectAgentTab(el.dataset.tab));
+  });
+  // Delegated: agent list is re-rendered, so listen on the parent.
+  document.getElementById('agent-list').addEventListener('click', (ev) => {
+    const item = ev.target.closest('[data-agent-name]');
+    if (item) selectAgentByName(item.dataset.agentName);
+  });
+  // Delegated: launch-cmd copy button is inside a re-rendered config panel.
+  document.getElementById('agent-config-panel').addEventListener('click', (ev) => {
+    if (ev.target.matches('.copy-btn[data-action="copy-launch"]')) {
+      copyLaunchCmd();
+    }
+  });
 }
 
 // --- SSE ---
@@ -269,14 +295,17 @@ function renderSidebar() {
   const seen = new Set();
   let html = '';
 
-  // Show configured agents first (they're always expected)
+  // Show configured agents first (they're always expected).
+  // Agent names go through `data-agent-name="..."` (HTML-attr escaped via `esc()`)
+  // and are read back from `dataset` by the delegated click handler — never
+  // interpolated into a JS string.
   for (const cfg of agentConfigs) {
     if (cfg._isMain) continue; // main agent shown separately
     seen.add(cfg.name);
     const worker = teamWorkers.find(w => w.name === cfg.name);
     const isLive = !!worker;
     const isActive = selectedAgent === cfg.name && currentView === 'agent';
-    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(cfg.name)}" onclick="selectAgentByName('${esc(cfg.name)}')">`;
+    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(cfg.name)}">`;
     html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
     html += `<span class="name">${esc(cfg.name)}</span>`;
     html += `<span class="role-tag">${esc(cfg.role)}</span>`;
@@ -287,7 +316,7 @@ function renderSidebar() {
   for (const w of teamWorkers) {
     if (seen.has(w.name)) continue;
     const isActive = selectedAgent === w.name && currentView === 'agent';
-    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(w.name)}" onclick="selectAgentByName('${esc(w.name)}')">`;
+    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(w.name)}">`;
     html += `<span class="dot live"></span>`;
     html += `<span class="name">${esc(w.name)}</span>`;
     html += `<span class="role-tag">${esc(w.role)}</span>`;
@@ -300,7 +329,7 @@ function renderSidebar() {
     const mainWorker = teamWorkers.find(w => w.role === 'main-agent' || w.name === 'main');
     const isLive = !!mainWorker;
     const isActive = selectedAgent === 'main' && currentView === 'agent';
-    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="main" onclick="selectAgentByName('main')">`;
+    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="main">`;
     html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
     html += `<span class="name">main</span>`;
     html += `<span class="role-tag">coordinator</span>`;
@@ -442,10 +471,11 @@ function renderAgentDetail() {
     if (agentCfg.prompt) cfgHtml += configBlock('Prompt', agentCfg.prompt);
   }
 
-  // Launch command (copyable)
+  // Launch command (copyable). The Copy button is wired via the delegated
+  // listener on #agent-config-panel (see setupEventListeners).
   const launchCmd = agentCfg?.launch_command;
   if (launchCmd) {
-    cfgHtml += `<div class="config-section"><div class="config-label">Launch Command</div><div class="config-value command copy-cmd" id="launch-cmd-block"><code>${esc(launchCmd)}</code><button class="copy-btn" onclick="copyLaunchCmd()">Copy</button></div></div>`;
+    cfgHtml += `<div class="config-section"><div class="config-label">Launch Command</div><div class="config-value command copy-cmd" id="launch-cmd-block"><code>${esc(launchCmd)}</code><button class="copy-btn" data-action="copy-launch">Copy</button></div></div>`;
   }
 
   configPanel.innerHTML = cfgHtml;
@@ -457,10 +487,14 @@ function renderAgentDetail() {
 function renderAgentEvents() {
   const panel = document.getElementById('agent-events-panel');
   if (!selectedAgent) { panel.innerHTML = '<div class="empty">Select an agent</div>'; return; }
-  // Find the worker ID(s) for this agent name to filter events
+  // Match events by current worker_id (if the worker is still registered)
+  // OR by worker_name on the event itself — so history for a worker that has
+  // since expired/been evicted still shows up under that agent.
   const worker = teamWorkers.find(w => w.name === selectedAgent);
   const workerId = worker?.id;
-  const filtered = workerId ? allEvents.filter(ev => ev.worker_id === workerId) : [];
+  const filtered = allEvents.filter(ev =>
+    (workerId && ev.worker_id === workerId) || ev.worker_name === selectedAgent
+  );
   if (filtered.length === 0) {
     panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
     return;
