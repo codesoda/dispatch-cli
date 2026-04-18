@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `dispatch {codex,claude}-hook stop` now probes the broker socket before deciding. If the broker is reachable, it emits the block decision as before. If the socket is missing, refused, or times out (≤250ms), it exits 0 with empty stdout so the vendor CLI is free to stop the agent cleanly. Lets dispatch shut down without holding vendor agents hostage.
+
 ## [0.4.1] - 2026-04-19
 
 ### Added

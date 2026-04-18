@@ -550,7 +550,7 @@ pub fn now_secs() -> u64 {
 /// so no additional path components are needed. Using `/tmp` avoids the
 /// Unix domain socket `SUN_LEN` limit (104 bytes on macOS) that triggers
 /// when project paths are deeply nested.
-fn socket_path(_project_root: &Path, cell_id: &str) -> PathBuf {
+pub(crate) fn socket_path(_project_root: &Path, cell_id: &str) -> PathBuf {
     PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"))
 }
 

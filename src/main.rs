@@ -79,12 +79,14 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         return Ok(());
     }
 
-    // Hook subcommands are local file operations / stdout — no broker, no config.
+    // Hook subcommands don't go through the broker as a client; the Stop
+    // handler probes the socket directly so it can fall back to "allow stop"
+    // when the broker is unreachable.
     if let Commands::CodexHook { action } = &cli.command {
-        return run_codex_hook(action, &cwd);
+        return run_codex_hook(action, &cwd).await;
     }
     if let Commands::ClaudeHook { action } = &cli.command {
-        return run_claude_hook(action, &cwd);
+        return run_claude_hook(action, &cwd).await;
     }
 
     let config = resolve_config(cli.cell_id.as_deref(), cli.config.as_deref(), &cwd)?;
@@ -217,45 +219,79 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
     Ok(())
 }
 
-fn run_codex_hook(
+async fn run_codex_hook(
     action: &HookAction,
     cwd: &std::path::Path,
 ) -> Result<(), dispatch::errors::DispatchError> {
     match action {
-        HookAction::Stop => {
-            println!("{}", hooks::stop_decision_json());
-        }
+        HookAction::Stop => run_stop_hook("codex-hook", cwd).await,
         HookAction::Install => {
             let path = hooks::codex::install(cwd)?;
             eprintln!(
                 "installed codex hook at {}\nensure features.codex_hooks = true is set in .codex/config.toml (already added if missing)",
                 path.display()
             );
+            Ok(())
         }
-        HookAction::Uninstall => match hooks::codex::uninstall(cwd)? {
-            Some(path) => eprintln!("removed {}", path.display()),
-            None => eprintln!("no codex hook installed"),
-        },
+        HookAction::Uninstall => {
+            match hooks::codex::uninstall(cwd)? {
+                Some(path) => eprintln!("removed {}", path.display()),
+                None => eprintln!("no codex hook installed"),
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
-fn run_claude_hook(
+async fn run_claude_hook(
     action: &HookAction,
     cwd: &std::path::Path,
 ) -> Result<(), dispatch::errors::DispatchError> {
     match action {
-        HookAction::Stop => {
-            println!("{}", hooks::stop_decision_json());
-        }
+        HookAction::Stop => run_stop_hook("claude-hook", cwd).await,
         HookAction::Install => {
             let path = hooks::claude::install(cwd)?;
             eprintln!("installed claude hook at {}", path.display());
+            Ok(())
         }
-        HookAction::Uninstall => match hooks::claude::uninstall(cwd)? {
-            Some(path) => eprintln!("removed entry from {}", path.display()),
-            None => eprintln!("no claude hook installed"),
-        },
+        HookAction::Uninstall => {
+            match hooks::claude::uninstall(cwd)? {
+                Some(path) => eprintln!("removed entry from {}", path.display()),
+                None => eprintln!("no claude hook installed"),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Stop-hook body shared by both vendor handlers.
+///
+/// Probes the broker socket (env var or config-derived); prints the block
+/// JSON only when the broker answers. A missing / refused / timed-out
+/// socket means dispatch isn't available to do anything with this agent, so
+/// we emit nothing and let the vendor CLI stop the agent cleanly.
+async fn run_stop_hook(
+    kind: &'static str,
+    cwd: &std::path::Path,
+) -> Result<(), dispatch::errors::DispatchError> {
+    let socket = hooks::resolve_socket_path(cwd);
+    let alive = match socket.as_deref() {
+        Some(path) => hooks::broker_is_alive(path).await,
+        None => false,
+    };
+    if alive {
+        tracing::debug!(
+            hook = kind,
+            socket = ?socket,
+            "stop hook: broker alive, blocking stop"
+        );
+        println!("{}", hooks::stop_decision_json());
+    } else {
+        tracing::debug!(
+            hook = kind,
+            socket = ?socket,
+            "stop hook: broker unreachable, allowing stop"
+        );
     }
     Ok(())
 }

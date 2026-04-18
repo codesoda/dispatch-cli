@@ -370,6 +370,91 @@ fn listen_times_out_with_no_messages() {
     );
 }
 
+// ── Stop-hook broker-liveness probe ───────────────────────────────────
+
+/// With no broker reachable (env points at a nonexistent socket and no
+/// config in cwd), the stop hook must emit nothing and exit 0 — the vendor
+/// CLI treats empty stdout as "allow stop".
+#[test]
+fn codex_hook_stop_is_silent_when_broker_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let fake_socket = dir.path().join("does-not-exist.sock");
+
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &fake_socket)
+        .env_remove("DISPATCH_CELL_ID")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "expected empty stdout when broker unreachable, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn claude_hook_stop_is_silent_when_broker_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let fake_socket = dir.path().join("does-not-exist.sock");
+
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("claude-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &fake_socket)
+        .env_remove("DISPATCH_CELL_ID")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "expected empty stdout when broker unreachable, got: {stdout:?}"
+    );
+}
+
+/// With a live broker socket (env var points at it), the stop hook must
+/// print the block-decision JSON so the agent stays alive for the next
+/// dispatch message.
+#[test]
+fn codex_hook_stop_blocks_when_broker_alive() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-codex-hook-alive";
+    let _broker = start_broker(&dir, cell_id);
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &socket)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("stop hook stdout should be JSON: {stdout:?}"));
+    assert_eq!(json["decision"], "block");
+    assert!(
+        json["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "block decision must carry a non-empty reason"
+    );
+}
+
 // ── stdout/stderr separation ──────────────────────────────────────────
 
 #[test]
