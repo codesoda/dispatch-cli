@@ -164,8 +164,6 @@ fn resolve_agent_config(
     })
 }
 
-
-
 /// Find `dispatch.config.toml` in the current directory.
 /// Returns the path to the config file and the directory containing it.
 pub fn find_config_file(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -308,20 +306,28 @@ fn resolve_config_inner(
     };
 
     // Extract fields from config file
-    let (name, backend, default_ttl, config_cwd, monitor_config, raw_agents, main_agent_config, heartbeats) =
-        match config_file {
-            Some(c) => (
-                c.name,
-                c.backend,
-                c.default_ttl,
-                c.cwd,
-                c.monitor,
-                c.agents,
-                c.main_agent,
-                c.heartbeats,
-            ),
-            None => (None, None, None, None, None, vec![], None, vec![]),
-        };
+    let (
+        name,
+        backend,
+        default_ttl,
+        config_cwd,
+        monitor_config,
+        raw_agents,
+        main_agent_config,
+        heartbeats,
+    ) = match config_file {
+        Some(c) => (
+            c.name,
+            c.backend,
+            c.default_ttl,
+            c.cwd,
+            c.monitor,
+            c.agents,
+            c.main_agent,
+            c.heartbeats,
+        ),
+        None => (None, None, None, None, None, vec![], None, vec![]),
+    };
 
     // Resolve agent working directory: config cwd (relative to project_root) or project_root
     let agent_cwd = if let Some(ref cwd_path) = config_cwd {

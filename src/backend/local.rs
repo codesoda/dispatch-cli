@@ -46,7 +46,11 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub fn new(config: &crate::config::ResolvedConfig, monitor_port: Option<u16>, launch_agents: bool) -> Self {
+    pub fn new(
+        config: &crate::config::ResolvedConfig,
+        monitor_port: Option<u16>,
+        launch_agents: bool,
+    ) -> Self {
         Self {
             config: config.clone(),
             monitor_port,
@@ -368,13 +372,11 @@ pub async fn serve(
         cell_id
     );
 
-    let state = Arc::new(Mutex::new(
-        if let Some(ttl) = config.default_ttl {
-            BrokerState::with_default_ttl(ttl)
-        } else {
-            BrokerState::new()
-        },
-    ));
+    let state = Arc::new(Mutex::new(if let Some(ttl) = config.default_ttl {
+        BrokerState::with_default_ttl(ttl)
+    } else {
+        BrokerState::new()
+    }));
     let (event_tx, _) = broadcast::channel::<BrokerEvent>(256);
 
     // Shutdown signal shared with the monitor dashboard.
@@ -435,11 +437,8 @@ pub async fn serve(
     if !config.agents.is_empty() && !launch_agents {
         eprintln!("\ndispatch serve: ready. Start agents in separate terminals:\n");
         for agent in &config.agents {
-            let cmd = super::orchestrator::build_agent_command(
-                agent,
-                cell_id,
-                monitor_url.as_deref(),
-            );
+            let cmd =
+                super::orchestrator::build_agent_command(agent, cell_id, monitor_url.as_deref());
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
         }
@@ -1270,8 +1269,14 @@ mod tests {
     #[test]
     fn test_list_workers_excludes_expired() {
         let mut state = BrokerState::new();
-        let active_id =
-            state.register_worker("active".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let active_id = state.register_worker(
+            "active".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         let expired_id = state.register_worker(
             "expired".into(),
             "coder".into(),
@@ -1441,8 +1446,14 @@ mod tests {
     #[test]
     fn test_send_message_queues_in_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
 
         let msg_id = state.send_message(worker_id.clone(), "hello".into(), Some("sender-1".into()));
         assert!(msg_id.is_some(), "send_message should return a message ID");
@@ -1483,8 +1494,14 @@ mod tests {
     #[test]
     fn test_send_message_unique_ids() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
 
         let id1 = state
             .send_message(worker_id.clone(), "msg1".into(), None)
@@ -1499,8 +1516,14 @@ mod tests {
     #[test]
     fn test_send_message_without_from() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
 
         let msg_id = state
             .send_message(worker_id.clone(), "anon msg".into(), None)
@@ -1590,8 +1613,14 @@ mod tests {
     #[test]
     fn test_pop_message_returns_fifo_order() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         state.send_message(worker_id.clone(), "first".into(), None);
         state.send_message(worker_id.clone(), "second".into(), None);
 
@@ -1605,8 +1634,14 @@ mod tests {
     #[test]
     fn test_pop_message_empty_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         assert!(state.pop_message(&worker_id).is_none());
     }
 
@@ -1619,8 +1654,14 @@ mod tests {
     #[test]
     fn test_get_notifier_returns_same_instance() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         let n1 = state.get_notifier(&worker_id);
         let n2 = state.get_notifier(&worker_id);
         assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");

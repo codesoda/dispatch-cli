@@ -145,19 +145,18 @@ impl AgentOrchestrator {
             reason: format!("failed to create log dir {}: {e}", self.log_dir.display()),
         })?;
         let log_path = self.log_dir.join(format!("{}.log", config.name));
-        let log_file = std::fs::File::create(&log_path).map_err(|e| {
-            DispatchError::AgentLaunchFailed {
+        let log_file =
+            std::fs::File::create(&log_path).map_err(|e| DispatchError::AgentLaunchFailed {
                 name: config.name.clone(),
                 reason: format!("failed to create log file {}: {e}", log_path.display()),
-            }
-        })?;
+            })?;
         // Clone the file handle so stdout and stderr write to the same file.
-        let log_file_err = log_file.try_clone().map_err(|e| {
-            DispatchError::AgentLaunchFailed {
+        let log_file_err = log_file
+            .try_clone()
+            .map_err(|e| DispatchError::AgentLaunchFailed {
                 name: config.name.clone(),
                 reason: format!("failed to clone log file handle: {e}"),
-            }
-        })?;
+            })?;
 
         let child = Command::new("sh")
             .arg("-c")
@@ -177,7 +176,10 @@ impl AgentOrchestrator {
         let pid = child.id().unwrap_or(0);
         eprintln!(
             "dispatch serve: launched agent '{}' (role={}, pid={}, log={})",
-            config.name, config.role, pid, log_path.display()
+            config.name,
+            config.role,
+            pid,
+            log_path.display()
         );
 
         self.agents.push(RunningAgent {
@@ -399,9 +401,7 @@ fn shell_escape(s: &str) -> String {
 fn write_prompt_tempfile(prompt: &str, agent_name: &str) -> String {
     let path = std::env::temp_dir().join(format!("dispatch-prompt-{agent_name}.md"));
     std::fs::write(&path, prompt).unwrap_or_else(|e| {
-        eprintln!(
-            "dispatch: warning: failed to write prompt tempfile for '{agent_name}': {e}"
-        );
+        eprintln!("dispatch: warning: failed to write prompt tempfile for '{agent_name}': {e}");
     });
     path.display().to_string()
 }
