@@ -109,11 +109,11 @@ pub enum Commands {
         #[arg(long)]
         worker: Option<String>,
 
-        /// Show events since timestamp (RFC3339 or relative: 5m, 1h, 30s)
+        /// Show events since timestamp (Unix seconds, or relative: 30s, 5m, 1h, 2d)
         #[arg(long)]
         since: Option<String>,
 
-        /// Show events until timestamp (RFC3339 or relative)
+        /// Show events until timestamp (Unix seconds, or relative: 30s, 5m, 1h, 2d)
         #[arg(long)]
         until: Option<String>,
 
@@ -136,7 +136,7 @@ pub enum Commands {
         #[arg(long)]
         sent: bool,
 
-        /// Show messages since timestamp (RFC3339 or relative: 5m, 1h, 30s)
+        /// Show messages since timestamp (Unix seconds, or relative: 30s, 5m, 1h, 2d)
         #[arg(long)]
         since: Option<String>,
 

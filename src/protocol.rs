@@ -192,14 +192,16 @@ pub enum ResponsePayload {
     WorkerList { workers: Vec<Worker> },
     /// A worker was registered; returns the assigned worker ID.
     WorkerRegistered { worker_id: String },
-    /// A message delivered or queued.
-    MessageAck { message_id: String },
-    /// Message acknowledgement confirmed. The `ack_confirmed` field distinguishes
-    /// this from `MessageAck` during untagged deserialization.
+    /// Message acknowledgement confirmed. MUST appear before `MessageAck`:
+    /// serde's untagged deserializer tries variants in declaration order and
+    /// ignores unknown fields, so an `AckConfirm` payload would otherwise
+    /// silently deserialize as `MessageAck` and drop `ack_confirmed`.
     AckConfirm {
         message_id: String,
         ack_confirmed: bool,
     },
+    /// A message delivered or queued.
+    MessageAck { message_id: String },
     /// Worker status query result.
     StatusResult { workers: Vec<WorkerStatus> },
     /// Event history query result.
@@ -244,7 +246,31 @@ mod tests {
             },
             BrokerRequest::Heartbeat {
                 worker_id: "w1".into(),
-                status: None,
+                status: Some("running tests".into()),
+            },
+            BrokerRequest::Ack {
+                worker_id: "w1".into(),
+                message_id: "m1".into(),
+                note: Some("starting impl".into()),
+            },
+            BrokerRequest::Events {
+                since: Some(100),
+                until: Some(200),
+                event_type: Some("send".into()),
+                worker: Some("w1".into()),
+                limit: Some(10),
+            },
+            BrokerRequest::Messages {
+                worker_id: "w1".into(),
+                unacked: true,
+                sent: false,
+                since: None,
+                limit: Some(50),
+                id: None,
+            },
+            BrokerRequest::Status {
+                worker_id: Some("w1".into()),
+                clear: false,
             },
             BrokerRequest::AgentStart {
                 name: "reviewer".into(),
@@ -305,6 +331,10 @@ mod tests {
             ResponsePayload::Timeout {
                 worker_id: "w1".into(),
             },
+            ResponsePayload::AckConfirm {
+                message_id: "msg-2".into(),
+                ack_confirmed: true,
+            },
             ResponsePayload::Ack {},
         ];
         for payload in payloads {
@@ -359,6 +389,31 @@ mod tests {
         assert!(!json.contains("status_history"));
         let back: Worker = serde_json::from_str(&json).unwrap();
         assert!(back.status_history.is_empty());
+    }
+
+    /// Regression: `AckConfirm` is structurally a superset of `MessageAck`.
+    /// Because serde's untagged enum ignores unknown fields, `AckConfirm` MUST
+    /// be declared before `MessageAck` or its payload silently degrades and
+    /// `ack_confirmed` is dropped on deserialize.
+    #[test]
+    fn ack_confirm_does_not_degrade_to_message_ack() {
+        let payload = ResponsePayload::AckConfirm {
+            message_id: "m1".into(),
+            ack_confirmed: true,
+        };
+        let resp = BrokerResponse::Ok { payload };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"ack_confirmed\":true"),
+            "serialized form must include ack_confirmed: {json}"
+        );
+        let back: BrokerResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            BrokerResponse::Ok {
+                payload: ResponsePayload::AckConfirm { ack_confirmed, .. },
+            } => assert!(ack_confirmed),
+            other => panic!("expected AckConfirm, got {other:?}"),
+        }
     }
 
     /// BrokerResponse::Error round-trips correctly.

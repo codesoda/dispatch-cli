@@ -59,8 +59,9 @@ pub struct Launch {
     pub program: String,
     /// Argv excluding `program`.
     pub args: Vec<String>,
-    /// True when `program == "sh"` and `args` is `["-c", <cmd>]`. Purely
-    /// informational — the caller can infer the same from `program`.
+    /// Authoritative: when true, `program == "sh"` and `args` is `["-c", <cmd>]`.
+    /// Callers that render a shell-pasteable string rely on this flag to decide
+    /// whether to emit the raw command (true) or quote each argv element (false).
     pub wrap_in_shell: bool,
     /// File to read as stdin for the spawned process. None = inherit/null
     /// (caller decides).
@@ -71,10 +72,37 @@ pub struct Launch {
 pub enum AdapterError {
     #[error("command adapter requires `command = \"...\"` in agent config")]
     MissingCommandString,
+    #[error("`{{prompt_file}}` token used in command but no `prompt_file` is configured")]
+    MissingPromptFile,
+    #[error("`{{prompt}}` token used in command but no `prompt` is configured")]
+    MissingPromptInline,
     #[error("hook install not supported for the `command` adapter")]
     HookInstallNotSupported,
     #[error("hook install not yet implemented for adapter `{0}`")]
     HookInstallPending(Adapter),
+    #[error("hook uninstall not supported for the `command` adapter")]
+    HookUninstallNotSupported,
+    #[error("hook uninstall not yet implemented for adapter `{0}`")]
+    HookUninstallPending(Adapter),
+}
+
+/// POSIX single-quote shell escape. Always safe to paste into `sh -c`.
+pub(crate) fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote a shell argument only when necessary. Plain alphanumerics, dashes,
+/// dots, slashes, underscores, and equals signs pass through unquoted for
+/// paste-friendly output.
+pub(crate) fn shell_arg_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_/.=".contains(c))
+    {
+        s.to_string()
+    } else {
+        shell_escape(s)
+    }
 }
 
 impl Adapter {
@@ -100,8 +128,8 @@ impl Adapter {
     /// (Deferred to a later step.)
     pub fn hook_uninstall(&self, _repo_root: &Path) -> Result<(), AdapterError> {
         match self {
-            Adapter::Command => Err(AdapterError::HookInstallNotSupported),
-            other => Err(AdapterError::HookInstallPending(*other)),
+            Adapter::Command => Err(AdapterError::HookUninstallNotSupported),
+            other => Err(AdapterError::HookUninstallPending(*other)),
         }
     }
 }
@@ -168,6 +196,33 @@ mod tests {
         assert!(matches!(
             Adapter::Codex.hook_install(&tmp),
             Err(AdapterError::HookInstallPending(Adapter::Codex))
+        ));
+    }
+
+    #[test]
+    fn hook_uninstall_command_rejects() {
+        let tmp = std::env::temp_dir();
+        assert!(matches!(
+            Adapter::Command.hook_uninstall(&tmp),
+            Err(AdapterError::HookUninstallNotSupported)
+        ));
+    }
+
+    #[test]
+    fn hook_uninstall_claude_pending() {
+        let tmp = std::env::temp_dir();
+        assert!(matches!(
+            Adapter::Claude.hook_uninstall(&tmp),
+            Err(AdapterError::HookUninstallPending(Adapter::Claude))
+        ));
+    }
+
+    #[test]
+    fn hook_uninstall_codex_pending() {
+        let tmp = std::env::temp_dir();
+        assert!(matches!(
+            Adapter::Codex.hook_uninstall(&tmp),
+            Err(AdapterError::HookUninstallPending(Adapter::Codex))
         ));
     }
 }

@@ -204,10 +204,10 @@
     <!-- Agent detail view -->
     <div class="agent-detail hidden" id="view-agent">
       <div class="tab-bar">
-        <div class="tab active" data-tab="config" onclick="selectAgentTab('config')">Config</div>
-        <div class="tab" data-tab="events" onclick="selectAgentTab('events')">Events</div>
-        <div class="tab" data-tab="messages" onclick="selectAgentTab('messages')">Messages</div>
-        <div class="tab" data-tab="logs" onclick="selectAgentTab('logs')">Logs</div>
+        <div class="tab active" data-tab="config">Config</div>
+        <div class="tab" data-tab="events">Events</div>
+        <div class="tab" data-tab="messages">Messages</div>
+        <div class="tab" data-tab="logs">Logs</div>
       </div>
       <div id="agent-config-panel">
         <div class="empty">Select an agent</div>
@@ -810,30 +810,32 @@ async function renderAgentEvents() {
   if (!selectedAgent) { panel.innerHTML = '<div class="empty">Select an agent</div>'; return; }
   const worker = teamWorkers.find(w => w.name === selectedAgent);
   const workerId = worker?.id;
-  if (!workerId) {
-    panel.innerHTML = '<div class="empty">Agent not registered yet — no events.</div>';
+  // Prefer the server-side history endpoint when the agent is still registered.
+  // For evicted/unregistered agents (no workerId), fall through to the SSE cache
+  // so their pre-eviction history stays visible.
+  if (workerId) {
+    try {
+      const resp = await fetch(`/api/events/history?worker=${encodeURIComponent(workerId)}&limit=200`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const histEvents = (data.events || []).map(e => ({ ...e, _ts: new Date(e.timestamp * 1000) }));
+        if (histEvents.length > 0) {
+          panel.innerHTML = histEvents.map(renderEvent).join('');
+          return;
+        }
+      }
+    } catch (_e) { /* fall through to SSE cache */ }
+  }
+  // SSE-cache fallback: match on worker_id when we have one, and on worker_name
+  // in all cases so evicted agents keep their history visible by name.
+  const filtered = allEvents.filter(ev =>
+    (workerId && ev.worker_id === workerId) || ev.worker_name === selectedAgent
+  );
+  if (filtered.length === 0) {
+    panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
     return;
   }
-  // Fetch full history from API, supplemented by any SSE events not yet in history
-  try {
-    const resp = await fetch(`/api/events/history?worker=${encodeURIComponent(workerId)}&limit=200`);
-    if (!resp.ok) { panel.innerHTML = '<div class="empty">Failed to fetch events.</div>'; return; }
-    const data = await resp.json();
-    const histEvents = (data.events || []).map(e => ({ ...e, _ts: new Date(e.timestamp * 1000) }));
-    if (histEvents.length === 0) {
-      panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
-      return;
-    }
-    panel.innerHTML = histEvents.map(renderEvent).join('');
-  } catch(e) {
-    // Fallback to SSE-cached events
-    const filtered = allEvents.filter(ev => ev.worker_id === workerId);
-    if (filtered.length === 0) {
-      panel.innerHTML = '<div class="empty">No events for this agent yet</div>';
-      return;
-    }
-    panel.innerHTML = filtered.map(renderEvent).join('');
-  }
+  panel.innerHTML = filtered.map(renderEvent).join('');
 }
 
 function configBlock(label, value, isCommand) {

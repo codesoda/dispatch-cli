@@ -18,29 +18,18 @@ fn parse_timestamp(s: &str) -> Result<u64, String> {
         .unwrap_or_default()
         .as_secs();
 
-    // Try relative duration: number + suffix (s/m/h/d)
-    if let Some(num_str) = s.strip_suffix('s') {
-        if let Ok(n) = num_str.parse::<u64>() {
-            return Ok(now.saturating_sub(n));
-        }
-    }
-    if let Some(num_str) = s.strip_suffix('m') {
-        if let Ok(n) = num_str.parse::<u64>() {
-            return Ok(now.saturating_sub(n * 60));
-        }
-    }
-    if let Some(num_str) = s.strip_suffix('h') {
-        if let Ok(n) = num_str.parse::<u64>() {
-            return Ok(now.saturating_sub(n * 3600));
-        }
-    }
-    if let Some(num_str) = s.strip_suffix('d') {
-        if let Ok(n) = num_str.parse::<u64>() {
-            return Ok(now.saturating_sub(n * 86400));
+    let relative = [('s', 1u64), ('m', 60), ('h', 3600), ('d', 86400)];
+    for (suffix, factor) in relative {
+        if let Some(num_str) = s.strip_suffix(suffix) {
+            if let Ok(n) = num_str.parse::<u64>() {
+                let secs = n.checked_mul(factor).ok_or_else(|| {
+                    format!("invalid timestamp: {s} (relative duration overflows)")
+                })?;
+                return Ok(now.saturating_sub(secs));
+            }
         }
     }
 
-    // Try absolute Unix timestamp
     if let Ok(ts) = s.parse::<u64>() {
         return Ok(ts);
     }
@@ -259,4 +248,28 @@ async fn run_claude_hook(
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_timestamp_accepts_unix_seconds() {
+        assert_eq!(parse_timestamp("1700000000").unwrap(), 1700000000);
+    }
+
+    #[test]
+    fn parse_timestamp_relative_does_not_overflow() {
+        // u64::MAX followed by a suffix must not panic in debug or wrap in
+        // release — it should return a readable error.
+        let input = format!("{}m", u64::MAX);
+        let err = parse_timestamp(&input).unwrap_err();
+        assert!(err.contains("overflow"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_timestamp_rejects_garbage() {
+        assert!(parse_timestamp("not-a-timestamp").is_err());
+    }
 }

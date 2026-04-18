@@ -397,7 +397,11 @@ impl BrokerState {
     }
 
     /// Record an acknowledgement for a message.
-    /// Returns an error string if the worker doesn't exist.
+    ///
+    /// Validates (in order) that the worker exists, the message exists in
+    /// history, and the message was addressed to this worker. Without these
+    /// checks a caller could record acks for arbitrary or nonexistent message
+    /// IDs, corrupting the monitor's message state.
     pub fn ack_message(
         &mut self,
         worker_id: &str,
@@ -407,6 +411,17 @@ impl BrokerState {
         self.evict_expired();
         if !self.workers.contains_key(worker_id) {
             return Err(format!("worker not found or expired: {worker_id}"));
+        }
+        let recipient = self
+            .message_history
+            .iter()
+            .find(|m| m.message_id == message_id)
+            .map(|m| m.to.clone())
+            .ok_or_else(|| format!("message not found: {message_id}"))?;
+        if recipient != worker_id {
+            return Err(format!(
+                "message {message_id} was not addressed to worker {worker_id}"
+            ));
         }
         let now = now_secs();
         self.ack_log.insert(
@@ -418,7 +433,6 @@ impl BrokerState {
                 acked_at: now,
             },
         );
-        // Update acked_at in message history.
         if let Some(hist) = self
             .message_history
             .iter_mut()
@@ -2205,6 +2219,68 @@ mod tests {
         let n1 = state.get_notifier(&worker_id);
         let n2 = state.get_notifier(&worker_id);
         assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");
+    }
+
+    #[test]
+    fn test_ack_message_rejects_unknown_worker() {
+        let mut state = BrokerState::new();
+        let err = state
+            .ack_message("missing-worker", "msg-1", None)
+            .unwrap_err();
+        assert!(err.contains("worker not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_ack_message_rejects_unknown_message() {
+        let mut state = BrokerState::new();
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
+        let err = state
+            .ack_message(&worker_id, "nonexistent-message", None)
+            .unwrap_err();
+        assert!(err.contains("message not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_ack_message_rejects_wrong_recipient() {
+        let mut state = BrokerState::new();
+        let alice =
+            state.register_worker("alice".into(), "r".into(), "d".into(), vec![], None, false);
+        let bob = state.register_worker("bob".into(), "r".into(), "d".into(), vec![], None, false);
+        let message_id = state
+            .send_message(alice.clone(), "for alice".into(), None)
+            .expect("send");
+        let err = state.ack_message(&bob, &message_id, None).unwrap_err();
+        assert!(
+            err.contains("not addressed to worker"),
+            "expected recipient-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ack_message_success_updates_history() {
+        let mut state = BrokerState::new();
+        let alice =
+            state.register_worker("alice".into(), "r".into(), "d".into(), vec![], None, false);
+        let message_id = state
+            .send_message(alice.clone(), "hello".into(), None)
+            .expect("send");
+        state
+            .ack_message(&alice, &message_id, Some("noted".into()))
+            .expect("ack should succeed");
+        let hist = state
+            .message_history
+            .iter()
+            .find(|m| m.message_id == message_id)
+            .expect("message in history");
+        assert!(hist.acked_at.is_some(), "acked_at should be set");
+        assert!(state.ack_log.contains_key(&message_id));
     }
 
     #[tokio::test]

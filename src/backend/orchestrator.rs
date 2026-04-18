@@ -7,7 +7,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::adapter::{BuildContext, Launch};
+use crate::adapter::{shell_arg_quote, shell_escape, BuildContext, Launch};
 use crate::config::ResolvedAgentConfig;
 use crate::errors::DispatchError;
 
@@ -223,7 +223,13 @@ impl AgentOrchestrator {
 
     /// Start a configured agent by name. Errors if the name is unknown or
     /// an instance is already running.
+    ///
+    /// Before rejecting on `already running`, this reaps any ManagedAgent
+    /// whose supervisor task has already finished (Crashed or Stopped), so a
+    /// previously-failed agent can be started again without needing `restart`.
     pub async fn start_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
+        self.agents.retain(|a| !a.supervisor.is_finished());
+
         if self.agents.iter().any(|a| a.name == name) {
             return Err(DispatchError::AgentLaunchFailed {
                 name: name.to_string(),
@@ -437,11 +443,13 @@ async fn spawn_child_process(
 
     let stdin = match &launch.stdin_file {
         Some(path) => {
-            let f = std::fs::File::open(path).map_err(|e| DispatchError::AgentLaunchFailed {
-                name: config.name.clone(),
-                reason: format!("failed to open prompt file {}: {e}", path.display()),
+            let f = tokio::fs::File::open(path).await.map_err(|e| {
+                DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: format!("failed to open prompt file {}: {e}", path.display()),
+                }
             })?;
-            std::process::Stdio::from(f)
+            std::process::Stdio::from(f.into_std().await)
         }
         None => std::process::Stdio::null(),
     };
@@ -621,20 +629,6 @@ fn launch_to_shell_string(launch: &Launch) -> String {
     s
 }
 
-/// Quote a shell argument only when necessary. Plain alphanumerics, dashes,
-/// dots, slashes, underscores, and equals signs pass through unquoted for
-/// paste-friendly output.
-fn shell_arg_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_/.=".contains(c))
-    {
-        s.to_string()
-    } else {
-        shell_escape(s)
-    }
-}
-
 /// Build the main agent command string for the user to paste.
 pub fn build_main_agent_command(
     main: &crate::config::MainAgentConfig,
@@ -663,11 +657,6 @@ pub fn build_main_agent_command(
 
     parts.push(cmd);
     parts.join(" ")
-}
-
-/// Shell-escape a string for use in `sh -c` commands. POSIX single-quote escaping.
-pub(super) fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Whether `s` is safe to use as a single filename component on disk and as
