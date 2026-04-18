@@ -648,9 +648,17 @@ pub async fn serve(
     );
 
     if launch_agents {
-        // Auto-launch configured agents.
-        if !config.agents.is_empty() {
-            orchestrator.launch_all(&config.agents).await?;
+        // Auto-launch only agents explicitly marked `launch = true`. Agents
+        // with `launch = false` (the default) stay unmanaged and their
+        // copy-paste launch commands are printed below instead.
+        let launchable: Vec<crate::config::ResolvedAgentConfig> = config
+            .agents
+            .iter()
+            .filter(|a| a.launch)
+            .cloned()
+            .collect();
+        if !launchable.is_empty() {
+            orchestrator.launch_all(&launchable).await?;
         }
         // Start configured heartbeat timers.
         if !config.heartbeats.is_empty() {
@@ -658,10 +666,17 @@ pub async fn serve(
         }
     }
 
-    // Print agent commands for the user to run manually.
-    if !config.agents.is_empty() && !launch_agents {
-        eprintln!("\ndispatch serve: ready. Start agents in separate terminals:\n");
-        for agent in &config.agents {
+    // Print copy-paste launch commands for agents that were not auto-launched.
+    // That means: every agent when `--launch` is not set, plus `launch = false`
+    // agents when `--launch` is set.
+    let manual: Vec<&crate::config::ResolvedAgentConfig> = config
+        .agents
+        .iter()
+        .filter(|a| !launch_agents || !a.launch)
+        .collect();
+    if !manual.is_empty() {
+        eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
+        for agent in &manual {
             let cmd = super::orchestrator::build_agent_command(
                 agent,
                 cell_id,
@@ -725,7 +740,13 @@ async fn accept_loop(
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, state, event_tx).await {
-                tracing::error!(error = %e, "connection handler error");
+                // Broken pipe is expected when clients disconnect before reading the response.
+                let is_broken_pipe = matches!(&e, DispatchError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe);
+                if is_broken_pipe {
+                    tracing::debug!(error = %e, "client disconnected before response");
+                } else {
+                    tracing::error!(error = %e, "connection handler error");
+                }
             }
         });
     }
