@@ -155,6 +155,22 @@ fn resolve_agent_config(
         });
     }
 
+    // Claude/codex adapters pipe prompts as stdin from `prompt_file`. An
+    // inline `prompt = "..."` would be silently dropped, launching the agent
+    // with empty stdin; reject it up front so the misconfiguration surfaces.
+    if matches!(agent.adapter, Adapter::Claude | Adapter::Codex)
+        && agent.prompt.is_some()
+        && agent.prompt_file.is_none()
+    {
+        return Err(DispatchError::AgentConfigError {
+            name: agent.name.clone(),
+            reason: format!(
+                "adapter = \"{}\" requires `prompt_file = \"...\"` (inline `prompt` is not supported on this adapter)",
+                agent.adapter
+            ),
+        });
+    }
+
     let (prompt, prompt_file_path) = match (&agent.prompt, &agent.prompt_file) {
         (Some(_), Some(_)) => {
             return Err(DispatchError::AgentConfigError {
@@ -602,6 +618,8 @@ backend = "https://example.com"
     #[test]
     fn agent_config_parses_claude_adapter() {
         let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("reviewer.md");
+        fs::write(&prompt_path, "you are a reviewer").unwrap();
         let config_path = tmp.path().join("dispatch.config.toml");
         fs::write(
             &config_path,
@@ -612,7 +630,7 @@ role = "reviewer"
 description = "reviews"
 adapter = "claude"
 extra_args = ["--model", "sonnet"]
-prompt = "you are a reviewer"
+prompt_file = "reviewer.md"
 launch = true
 "#,
         )
@@ -625,6 +643,53 @@ launch = true
         assert_eq!(a.extra_args, vec!["--model", "sonnet"]);
         assert!(a.launch);
         assert!(a.command.is_none());
+        assert!(a.prompt_file_path.is_some());
+    }
+
+    #[test]
+    fn agent_config_rejects_claude_adapter_with_inline_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "reviewer"
+role = "reviewer"
+description = "reviews"
+adapter = "claude"
+prompt = "you are a reviewer"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prompt_file") && msg.contains("claude"),
+            "expected prompt_file-required error for claude, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn agent_config_rejects_codex_adapter_with_inline_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "worker"
+role = "worker"
+description = "codex"
+adapter = "codex"
+prompt = "be helpful"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("prompt_file"));
     }
 
     #[test]

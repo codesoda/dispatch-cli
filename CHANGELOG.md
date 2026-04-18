@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `extra_args = [...]` on agents — adapter-appended argv without touching the launch string
 - Per-agent `launch = true/false` flag (auto-start only agents with `launch = true`)
 - Prompt files now piped as stdin for the `claude` and `codex` adapters (no more `< {prompt_file}` shell redirect)
-- Introspection commands: `dispatch ack`, `dispatch status`, `dispatch heartbeat --status`, `dispatch events`, `dispatch messages`, `dispatch history`
+- Introspection commands: `dispatch ack`, `dispatch status`, `dispatch heartbeat --status`, `dispatch events`, `dispatch messages`
 - `dispatch agent {start,stop,restart} <name|worker-id>` — lifecycle control for managed agents over the broker socket; name or worker ID accepted
 - Agent supervisor with exponential-backoff auto-restart (1s → 30s cap, 5 consecutive failures = crashed; counter resets after 30s stable)
 - `dispatch codex-hook {stop,install,uninstall}` — writes `.codex/hooks.json` + enables `features.codex_hooks`; Stop handler emits a block decision so the agent keeps listening for dispatch messages
