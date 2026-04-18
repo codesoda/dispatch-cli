@@ -626,9 +626,24 @@ pub async fn serve(
     // orchestrator (writes) and the monitor (reads via /api/logs/{agent}).
     let log_dir = config.project_root.join("logs");
 
+    // Compute monitor URL up front so the orchestrator can pass it to agents
+    // as DISPATCH_MONITOR_URL; the monitor server itself starts after the
+    // orchestrator is constructed so MonitorState can share it.
+    let monitor_url = monitor_port.map(|port| format!("http://localhost:{port}"));
+
+    // Set up the orchestrator (manages agent process lifecycle).
+    let orchestrator = Arc::new(Mutex::new(super::orchestrator::AgentOrchestrator::new(
+        cell_id,
+        &socket,
+        monitor_url.clone(),
+        &config.agent_cwd,
+        log_dir.clone(),
+        config.agents.clone(),
+    )));
+
     // Optionally start the HTTP monitor dashboard.
-    let monitor_url = if let Some(port) = monitor_port {
-        let url = format!("http://localhost:{port}");
+    if let Some(port) = monitor_port {
+        let url = monitor_url.clone().expect("monitor_url set when port set");
         let monitor_state = super::monitor::MonitorState {
             broker: Arc::clone(&state),
             events: event_tx.clone(),
@@ -641,6 +656,7 @@ pub async fn serve(
             heartbeats: config.heartbeats.clone(),
             log_dir: log_dir.clone(),
             monitor_url: Some(url.clone()),
+            orchestrator: Arc::clone(&orchestrator),
         };
         tokio::spawn(async move {
             if let Err(e) = super::monitor::run_monitor(port, monitor_state).await {
@@ -653,20 +669,7 @@ pub async fn serve(
                 tracing::warn!(error = %e, "failed to open monitor in browser");
             }
         }
-        Some(url)
-    } else {
-        None
-    };
-
-    // Set up the orchestrator (manages agent process lifecycle).
-    let orchestrator = Arc::new(Mutex::new(super::orchestrator::AgentOrchestrator::new(
-        cell_id,
-        &socket,
-        monitor_url.clone(),
-        &config.agent_cwd,
-        log_dir,
-        config.agents.clone(),
-    )));
+    }
 
     if launch_agents {
         // Auto-launch only agents explicitly marked `launch = true`. Agents

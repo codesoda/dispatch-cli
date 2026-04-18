@@ -51,6 +51,25 @@
   .sparkline .bar { background: #58a6ff40; border-radius: 1px; min-width: 4px; flex: 1; transition: height 0.3s; }
   .recent-section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #484f58; margin-bottom: 8px; }
 
+  /* Agent cards */
+  .agents-section { margin-bottom: 20px; }
+  .agents-section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #484f58; margin-bottom: 8px; }
+  .agents-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .agent-card { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 12px; cursor: pointer; transition: border-color 0.15s; }
+  .agent-card:hover { border-color: #30363d; }
+  .agent-card .ac-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+  .agent-card .ac-name { font-size: 13px; font-weight: 600; color: #c9d1d9; }
+  .agent-card .ac-role { font-size: 10px; color: #8b949e; margin-bottom: 8px; }
+  .agent-card .ac-meta { font-size: 10px; color: #6e7681; display: flex; gap: 10px; flex-wrap: wrap; }
+  .agent-card .ac-meta b { color: #8b949e; font-weight: 500; }
+  .state-pill { font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap; }
+  .state-pill.running { background: #3fb95020; color: #3fb950; }
+  .state-pill.starting { background: #58a6ff20; color: #58a6ff; }
+  .state-pill.restarting { background: #d2992220; color: #d29922; }
+  .state-pill.crashed { background: #f8514920; color: #f85149; }
+  .state-pill.stopped { background: #484f5830; color: #8b949e; }
+  .state-pill.unmanaged { background: #30363d50; color: #6e7681; }
+
   /* Event stream view */
   .event-stream { flex: 1; overflow-y: auto; padding: 12px; }
   .event { font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #161b22; }
@@ -139,6 +158,12 @@
         <div class="stat-card"><div class="stat-label">Requests</div><div class="stat-value" id="dash-requests">0</div></div>
         <div class="stat-card"><div class="stat-label">Version</div><div class="stat-value" id="dash-version">--</div></div>
       </div>
+      <div class="agents-section">
+        <h3>Agents</h3>
+        <div class="agents-grid" id="agents-grid">
+          <div class="empty">No agents configured</div>
+        </div>
+      </div>
       <div class="sparkline-container">
         <div class="stat-label">Event Volume (last 60s)</div>
         <div class="sparkline" id="sparkline"></div>
@@ -184,6 +209,7 @@ let allEvents = []; // all events cached
 const MAX_EVENTS = 1000;
 let agentConfigs = []; // from /api/agents
 let teamWorkers = []; // from /api/team
+let agentState = {}; // name -> state object from /api/agents/state
 // Sparkline: 60 buckets, each 1 second
 const SPARK_BUCKETS = 60;
 let sparkData = new Array(SPARK_BUCKETS).fill(0);
@@ -195,10 +221,11 @@ let serverTimeDrift = 0; // server_time - client_time (to correct clock skew)
 // --- Initialization ---
 async function init() {
   setupEventListeners();
-  await Promise.all([fetchAgentConfigs(), refreshTeam(), pingServer()]);
+  await Promise.all([fetchAgentConfigs(), refreshTeam(), pingServer(), fetchAgentState()]);
   setupSSE();
   setInterval(refreshTeam, 2000);
   setInterval(pingServer, 5000);
+  setInterval(fetchAgentState, 2000);
   setInterval(tickUI, 1000); // tick uptime + TTL every second
   sparkInterval = setInterval(tickSparkline, 1000);
 }
@@ -219,6 +246,11 @@ function setupEventListeners() {
   document.getElementById('agent-list').addEventListener('click', (ev) => {
     const item = ev.target.closest('[data-agent-name]');
     if (item) selectAgentByName(item.dataset.agentName);
+  });
+  // Delegated: dashboard agent cards are re-rendered every 2s.
+  document.getElementById('agents-grid').addEventListener('click', (ev) => {
+    const card = ev.target.closest('[data-agent-name]');
+    if (card) selectAgentByName(card.dataset.agentName);
   });
   // Delegated: launch-cmd copy button is inside a re-rendered config panel.
   document.getElementById('agent-config-panel').addEventListener('click', (ev) => {
@@ -255,11 +287,24 @@ async function fetchAgentConfigs() {
   } catch(e) {}
 }
 
+async function fetchAgentState() {
+  try {
+    const resp = await fetch('/api/agents/state');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const map = {};
+    (data.agents || []).forEach(a => { map[a.name] = a.state; });
+    agentState = map;
+    renderAgentCards();
+  } catch(e) {}
+}
+
 async function refreshTeam() {
   try {
     const resp = await fetch('/api/team');
     teamWorkers = await resp.json();
     renderSidebar();
+    renderAgentCards();
   } catch(e) {}
 }
 
@@ -357,6 +402,69 @@ function renderSidebar() {
   }
 
   list.innerHTML = html || '<div class="nav-item empty" style="cursor:default">No agents configured</div>';
+}
+
+// Render the agent cards grid on the dashboard. Pulls supervisor state from
+// /api/agents/state and worker_id from /api/team. Clicking a card selects
+// that agent in the detail view via the sidebar click delegate.
+function renderAgentCards() {
+  const grid = document.getElementById('agents-grid');
+  if (!grid) return;
+  const managed = (agentConfigs || []).filter(a => !a._isMain);
+  if (managed.length === 0) {
+    grid.innerHTML = '<div class="empty">No agents configured</div>';
+    return;
+  }
+  const parts = managed.map(cfg => {
+    const st = agentState[cfg.name];
+    const { kind, label, pid, extra } = describeAgentState(st, cfg);
+    const worker = (teamWorkers || []).find(w => w.name === cfg.name);
+    const workerIdShort = worker ? worker.id.slice(0, 8) : '';
+    const meta = [];
+    if (pid) meta.push(`<span><b>pid</b> ${esc(pid)}</span>`);
+    if (workerIdShort) meta.push(`<span><b>worker</b> ${esc(workerIdShort)}</span>`);
+    if (extra) meta.push(`<span>${esc(extra)}</span>`);
+    return `
+      <div class="agent-card" data-agent-name="${esc(cfg.name)}">
+        <div class="ac-head">
+          <div class="ac-name">${esc(cfg.name)}</div>
+          <span class="state-pill ${kind}">${esc(label)}</span>
+        </div>
+        <div class="ac-role">${esc(cfg.role || '')}</div>
+        <div class="ac-meta">${meta.join('')}</div>
+      </div>`;
+  });
+  grid.innerHTML = parts.join('');
+}
+
+// Map a raw AgentState (serde-tagged JSON) + fallback config into display
+// fields. Agents absent from /api/agents/state are shown as "unmanaged" —
+// that's the expected state when launch=false or the orchestrator hasn't
+// spawned them yet.
+function describeAgentState(st, cfg) {
+  if (!st) {
+    return { kind: cfg.launch ? 'stopped' : 'unmanaged',
+             label: cfg.launch ? 'stopped' : 'unmanaged',
+             pid: null, extra: null };
+  }
+  switch (st.state) {
+    case 'running':
+      return { kind: 'running', label: 'running', pid: st.pid, extra: null };
+    case 'starting':
+      return { kind: 'starting', label: 'starting', pid: null, extra: null };
+    case 'restarting':
+      return { kind: 'restarting', label: 'restarting',
+               pid: null,
+               extra: `attempt ${st.attempt} · backoff ${st.backoff_secs}s` };
+    case 'crashed':
+      return { kind: 'crashed', label: 'crashed',
+               pid: null,
+               extra: `${st.attempts} attempts — ${st.reason || ''}`.trim() };
+    case 'stopped':
+      return { kind: 'stopped', label: 'stopped', pid: null, extra: null };
+    default:
+      return { kind: 'unmanaged', label: st.state || 'unknown', pid: null, extra: null };
+  }
 }
 
 // --- View switching ---

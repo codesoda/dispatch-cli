@@ -27,6 +27,9 @@ pub struct MonitorState {
     pub heartbeats: Vec<crate::config::HeartbeatConfig>,
     pub log_dir: PathBuf,
     pub monitor_url: Option<String>,
+    /// Orchestrator handle used to read live supervisor state for each
+    /// managed agent. Shared with the broker's request handler.
+    pub orchestrator: Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
 }
 
 /// Start the HTTP monitor dashboard on the given port.
@@ -40,6 +43,7 @@ pub async fn run_monitor(
         .route("/api/events", get(api_events))
         .route("/api/health", get(api_health))
         .route("/api/agents", get(api_agents))
+        .route("/api/agents/state", get(api_agents_state))
         .route("/api/logs/{agent}", get(api_logs))
         .route("/api/events/history", get(api_events_history))
         .route("/api/messages/{worker}", get(api_messages))
@@ -176,6 +180,28 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
         "main_agent": main_agent,
         "heartbeats": heartbeats,
     }))
+}
+
+/// Live supervisor state for every managed agent.
+///
+/// The dashboard polls this to drive the agent cards view. Agents the
+/// orchestrator hasn't spawned (launch = false, or explicitly stopped) are
+/// simply absent from the response — the UI merges this with `/api/agents`
+/// configs to show unmanaged agents with a "not running" placeholder.
+async fn api_agents_state(State(state): State<MonitorState>) -> axum::Json<serde_json::Value> {
+    let orch = state.orchestrator.lock().await;
+    let entries = orch.list_state().await;
+    let states: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(name, role, agent_state)| {
+            serde_json::json!({
+                "name": name,
+                "role": role,
+                "state": agent_state,
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "agents": states }))
 }
 
 /// Query params for the logs endpoint.

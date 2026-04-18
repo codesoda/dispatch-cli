@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Agent supervisor with exponential-backoff auto-restart (1s → 30s cap, 5 consecutive failures = crashed; counter resets after 30s stable)
 - `dispatch codex-hook {stop,install,uninstall}` — writes `.codex/hooks.json` + enables `features.codex_hooks`; Stop handler emits a block decision so the agent keeps listening for dispatch messages
 - `dispatch claude-hook {stop,install,uninstall}` — same pattern via `.claude/settings.local.json` (merges into existing `settings.json` if present)
+- Monitor dashboard: agent cards grid showing supervisor state per agent (running/starting/restarting/crashed/stopped), PID, short worker ID; clicking a card opens the existing agent detail view
+- `GET /api/agents/state` — live supervisor state for each managed agent
 - Monitor UI: events history drawer, messages tab, status taglines, ack-aware row colors
 - Per-agent log files at `logs/<name>.log`
 
