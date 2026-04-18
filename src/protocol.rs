@@ -98,6 +98,12 @@ pub enum BrokerRequest {
         #[serde(default)]
         clear: bool,
     },
+    /// Start a configured agent by name.
+    AgentStart { name: String },
+    /// Stop a managed agent by name.
+    AgentStop { name: String },
+    /// Restart a managed agent by name (stop then start).
+    AgentRestart { name: String },
 }
 
 /// Summary of a worker's status for the status query response.
@@ -222,6 +228,15 @@ mod tests {
             BrokerRequest::Heartbeat {
                 worker_id: "w1".into(),
                 status: None,
+            },
+            BrokerRequest::AgentStart {
+                name: "reviewer".into(),
+            },
+            BrokerRequest::AgentStop {
+                name: "reviewer".into(),
+            },
+            BrokerRequest::AgentRestart {
+                name: "reviewer".into(),
             },
         ];
         for req in &cases {

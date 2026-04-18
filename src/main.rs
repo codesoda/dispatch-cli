@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use dispatch::backend::create_backend;
-use dispatch::cli::{Cli, Commands};
+use dispatch::cli::{AgentAction, Cli, Commands};
 use dispatch::config::resolve_config;
 use dispatch::logging::init_tracing;
 use dispatch::protocol::BrokerRequest;
@@ -192,6 +192,11 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 Commands::Heartbeat { worker_id, status } => {
                     BrokerRequest::Heartbeat { worker_id, status }
                 }
+                Commands::Agent { action } => match action {
+                    AgentAction::Start { name } => BrokerRequest::AgentStart { name },
+                    AgentAction::Stop { name } => BrokerRequest::AgentStop { name },
+                    AgentAction::Restart { name } => BrokerRequest::AgentRestart { name },
+                },
             };
             let response = backend.send_request(&request).await?;
             let json = serde_json::to_string(&response)?;

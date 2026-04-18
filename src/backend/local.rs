@@ -659,26 +659,24 @@ pub async fn serve(
     };
 
     // Set up the orchestrator (manages agent process lifecycle).
-    let mut orchestrator = super::orchestrator::AgentOrchestrator::new(
+    let orchestrator = Arc::new(Mutex::new(super::orchestrator::AgentOrchestrator::new(
         cell_id,
         &socket,
         monitor_url.clone(),
         &config.agent_cwd,
         log_dir,
-    );
+        config.agents.clone(),
+    )));
 
     if launch_agents {
         // Auto-launch only agents explicitly marked `launch = true`. Agents
         // with `launch = false` (the default) stay unmanaged and their
         // copy-paste launch commands are printed below instead.
-        let launchable: Vec<crate::config::ResolvedAgentConfig> =
-            config.agents.iter().filter(|a| a.launch).cloned().collect();
-        if !launchable.is_empty() {
-            orchestrator.launch_all(&launchable).await?;
-        }
+        let mut orch = orchestrator.lock().await;
+        orch.launch_all().await?;
         // Start configured heartbeat timers.
         if !config.heartbeats.is_empty() {
-            orchestrator.start_heartbeats(&config.heartbeats, &event_tx);
+            orch.start_heartbeats(&config.heartbeats, &event_tx);
         }
     }
 
@@ -713,11 +711,11 @@ pub async fn serve(
 
     // Run until shutdown signal (OS signal or monitor UI).
     let result = tokio::select! {
-        res = accept_loop(&listener, state, event_tx) => res,
+        res = accept_loop(&listener, state, event_tx, Arc::clone(&orchestrator)) => res,
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
             eprintln!("dispatch serve: shutting down agents...");
-            orchestrator.shutdown_all().await;
+            orchestrator.lock().await.shutdown_all().await;
             eprintln!("dispatch serve: shutting down");
             Ok(())
         }
@@ -725,7 +723,7 @@ pub async fn serve(
             tracing::info!("shutdown requested via monitor");
             eprintln!("dispatch serve: shutdown requested from monitor");
             eprintln!("dispatch serve: shutting down agents...");
-            orchestrator.shutdown_all().await;
+            orchestrator.lock().await.shutdown_all().await;
             eprintln!("dispatch serve: shutting down");
             Ok(())
         }
@@ -746,13 +744,15 @@ async fn accept_loop(
     listener: &UnixListener,
     state: Arc<Mutex<BrokerState>>,
     event_tx: broadcast::Sender<BrokerEvent>,
+    orchestrator: Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
 ) -> Result<(), DispatchError> {
     loop {
         let (stream, _addr) = listener.accept().await.map_err(DispatchError::Io)?;
         let state = Arc::clone(&state);
         let event_tx = event_tx.clone();
+        let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state, event_tx).await {
+            if let Err(e) = handle_connection(stream, state, event_tx, orchestrator).await {
                 // Broken pipe is expected when clients disconnect before reading the response.
                 let is_broken_pipe = matches!(&e, DispatchError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe);
                 if is_broken_pipe {
@@ -772,6 +772,7 @@ async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<BrokerState>>,
     event_tx: broadcast::Sender<BrokerEvent>,
+    orchestrator: Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
 ) -> Result<(), DispatchError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -789,7 +790,7 @@ async fn handle_connection(
     tracing::debug!(request = %line, "received request");
 
     let response = match serde_json::from_str::<BrokerRequest>(line) {
-        Ok(request) => handle_request(request, state, &event_tx).await,
+        Ok(request) => handle_request(request, state, &event_tx, orchestrator).await,
         Err(e) => BrokerResponse::Error {
             message: format!("invalid request: {e}"),
         },
@@ -819,6 +820,7 @@ async fn handle_request(
     request: BrokerRequest,
     state: Arc<Mutex<BrokerState>>,
     event_tx: &broadcast::Sender<BrokerEvent>,
+    orchestrator: Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
 ) -> BrokerResponse {
     {
         let mut s = state.lock().await;
@@ -1159,7 +1161,68 @@ async fn handle_request(
                 payload: ResponsePayload::MessageList { messages },
             }
         }
+        BrokerRequest::AgentStart { name } => {
+            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            let mut orch = orchestrator.lock().await;
+            match orch.start_by_name(&resolved).await {
+                Ok(()) => BrokerResponse::Ok {
+                    payload: ResponsePayload::Ack {},
+                },
+                Err(e) => BrokerResponse::Error {
+                    message: format!("agent start failed: {e}"),
+                },
+            }
+        }
+        BrokerRequest::AgentStop { name } => {
+            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            let mut orch = orchestrator.lock().await;
+            if orch.stop_by_name(&resolved).await {
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::Ack {},
+                }
+            } else {
+                BrokerResponse::Error {
+                    message: format!("agent '{resolved}' is not running"),
+                }
+            }
+        }
+        BrokerRequest::AgentRestart { name } => {
+            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            let mut orch = orchestrator.lock().await;
+            match orch.restart_by_name(&resolved).await {
+                Ok(()) => BrokerResponse::Ok {
+                    payload: ResponsePayload::Ack {},
+                },
+                Err(e) => BrokerResponse::Error {
+                    message: format!("agent restart failed: {e}"),
+                },
+            }
+        }
     }
+}
+
+/// Resolve an `agent` subcommand target string (agent name or worker ID) to a
+/// configured agent name. If the input already matches a configured agent
+/// name, it's returned as-is. Otherwise, treat it as a worker ID and look up
+/// the worker's name in the broker registry. Falls back to the input itself
+/// when neither lookup succeeds — the orchestrator will then surface a
+/// "no such agent in config" error.
+async fn resolve_agent_target(
+    target: &str,
+    state: &Arc<Mutex<BrokerState>>,
+    orchestrator: &Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
+) -> String {
+    {
+        let orch = orchestrator.lock().await;
+        if orch.has_config(target) {
+            return target.to_string();
+        }
+    }
+    let state = state.lock().await;
+    if let Some(name) = state.worker_name(target) {
+        return name.to_string();
+    }
+    target.to_string()
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).

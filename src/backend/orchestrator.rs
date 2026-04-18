@@ -57,6 +57,9 @@ pub struct AgentOrchestrator {
     /// Where per-agent log files are written. Must match the directory the
     /// monitor's `/api/logs/{agent}` endpoint reads from.
     log_dir: PathBuf,
+    /// All configured agents, used to look up an agent's config by name
+    /// when responding to `dispatch agent start/restart <name>` requests.
+    configs: Vec<ResolvedAgentConfig>,
 }
 
 impl AgentOrchestrator {
@@ -66,6 +69,7 @@ impl AgentOrchestrator {
         monitor_url: Option<String>,
         agent_cwd: &Path,
         log_dir: PathBuf,
+        configs: Vec<ResolvedAgentConfig>,
     ) -> Self {
         Self {
             agents: Vec::new(),
@@ -75,6 +79,7 @@ impl AgentOrchestrator {
             monitor_url,
             agent_cwd: agent_cwd.to_path_buf(),
             log_dir,
+            configs,
         }
     }
 
@@ -204,16 +209,58 @@ impl AgentOrchestrator {
         Ok(())
     }
 
-    /// Launch all configured agents sequentially with a brief pause between.
-    pub async fn launch_all(
-        &mut self,
-        configs: &[ResolvedAgentConfig],
-    ) -> Result<(), DispatchError> {
-        for config in configs {
+    /// Launch every agent marked `launch = true` in the stored configs,
+    /// sequentially with a brief pause between.
+    pub async fn launch_all(&mut self) -> Result<(), DispatchError> {
+        let launchable: Vec<ResolvedAgentConfig> =
+            self.configs.iter().filter(|a| a.launch).cloned().collect();
+        for config in &launchable {
             self.spawn_agent(config).await?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         Ok(())
+    }
+
+    /// Start a configured agent by name. Errors if the name is unknown or
+    /// an instance is already running.
+    pub async fn start_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
+        if self.agents.iter().any(|a| a.name == name) {
+            return Err(DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "already running".into(),
+            });
+        }
+        let config = self
+            .configs
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "no such agent in config".into(),
+            })?;
+        self.spawn_agent(&config).await
+    }
+
+    /// Restart a running agent: stop it (if running) then spawn it again.
+    /// Errors if the agent name isn't in config.
+    pub async fn restart_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
+        let config = self
+            .configs
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "no such agent in config".into(),
+            })?;
+        let _ = self.stop_by_name(name).await;
+        self.spawn_agent(&config).await
+    }
+
+    /// Whether an agent with this name exists in the config (running or not).
+    pub fn has_config(&self, name: &str) -> bool {
+        self.configs.iter().any(|a| a.name == name)
     }
 
     /// Return info about all agents.
@@ -335,8 +382,9 @@ impl AgentOrchestrator {
         self.agents.clear();
     }
 
-    /// Stop a specific agent by name.
-    pub async fn stop_agent(&mut self, name: &str) -> bool {
+    /// Stop a running agent by name. Returns `true` if an agent was found and
+    /// stopped, `false` if no agent by that name is currently running.
+    pub async fn stop_by_name(&mut self, name: &str) -> bool {
         if let Some(idx) = self.agents.iter().position(|a| a.name == name) {
             let agent = &mut self.agents[idx];
             if agent.child.try_wait().ok().flatten().is_none() {

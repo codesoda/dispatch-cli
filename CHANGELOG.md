@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-agent `launch = true/false` flag (auto-start only agents with `launch = true`)
 - Prompt files now piped as stdin for the `claude` and `codex` adapters (no more `< {prompt_file}` shell redirect)
 - Introspection commands: `dispatch ack`, `dispatch status`, `dispatch heartbeat --status`, `dispatch events`, `dispatch messages`, `dispatch history`
+- `dispatch agent {start,stop,restart} <name|worker-id>` — lifecycle control for managed agents over the broker socket; name or worker ID accepted
 - Monitor UI: events history drawer, messages tab, status taglines, ack-aware row colors
 - Per-agent log files at `logs/<name>.log`
 

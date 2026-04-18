@@ -185,4 +185,29 @@ pub enum Commands {
         #[arg(long)]
         status: Option<String>,
     },
+
+    /// Manage the lifecycle of configured agents (start, stop, restart)
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// Start a configured agent by name or worker ID
+    Start {
+        /// Agent name from config, or worker ID of a registered agent
+        name: String,
+    },
+    /// Stop a running agent by name or worker ID
+    Stop {
+        /// Agent name from config, or worker ID of a registered agent
+        name: String,
+    },
+    /// Restart a running agent by name or worker ID
+    Restart {
+        /// Agent name from config, or worker ID of a registered agent
+        name: String,
+    },
 }
