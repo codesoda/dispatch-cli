@@ -40,7 +40,7 @@ dispatch heartbeat --worker-id <YOUR_WORKER_ID>
 dispatch listen --worker-id <YOUR_WORKER_ID> --timeout 120
 ```
 
-Always send a heartbeat before listening. Workers expire after 1 hour without a heartbeat (configurable via `--ttl` on register or `default_ttl` in config). The listen command long-polls — it blocks until a message arrives or the timeout is reached.
+Sending a heartbeat before listening is a safe default. Workers expire after 1 hour without a heartbeat or other broker activity — `listen`, `send`, and `team` also renew the TTL — so a separate heartbeat may be unnecessary while you're actively listening (configurable via `--ttl` on register or `default_ttl` in config). The listen command long-polls — it blocks until a message arrives or the timeout is reached.
 
 If you get `"status":"timeout"`, just heartbeat and listen again.
 

@@ -134,6 +134,9 @@ pub struct Worker {
     pub description: String,
     pub capabilities: Vec<String>,
     /// TTL duration in seconds (used to renew `expires_at` on heartbeat).
+    /// `#[serde(default)]` so newer clients can deserialise responses from
+    /// older brokers that don't yet send this field (rolling-upgrade safe).
+    #[serde(default)]
     pub ttl_secs: u64,
     /// Unix timestamp (seconds) when this worker's TTL expires.
     pub expires_at: u64,
@@ -177,9 +180,7 @@ pub enum ResponsePayload {
     /// Worker status query result.
     StatusResult { workers: Vec<WorkerStatus> },
     /// Event history query result.
-    EventList {
-        events: Vec<serde_json::Value>,
-    },
+    EventList { events: Vec<serde_json::Value> },
     /// Message history query result.
     MessageList { messages: Vec<Message> },
     /// Listen timed out with no messages.

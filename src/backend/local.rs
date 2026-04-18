@@ -23,9 +23,8 @@ const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_EVENT_HISTORY_MAX: usize = 10_000;
 
 /// Event emitted by the broker for the monitor dashboard.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BrokerEvent {
-    pub id: String,
     pub kind: String,
     pub worker_id: String,
     /// Human-readable worker name (for display in UI).
@@ -50,7 +49,11 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub fn new(config: &crate::config::ResolvedConfig, monitor_port: Option<u16>, launch_agents: bool) -> Self {
+    pub fn new(
+        config: &crate::config::ResolvedConfig,
+        monitor_port: Option<u16>,
+        launch_agents: bool,
+    ) -> Self {
         Self {
             config: config.clone(),
             monitor_port,
@@ -233,21 +236,22 @@ impl BrokerState {
     }
 
     /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
-    /// Returns the IDs of workers that were evicted.
-    pub fn evict_expired(&mut self) -> Vec<String> {
+    /// Returns `(id, name)` pairs for the evicted workers so callers can populate
+    /// expire events with the worker's name (which is otherwise lost on removal).
+    pub fn evict_expired(&mut self) -> Vec<(String, String)> {
         let now = now_secs();
-        let expired_ids: Vec<String> = self
+        let expired: Vec<(String, String)> = self
             .workers
             .iter()
             .filter(|(_, w)| w.expires_at <= now)
-            .map(|(id, _)| id.clone())
+            .map(|(id, w)| (id.clone(), w.name.clone()))
             .collect();
-        for id in &expired_ids {
+        for (id, _) in &expired {
             self.workers.remove(id);
             self.mailboxes.remove(id);
             self.notifiers.remove(id);
         }
-        expired_ids
+        expired
     }
 
     /// Return a list of all active (non-expired) workers.
@@ -285,13 +289,15 @@ impl BrokerState {
             Some(id) => self
                 .workers
                 .get(id)
-                .map(|w| vec![crate::protocol::WorkerStatus {
-                    id: w.id.clone(),
-                    name: w.name.clone(),
-                    role: w.role.clone(),
-                    last_status: w.last_status.clone(),
-                    last_status_at: w.last_status_at,
-                }])
+                .map(|w| {
+                    vec![crate::protocol::WorkerStatus {
+                        id: w.id.clone(),
+                        name: w.name.clone(),
+                        role: w.role.clone(),
+                        last_status: w.last_status.clone(),
+                        last_status_at: w.last_status_at,
+                    }]
+                })
                 .unwrap_or_default(),
             None => self
                 .workers
@@ -308,19 +314,26 @@ impl BrokerState {
     }
 
     /// Emit an event: broadcast it, record in history, and print to stderr.
+    ///
+    /// `worker_name_override` wins when the worker has just been evicted (its
+    /// name can't be looked up anymore) or when the caller already has the
+    /// name cheaply. If `None`, falls back to `self.worker_name(worker_id)`.
     pub fn emit_and_record(
         &mut self,
         tx: &broadcast::Sender<BrokerEvent>,
         kind: &str,
         worker_id: &str,
+        worker_name_override: Option<&str>,
         detail: &str,
         payload: Option<serde_json::Value>,
     ) {
+        let worker_name = worker_name_override
+            .map(|s| s.to_string())
+            .or_else(|| self.worker_name(worker_id).map(|s| s.to_string()));
         let event = BrokerEvent {
-            id: uuid::Uuid::new_v4().to_string(),
             kind: kind.to_string(),
             worker_id: worker_id.to_string(),
-            worker_name: self.worker_name(worker_id).map(|s| s.to_string()),
+            worker_name,
             detail: detail.to_string(),
             payload,
             timestamp: now_secs(),
@@ -328,9 +341,15 @@ impl BrokerState {
         let ts = chrono_ts();
         let display_name = event.worker_name.as_deref().unwrap_or(worker_id);
         if let Some(ref p) = event.payload {
-            eprintln!("[{ts}] {:>10}  {display_name}  {}  {p}", event.kind, event.detail);
+            eprintln!(
+                "[{ts}] {:>10}  {display_name}  {}  {p}",
+                event.kind, event.detail
+            );
         } else {
-            eprintln!("[{ts}] {:>10}  {display_name}  {}", event.kind, event.detail);
+            eprintln!(
+                "[{ts}] {:>10}  {display_name}  {}",
+                event.kind, event.detail
+            );
         }
         let _ = tx.send(event.clone());
         self.event_history.push_back(event);
@@ -498,9 +517,7 @@ impl BrokerState {
                     true
                 }
             })
-            .filter(|m| {
-                since.is_none_or(|ts| m.sent_at.unwrap_or(0) >= ts)
-            })
+            .filter(|m| since.is_none_or(|ts| m.sent_at.unwrap_or(0) >= ts))
             .take(limit)
             .collect()
     }
@@ -595,17 +612,19 @@ pub async fn serve(
         cell_id
     );
 
-    let state = Arc::new(Mutex::new(
-        if let Some(ttl) = config.default_ttl {
-            BrokerState::with_default_ttl(ttl)
-        } else {
-            BrokerState::new()
-        },
-    ));
+    let state = Arc::new(Mutex::new(if let Some(ttl) = config.default_ttl {
+        BrokerState::with_default_ttl(ttl)
+    } else {
+        BrokerState::new()
+    }));
     let (event_tx, _) = broadcast::channel::<BrokerEvent>(256);
 
     // Shutdown signal shared with the monitor dashboard.
     let monitor_shutdown = Arc::new(Notify::new());
+
+    // Single source of truth for the log directory — used by both the
+    // orchestrator (writes) and the monitor (reads via /api/logs/{agent}).
+    let log_dir = config.project_root.join("logs");
 
     // Optionally start the HTTP monitor dashboard.
     let monitor_url = if let Some(port) = monitor_port {
@@ -620,7 +639,7 @@ pub async fn serve(
             agents: config.agents.clone(),
             main_agent: config.main_agent.clone(),
             heartbeats: config.heartbeats.clone(),
-            log_dir: config.project_root.join("logs"),
+            log_dir: log_dir.clone(),
             monitor_url: Some(url.clone()),
         };
         tokio::spawn(async move {
@@ -645,18 +664,15 @@ pub async fn serve(
         &socket,
         monitor_url.clone(),
         &config.agent_cwd,
+        log_dir,
     );
 
     if launch_agents {
         // Auto-launch only agents explicitly marked `launch = true`. Agents
         // with `launch = false` (the default) stay unmanaged and their
         // copy-paste launch commands are printed below instead.
-        let launchable: Vec<crate::config::ResolvedAgentConfig> = config
-            .agents
-            .iter()
-            .filter(|a| a.launch)
-            .cloned()
-            .collect();
+        let launchable: Vec<crate::config::ResolvedAgentConfig> =
+            config.agents.iter().filter(|a| a.launch).cloned().collect();
         if !launchable.is_empty() {
             orchestrator.launch_all(&launchable).await?;
         }
@@ -677,11 +693,8 @@ pub async fn serve(
     if !manual.is_empty() {
         eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
         for agent in &manual {
-            let cmd = super::orchestrator::build_agent_command(
-                agent,
-                cell_id,
-                monitor_url.as_deref(),
-            );
+            let cmd =
+                super::orchestrator::build_agent_command(agent, cell_id, monitor_url.as_deref());
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
         }
@@ -792,8 +805,6 @@ async fn handle_connection(
     Ok(())
 }
 
-
-
 /// Format current time as HH:MM:SS for console output.
 fn chrono_ts() -> String {
     let secs = now_secs();
@@ -836,6 +847,7 @@ async fn handle_request(
                 event_tx,
                 "register",
                 &worker_id,
+                Some(&name),
                 &format!("{name} ({role})"),
                 Some(serde_json::json!({
                     "name": name,
@@ -870,6 +882,7 @@ async fn handle_request(
             }
             let body_clone = body.clone();
             let from_clone = from.clone();
+            let recipient_name = state.worker_name(&to).map(|s| s.to_string());
             match state.send_message(to.clone(), body, from) {
                 Some(message_id) => {
                     state.messages_sent += 1;
@@ -878,6 +891,7 @@ async fn handle_request(
                         event_tx,
                         "send",
                         &to,
+                        recipient_name.as_deref(),
                         &format!(
                             "from {} → {}",
                             from_clone.as_deref().unwrap_or("anonymous"),
@@ -910,11 +924,11 @@ async fn handle_request(
             };
 
             // Check worker exists and renew TTL; get notifier and try immediate pop.
-            let (notifier, immediate_msg) = {
+            let (notifier, immediate_msg, listener_name) = {
                 let mut s = state.lock().await;
                 let expired = s.evict_expired();
-                for id in &expired {
-                    s.emit_and_record(event_tx, "expire", id, "worker expired", None);
+                for (id, name) in &expired {
+                    s.emit_and_record(event_tx, "expire", id, Some(name), "worker expired", None);
                 }
                 if !s.workers.contains_key(&worker_id) {
                     return BrokerResponse::Error {
@@ -927,7 +941,8 @@ async fn handle_request(
                 }
                 let notifier = s.get_notifier(&worker_id);
                 let msg = s.pop_message(&worker_id);
-                (notifier, msg)
+                let name = s.worker_name(&worker_id).map(|s| s.to_string());
+                (notifier, msg, name)
             };
 
             // If a message was immediately available, return it.
@@ -939,6 +954,7 @@ async fn handle_request(
                         event_tx,
                         "deliver",
                         &worker_id,
+                        listener_name.as_deref(),
                         &format!(
                             "from {} → {}",
                             msg.from.as_deref().unwrap_or("anonymous"),
@@ -952,6 +968,7 @@ async fn handle_request(
                         })),
                     );
                 }
+                tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: immediate delivery");
                 return BrokerResponse::Ok {
                     payload: ResponsePayload::Message {
                         message_id: msg.message_id,
@@ -972,10 +989,12 @@ async fn handle_request(
                 if let Some(msg) = s.pop_message(&worker_id) {
                     s.messages_delivered += 1;
                     tracing::info!(worker_id = %worker_id, message_id = %msg.message_id, "listen: delivered after wait");
+                    let name = s.worker_name(&worker_id).map(|s| s.to_string());
                     s.emit_and_record(
                         event_tx,
                         "deliver",
                         &worker_id,
+                        name.as_deref(),
                         &format!(
                             "from {} → {}",
                             msg.from.as_deref().unwrap_or("anonymous"),
@@ -1017,12 +1036,18 @@ async fn handle_request(
             let status_clone = status.clone();
             match state.heartbeat_worker(&worker_id, status) {
                 Some(expires_at) => {
-                    let detail = if has_status { "TTL renewed + status updated" } else { "TTL renewed" };
+                    let detail = if has_status {
+                        "TTL renewed + status updated"
+                    } else {
+                        "TTL renewed"
+                    };
                     tracing::info!(worker_id = %worker_id, expires_at, "heartbeat renewed");
+                    let name = state.worker_name(&worker_id).map(|s| s.to_string());
                     state.emit_and_record(
                         event_tx,
                         "heartbeat",
                         &worker_id,
+                        name.as_deref(),
                         detail,
                         status_clone.map(|s| serde_json::json!({ "status": s })),
                     );
@@ -1052,6 +1077,7 @@ async fn handle_request(
                         event_tx,
                         "ack",
                         &worker_id,
+                        None,
                         &format!("acked {}", &message_id[..message_id.len().min(8)]),
                         Some(serde_json::json!({
                             "message_id": message_id,
@@ -1126,14 +1152,8 @@ async fn handle_request(
             id,
         } => {
             let state = state.lock().await;
-            let messages = state.query_messages(
-                &worker_id,
-                unacked,
-                sent,
-                since,
-                limit,
-                id.as_deref(),
-            );
+            let messages =
+                state.query_messages(&worker_id, unacked, sent, since, limit, id.as_deref());
             let messages: Vec<Message> = messages.into_iter().cloned().collect();
             BrokerResponse::Ok {
                 payload: ResponsePayload::MessageList { messages },
@@ -1605,8 +1625,14 @@ mod tests {
     #[test]
     fn test_list_workers_excludes_expired() {
         let mut state = BrokerState::new();
-        let active_id =
-            state.register_worker("active".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let active_id = state.register_worker(
+            "active".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         let expired_id = state.register_worker(
             "expired".into(),
             "coder".into(),
@@ -1776,8 +1802,14 @@ mod tests {
     #[test]
     fn test_send_message_queues_in_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
 
         let msg_id = state.send_message(worker_id.clone(), "hello".into(), Some("sender-1".into()));
         assert!(msg_id.is_some(), "send_message should return a message ID");
@@ -1818,8 +1850,14 @@ mod tests {
     #[test]
     fn test_send_message_unique_ids() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
 
         let id1 = state
             .send_message(worker_id.clone(), "msg1".into(), None)
@@ -1834,8 +1872,14 @@ mod tests {
     #[test]
     fn test_send_message_without_from() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
 
         let msg_id = state
             .send_message(worker_id.clone(), "anon msg".into(), None)
@@ -1925,8 +1969,14 @@ mod tests {
     #[test]
     fn test_pop_message_returns_fifo_order() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         state.send_message(worker_id.clone(), "first".into(), None);
         state.send_message(worker_id.clone(), "second".into(), None);
 
@@ -1940,8 +1990,14 @@ mod tests {
     #[test]
     fn test_pop_message_empty_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         assert!(state.pop_message(&worker_id).is_none());
     }
 
@@ -1954,8 +2010,14 @@ mod tests {
     #[test]
     fn test_get_notifier_returns_same_instance() {
         let mut state = BrokerState::new();
-        let worker_id =
-            state.register_worker("recv".into(), "coder".into(), "desc".into(), vec![], None, false);
+        let worker_id = state.register_worker(
+            "recv".into(),
+            "coder".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
         let n1 = state.get_notifier(&worker_id);
         let n2 = state.get_notifier(&worker_id);
         assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");

@@ -52,7 +52,10 @@ pub struct AgentOrchestrator {
     cell_id: String,
     socket_path: PathBuf,
     monitor_url: Option<String>,
-    project_root: PathBuf,
+    /// Working directory for spawned agent subprocesses.
+    agent_cwd: PathBuf,
+    /// Where per-agent log files are written. Must match the directory the
+    /// monitor's `/api/logs/{agent}` endpoint reads from.
     log_dir: PathBuf,
 }
 
@@ -61,16 +64,16 @@ impl AgentOrchestrator {
         cell_id: &str,
         socket_path: &Path,
         monitor_url: Option<String>,
-        project_root: &Path,
+        agent_cwd: &Path,
+        log_dir: PathBuf,
     ) -> Self {
-        let log_dir = project_root.join("logs");
         Self {
             agents: Vec::new(),
             heartbeats: Vec::new(),
             cell_id: cell_id.to_string(),
             socket_path: socket_path.to_path_buf(),
             monitor_url,
-            project_root: project_root.to_path_buf(),
+            agent_cwd: agent_cwd.to_path_buf(),
             log_dir,
         }
     }
@@ -114,10 +117,9 @@ impl AgentOrchestrator {
 
     /// Spawn a single agent as a subprocess.
     ///
-    /// Stdout and stderr are redirected to `logs/<agent-name>.log` relative to
-    /// the project root so that agent output can be inspected after the fact.
-    /// Stdin comes from the adapter's `stdin_file` (typically the prompt file)
-    /// or is `/dev/null` if the adapter doesn't need one.
+    /// Stdout/stderr go to `<log_dir>/<sanitized-agent-name>.log`. Stdin
+    /// comes from the adapter's `stdin_file` (typically the prompt file) or
+    /// is `/dev/null` if the adapter doesn't need one.
     pub async fn spawn_agent(&mut self, config: &ResolvedAgentConfig) -> Result<(), DispatchError> {
         let env_vars = self.env_vars(&config.name, &config.role);
         let launch = Self::build_launch(config)?;
@@ -128,27 +130,34 @@ impl AgentOrchestrator {
             adapter = %config.adapter,
             program = %launch.program,
             args = ?launch.args,
-            cwd = %self.project_root.display(),
+            cwd = %self.agent_cwd.display(),
             "launching agent"
         );
 
-        // Ensure log directory exists and open a per-agent log file.
-        std::fs::create_dir_all(&self.log_dir).map_err(|e| DispatchError::AgentLaunchFailed {
-            name: config.name.clone(),
-            reason: format!("failed to create log dir {}: {e}", self.log_dir.display()),
-        })?;
-        let log_path = self.log_dir.join(format!("{}.log", config.name));
-        let log_file =
-            std::fs::File::create(&log_path).map_err(|e| DispatchError::AgentLaunchFailed {
-                name: config.name.clone(),
-                reason: format!("failed to create log file {}: {e}", log_path.display()),
-            })?;
-        let log_file_err = log_file
-            .try_clone()
+        tokio::fs::create_dir_all(&self.log_dir)
+            .await
             .map_err(|e| DispatchError::AgentLaunchFailed {
                 name: config.name.clone(),
-                reason: format!("failed to clone log file handle: {e}"),
+                reason: format!("failed to create log dir {}: {e}", self.log_dir.display()),
             })?;
+        let safe_name = sanitize_name(&config.name);
+        let log_path = self.log_dir.join(format!("{safe_name}.log"));
+        let log_file = tokio::fs::File::create(&log_path).await.map_err(|e| {
+            DispatchError::AgentLaunchFailed {
+                name: config.name.clone(),
+                reason: format!("failed to create log file {}: {e}", log_path.display()),
+            }
+        })?;
+        let log_file_err =
+            log_file
+                .try_clone()
+                .await
+                .map_err(|e| DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: format!("failed to clone log file handle: {e}"),
+                })?;
+        let log_file_std = log_file.into_std().await;
+        let log_file_err_std = log_file_err.into_std().await;
 
         let stdin = match &launch.stdin_file {
             Some(path) => {
@@ -165,10 +174,10 @@ impl AgentOrchestrator {
         let child = Command::new(&launch.program)
             .args(&launch.args)
             .envs(&env_vars)
-            .current_dir(&self.project_root)
+            .current_dir(&self.agent_cwd)
             .stdin(stdin)
-            .stdout(std::process::Stdio::from(log_file))
-            .stderr(std::process::Stdio::from(log_file_err))
+            .stdout(std::process::Stdio::from(log_file_std))
+            .stderr(std::process::Stdio::from(log_file_err_std))
             .process_group(0) // Own process group so we can kill the whole tree.
             .spawn()
             .map_err(|e| DispatchError::AgentLaunchFailed {
@@ -236,7 +245,7 @@ impl AgentOrchestrator {
             let after = config.after.unwrap_or(0);
             let cell_id = self.cell_id.clone();
             let socket_path = self.socket_path.display().to_string();
-            let project_root = self.project_root.clone();
+            let agent_cwd = self.agent_cwd.clone();
             let event_tx = event_tx.clone();
 
             if after > 0 {
@@ -265,7 +274,7 @@ impl AgentOrchestrator {
                         .arg(&command)
                         .env("DISPATCH_CELL_ID", &cell_id)
                         .env("DISPATCH_SOCKET_PATH", &socket_path)
-                        .current_dir(&project_root)
+                        .current_dir(&agent_cwd)
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -285,7 +294,6 @@ impl AgentOrchestrator {
                         .unwrap_or_default()
                         .as_secs();
                     let _ = event_tx.send(super::local::BrokerEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
                         kind: "heartbeat".into(),
                         worker_id: String::new(),
                         worker_name: None,
@@ -345,20 +353,21 @@ impl AgentOrchestrator {
 
 /// Build an agent command string for the user to paste.
 ///
-/// Includes the dispatch env vars and the adapter-assembled launch string.
+/// Includes the dispatch env vars (shell-escaped) and the adapter-assembled
+/// launch string.
 pub fn build_agent_command(
     config: &ResolvedAgentConfig,
     cell_id: &str,
     monitor_url: Option<&str>,
 ) -> String {
     let mut parts = vec![
-        format!("DISPATCH_CELL_ID={cell_id}"),
-        format!("DISPATCH_AGENT_NAME={}", config.name),
-        format!("DISPATCH_AGENT_ROLE={}", config.role),
+        format!("DISPATCH_CELL_ID={}", shell_escape(cell_id)),
+        format!("DISPATCH_AGENT_NAME={}", shell_escape(&config.name)),
+        format!("DISPATCH_AGENT_ROLE={}", shell_escape(&config.role)),
     ];
 
     if let Some(url) = monitor_url {
-        parts.push(format!("DISPATCH_MONITOR_URL={url}"));
+        parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
     }
 
     let cmd_str = AgentOrchestrator::build_launch(config)
@@ -412,10 +421,10 @@ pub fn build_main_agent_command(
     cell_id: &str,
     monitor_url: Option<&str>,
 ) -> String {
-    let mut parts = vec![format!("DISPATCH_CELL_ID={cell_id}")];
+    let mut parts = vec![format!("DISPATCH_CELL_ID={}", shell_escape(cell_id))];
 
     if let Some(url) = monitor_url {
-        parts.push(format!("DISPATCH_MONITOR_URL={url}"));
+        parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
     }
 
     let mut cmd = main.command.clone();
@@ -427,16 +436,44 @@ pub fn build_main_agent_command(
     if let Some(ref prompt_file) = main.prompt_file {
         // Tell the agent to read the prompt file rather than inlining it.
         let msg = format!("Read and follow the instructions in {prompt_file}");
-        cmd.push_str(&format!(" \"{}\"", msg.replace('"', "\\\"")));
+        cmd.push_str(&format!(" {}", shell_escape(&msg)));
     } else if let Some(ref prompt) = main.prompt {
-        cmd.push_str(&format!(" \"{}\"", prompt.replace('"', "\\\"")));
+        cmd.push_str(&format!(" {}", shell_escape(prompt)));
     }
 
     parts.push(cmd);
     parts.join(" ")
 }
 
-/// Shell-escape a string for use in `sh -c` commands.
-fn shell_escape(s: &str) -> String {
+/// Shell-escape a string for use in `sh -c` commands. POSIX single-quote escaping.
+pub(super) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Whether `s` is safe to use as a single filename component on disk and as
+/// a path segment in a URL (no separators, no `..`, ASCII alphanumerics plus
+/// `-` and `_`).
+pub(super) fn is_safe_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Replace any character outside `[A-Za-z0-9_-]` with `_`. Used to derive a
+/// filesystem-safe component from a user-supplied agent name.
+pub(super) fn sanitize_name(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
 }

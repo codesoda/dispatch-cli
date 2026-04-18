@@ -44,7 +44,9 @@ fn parse_timestamp(s: &str) -> Result<u64, String> {
         return Ok(ts);
     }
 
-    Err(format!("invalid timestamp: {s} (use relative like 5m/1h/30s or a Unix timestamp)"))
+    Err(format!(
+        "invalid timestamp: {s} (use relative like 5m/1h/30s or a Unix timestamp)"
+    ))
 }
 
 #[tokio::main]
@@ -177,9 +179,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                         id,
                     }
                 }
-                Commands::Status { worker_id, clear } => {
-                    BrokerRequest::Status { worker_id, clear }
-                }
+                Commands::Status { worker_id, clear } => BrokerRequest::Status { worker_id, clear },
                 Commands::Ack {
                     worker_id,
                     message_id,
