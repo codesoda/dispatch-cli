@@ -138,9 +138,12 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
                 "name": a.name,
                 "role": a.role,
                 "description": a.description,
+                "adapter": a.adapter.to_string(),
                 "command": a.command,
+                "extra_args": a.extra_args,
                 "prompt": a.prompt,
                 "ttl": a.ttl,
+                "launch": a.launch,
                 "launch_command": launch_cmd,
             })
         })

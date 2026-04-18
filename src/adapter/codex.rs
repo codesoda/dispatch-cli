@@ -23,6 +23,15 @@ mod tests {
     use super::super::{Adapter, BuildContext};
     use std::path::Path;
 
+    fn ctx<'a>(extras: &'a [String], prompt_file: Option<&'a Path>) -> BuildContext<'a> {
+        BuildContext {
+            extra_args: extras,
+            prompt_file,
+            prompt_inline: None,
+            command_string: None,
+        }
+    }
+
     #[test]
     fn exec_preceeds_extra_args() {
         let extras = vec![
@@ -31,12 +40,7 @@ mod tests {
             "-m".to_string(),
             "gpt-5.4".to_string(),
         ];
-        let ctx = BuildContext {
-            extra_args: &extras,
-            prompt_file: None,
-            command_string: None,
-        };
-        let launch = Adapter::Codex.build(&ctx).unwrap();
+        let launch = Adapter::Codex.build(&ctx(&extras, None)).unwrap();
         assert_eq!(launch.program, "codex");
         assert_eq!(
             launch.args,
@@ -49,12 +53,7 @@ mod tests {
     #[test]
     fn prompt_file_becomes_stdin() {
         let prompt = Path::new("/tmp/prompt.md");
-        let ctx = BuildContext {
-            extra_args: &[],
-            prompt_file: Some(prompt),
-            command_string: None,
-        };
-        let launch = Adapter::Codex.build(&ctx).unwrap();
+        let launch = Adapter::Codex.build(&ctx(&[], Some(prompt))).unwrap();
         assert_eq!(launch.args, vec!["exec"]);
         assert_eq!(launch.stdin_file.as_deref(), Some(prompt));
     }
@@ -67,12 +66,7 @@ mod tests {
             "-c".to_string(),
             "service_tier=\"fast\"".to_string(),
         ];
-        let ctx = BuildContext {
-            extra_args: &extras,
-            prompt_file: None,
-            command_string: None,
-        };
-        let launch = Adapter::Codex.build(&ctx).unwrap();
+        let launch = Adapter::Codex.build(&ctx(&extras, None)).unwrap();
         assert_eq!(
             launch.args,
             vec![

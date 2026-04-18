@@ -23,6 +23,15 @@ mod tests {
     use super::super::{Adapter, BuildContext};
     use std::path::Path;
 
+    fn ctx<'a>(extras: &'a [String], prompt_file: Option<&'a Path>) -> BuildContext<'a> {
+        BuildContext {
+            extra_args: extras,
+            prompt_file,
+            prompt_inline: None,
+            command_string: None,
+        }
+    }
+
     #[test]
     fn extra_args_precede_dash_p() {
         let extras = vec![
@@ -30,12 +39,7 @@ mod tests {
             "--model".to_string(),
             "sonnet".to_string(),
         ];
-        let ctx = BuildContext {
-            extra_args: &extras,
-            prompt_file: None,
-            command_string: None,
-        };
-        let launch = Adapter::Claude.build(&ctx).unwrap();
+        let launch = Adapter::Claude.build(&ctx(&extras, None)).unwrap();
         assert_eq!(launch.program, "claude");
         assert_eq!(
             launch.args,
@@ -48,12 +52,7 @@ mod tests {
     #[test]
     fn prompt_file_becomes_stdin() {
         let prompt = Path::new("/tmp/prompt.md");
-        let ctx = BuildContext {
-            extra_args: &[],
-            prompt_file: Some(prompt),
-            command_string: None,
-        };
-        let launch = Adapter::Claude.build(&ctx).unwrap();
+        let launch = Adapter::Claude.build(&ctx(&[], Some(prompt))).unwrap();
         assert_eq!(launch.args, vec!["-p"]);
         assert_eq!(launch.stdin_file.as_deref(), Some(prompt));
     }

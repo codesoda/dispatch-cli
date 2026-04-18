@@ -42,6 +42,9 @@ pub struct BuildContext<'a> {
     /// Path to a prompt file, if the agent has one. Adapters that consume
     /// prompts via stdin (claude, codex) populate `Launch::stdin_file`.
     pub prompt_file: Option<&'a Path>,
+    /// Inline prompt text — used by the `command` adapter for `{prompt}`
+    /// substitution in the user's command string.
+    pub prompt_inline: Option<&'a str>,
     /// Full shell command — only used by the `command` adapter.
     pub command_string: Option<&'a str>,
 }
