@@ -127,6 +127,8 @@ impl AgentOrchestrator {
             role = %config.role,
             adapter = %config.adapter,
             program = %launch.program,
+            args = ?launch.args,
+            cwd = %self.project_root.display(),
             "launching agent"
         );
 
