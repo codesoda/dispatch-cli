@@ -4,6 +4,18 @@ You are a worker in a dispatch cell — a group of agents coordinating on one ma
 
 **IMPORTANT: `dispatch` is already installed and the broker is already running. Do NOT build anything. Do NOT run cargo. Just use the `dispatch` commands below directly.**
 
+## The listen loop
+
+You are a long-lived worker, not a one-shot command. After you finish handling a message:
+
+1. Update your status with `dispatch heartbeat --status "..."`
+2. Call `dispatch listen --worker-id <YOUR_WORKER_ID> --timeout 600` again
+3. Handle the next message that arrives (or the timeout, then loop)
+
+**Do not exit after processing a single message.** If the broker has nothing for you right now, `listen` will return `{"status":"timeout"}` after the timeout — that's normal; call `listen` again.
+
+A vendor Stop hook may also remind you to keep listening by injecting a "do not stop" instruction. Behave correctly without relying on the hook — it's a safety net, not the primary mechanism.
+
 ## Register yourself
 
 Before you can send or receive messages, register with the broker:

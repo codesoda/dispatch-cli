@@ -88,6 +88,24 @@ Dispatch runs as a **cell** — a single broker process that coordinates workers
 | `dispatch events` | Query event history (`--type`, `--worker`, `--since`, `--limit`) |
 | `dispatch messages` | Inspect message history (`--worker-id`, `--unacked`, `--sent`) |
 
+### Agent lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `dispatch agent start <name\|id>` | Start a configured agent by name or worker ID |
+| `dispatch agent stop <name\|id>` | Stop a running agent (skips restart budget) |
+| `dispatch agent restart <name\|id>` | Stop and re-spawn |
+
+### Vendor hooks
+
+| Command | Description |
+|---------|-------------|
+| `dispatch codex-hook install` | Register a Stop hook in `.codex/hooks.json` + enable `features.codex_hooks` |
+| `dispatch codex-hook uninstall` | Remove the hook (preserves other codex config) |
+| `dispatch claude-hook install` | Merge a Stop hook into `.claude/settings.json` |
+| `dispatch claude-hook uninstall` | Remove the Stop hook entry |
+| `dispatch codex-hook stop` / `dispatch claude-hook stop` | Hook handler invoked by the vendor CLI — prints a JSON block decision |
+
 ## Configuration
 
 Dispatch searches upward from the current directory for `dispatch.config.toml`:
@@ -97,6 +115,62 @@ cell_id = "my-project"
 ```
 
 Override precedence (highest wins): `--cell-id` flag > `DISPATCH_CELL_ID` env var > config file > derived from path.
+
+## Agent orchestration
+
+`dispatch serve` can launch and supervise agents declared in config. Each agent picks an **adapter** (how to invoke the underlying binary) and opts in to auto-launch with `launch = true`:
+
+```toml
+[[agents]]
+name = "implementer"
+role = "code.implementer"
+description = "Writes code based on plans"
+adapter = "codex"                      # "command" | "claude" | "codex"
+prompt_file = "prompts/implementer.md" # piped as stdin to claude/codex
+launch = true
+extra_args = [
+  "-s", "danger-full-access",
+  "-m", "gpt-5.4",
+  "-c", "model_reasoning_effort=\"xhigh\"",
+]
+
+[[agents]]
+name = "reviewer"
+role = "code.reviewer"
+description = "Reviews code for quality"
+adapter = "claude"
+prompt_file = "prompts/reviewer.md"
+launch = true
+extra_args = ["--dangerously-skip-permissions", "--model", "sonnet"]
+
+[[agents]]
+name = "watcher"
+role = "file.watcher"
+description = "Watches files and forwards stale messages"
+adapter = "command"
+command = "./examples/watch-files.sh --worker-id $DISPATCH_WORKER_ID src/"
+launch = true
+```
+
+Run `dispatch serve --launch` to auto-spawn every agent with `launch = true`. Agents with `launch = false` (the default) are printed as ready-to-paste commands so you can run them in separate terminals.
+
+### Supervisor + auto-restart
+
+Each supervised agent runs under a task that restarts it on exit with exponential backoff: **1s, 2s, 4s, 8s, 16s, 30s (cap)**. After **5 consecutive unstable failures** the supervisor gives up and marks the agent `crashed` in the monitor UI. An agent that ran for at least 30s before exiting gets a fresh restart budget, so a long-lived process that dies once isn't treated as flaky.
+
+Use `dispatch agent {start,stop,restart} <name|worker-id>` to intervene while the broker is up.
+
+### Vendor hooks (keeping LLM agents alive)
+
+LLM vendor CLIs (`claude`, `codex`) finish their turn and exit by default. To keep them alive for the next dispatch message, install a Stop hook that tells the vendor to block the exit:
+
+```sh
+# In your project root:
+dispatch codex-hook install       # writes .codex/hooks.json + enables features.codex_hooks
+dispatch claude-hook install      # merges a Stop hook into .claude/settings.json
+```
+
+The hook runs `dispatch {codex,claude}-hook stop`, which emits `{"decision":"block","reason":"..."}` on stdout. The reason tells the agent to call `dispatch listen` again with its worker ID. Uninstall with `... uninstall`.
 
 ## Stale & Refresh Control Messages
 
