@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use dispatch::backend::create_backend;
-use dispatch::cli::{AgentAction, Cli, Commands};
+use dispatch::cli::{AgentAction, Cli, Commands, HookAction};
 use dispatch::config::resolve_config;
+use dispatch::hooks;
 use dispatch::logging::init_tracing;
 use dispatch::protocol::BrokerRequest;
 
@@ -76,6 +77,14 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         println!("{}", path.display());
         eprintln!("Created dispatch.config.toml");
         return Ok(());
+    }
+
+    // Hook subcommands are local file operations / stdout — no broker, no config.
+    if let Commands::CodexHook { action } = &cli.command {
+        return run_codex_hook(action, &cwd);
+    }
+    if let Commands::ClaudeHook { action } = &cli.command {
+        return run_claude_hook(action, &cwd);
     }
 
     let config = resolve_config(cli.cell_id.as_deref(), cli.config.as_deref(), &cwd)?;
@@ -197,6 +206,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     AgentAction::Stop { name } => BrokerRequest::AgentStop { name },
                     AgentAction::Restart { name } => BrokerRequest::AgentRestart { name },
                 },
+                Commands::CodexHook { .. } | Commands::ClaudeHook { .. } => unreachable!(),
             };
             let response = backend.send_request(&request).await?;
             let json = serde_json::to_string(&response)?;
@@ -204,5 +214,48 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         }
     }
 
+    Ok(())
+}
+
+fn run_codex_hook(
+    action: &HookAction,
+    cwd: &std::path::Path,
+) -> Result<(), dispatch::errors::DispatchError> {
+    match action {
+        HookAction::Stop => {
+            println!("{}", hooks::stop_decision_json());
+        }
+        HookAction::Install => {
+            let path = hooks::codex::install(cwd)?;
+            eprintln!(
+                "installed codex hook at {}\nensure features.codex_hooks = true is set in .codex/config.toml (already added if missing)",
+                path.display()
+            );
+        }
+        HookAction::Uninstall => match hooks::codex::uninstall(cwd)? {
+            Some(path) => eprintln!("removed {}", path.display()),
+            None => eprintln!("no codex hook installed"),
+        },
+    }
+    Ok(())
+}
+
+fn run_claude_hook(
+    action: &HookAction,
+    cwd: &std::path::Path,
+) -> Result<(), dispatch::errors::DispatchError> {
+    match action {
+        HookAction::Stop => {
+            println!("{}", hooks::stop_decision_json());
+        }
+        HookAction::Install => {
+            let path = hooks::claude::install(cwd)?;
+            eprintln!("installed claude hook at {}", path.display());
+        }
+        HookAction::Uninstall => match hooks::claude::uninstall(cwd)? {
+            Some(path) => eprintln!("removed entry from {}", path.display()),
+            None => eprintln!("no claude hook installed"),
+        },
+    }
     Ok(())
 }

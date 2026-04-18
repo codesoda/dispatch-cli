@@ -191,6 +191,18 @@ pub enum Commands {
         #[command(subcommand)]
         action: AgentAction,
     },
+
+    /// Codex CLI hook integration (stop handler, install, uninstall)
+    CodexHook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+
+    /// Claude Code CLI hook integration (stop handler, install, uninstall)
+    ClaudeHook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -210,4 +222,15 @@ pub enum AgentAction {
         /// Agent name from config, or worker ID of a registered agent
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum HookAction {
+    /// Handler invoked by the vendor CLI's Stop hook. Prints a JSON block
+    /// decision on stdout so the agent stays alive to wait for more messages.
+    Stop,
+    /// Register the dispatch stop hook in this project's vendor config files
+    Install,
+    /// Remove the dispatch stop hook from this project's vendor config files
+    Uninstall,
 }
