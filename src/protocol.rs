@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+/// Maximum number of historical status taglines retained per worker.
+/// Current tagline is `Worker.last_status`; this cap bounds the ring that
+/// backs the "last N" strip on the agent card.
+pub const STATUS_HISTORY_MAX: usize = 3;
+
+/// A prior status tagline plus when it was set. Oldest first in the ring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub status: String,
+    pub set_at: u64,
+}
 
 /// A message queued in a worker's mailbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +164,11 @@ pub struct Worker {
     /// Unix timestamp when `last_status` was last set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_status_at: Option<u64>,
+    /// Recent status taglines, oldest first. Capped at `STATUS_HISTORY_MAX`.
+    /// The current `last_status` is **not** included here — it lives on its
+    /// own field. Skipped when empty so older clients see the same shape.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub status_history: VecDeque<StatusEntry>,
 }
 
 /// The payload inside a successful response, varies by request type.
@@ -272,6 +289,7 @@ mod tests {
                     expires_at: 1000,
                     last_status: None,
                     last_status_at: None,
+                    status_history: VecDeque::new(),
                 }],
             },
             ResponsePayload::HeartbeatAck {
@@ -300,6 +318,47 @@ mod tests {
                 serde_json::to_value(&back).unwrap(),
             );
         }
+    }
+
+    /// Worker round-trips with a populated status_history; the empty field
+    /// is omitted from JSON so older clients keep parsing the response.
+    #[test]
+    fn worker_status_history_round_trip() {
+        let mut history = VecDeque::new();
+        history.push_back(StatusEntry {
+            status: "starting".into(),
+            set_at: 100,
+        });
+        history.push_back(StatusEntry {
+            status: "running tests".into(),
+            set_at: 105,
+        });
+        let worker = Worker {
+            id: "w1".into(),
+            name: "worker-1".into(),
+            role: "builder".into(),
+            description: "test".into(),
+            capabilities: vec![],
+            ttl_secs: 300,
+            expires_at: 2000,
+            last_status: Some("waiting on review".into()),
+            last_status_at: Some(110),
+            status_history: history.clone(),
+        };
+        let json = serde_json::to_string(&worker).unwrap();
+        assert!(json.contains("status_history"));
+        let back: Worker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status_history, history);
+
+        // Empty history is omitted from JSON and absent fields default to empty.
+        let empty = Worker {
+            status_history: VecDeque::new(),
+            ..worker
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("status_history"));
+        let back: Worker = serde_json::from_str(&json).unwrap();
+        assert!(back.status_history.is_empty());
     }
 
     /// BrokerResponse::Error round-trips correctly.

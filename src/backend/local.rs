@@ -11,7 +11,10 @@ use tokio::sync::{Mutex, Notify};
 use tracing::instrument;
 
 use crate::errors::DispatchError;
-use crate::protocol::{BrokerRequest, BrokerResponse, Message, ResponsePayload, Worker};
+use crate::protocol::{
+    BrokerRequest, BrokerResponse, Message, ResponsePayload, StatusEntry, Worker,
+    STATUS_HISTORY_MAX,
+};
 
 /// Default worker TTL in seconds (1 hour).
 const DEFAULT_WORKER_TTL_SECS: u64 = 3600;
@@ -230,6 +233,7 @@ impl BrokerState {
             expires_at: now + ttl,
             last_status: None,
             last_status_at: None,
+            status_history: VecDeque::new(),
         };
         self.workers.insert(id.clone(), worker);
         id
@@ -267,14 +271,33 @@ impl BrokerState {
 
     /// Renew a worker's TTL and optionally update status.
     /// Returns the new expiry timestamp, or None if not found/expired.
+    ///
+    /// When `status` differs from the worker's existing `last_status`, the
+    /// previous tagline (with its set time) is pushed onto `status_history`
+    /// so the card UI can show the last few values. Identical re-sets are
+    /// deduped so a steady heartbeat doesn't fill the buffer with copies.
     pub fn heartbeat_worker(&mut self, worker_id: &str, status: Option<String>) -> Option<u64> {
         self.evict_expired();
         if let Some(worker) = self.workers.get_mut(worker_id) {
             let now = now_secs();
             worker.expires_at = now + worker.ttl_secs;
             if let Some(s) = status {
-                worker.last_status = Some(s);
-                worker.last_status_at = Some(now);
+                let unchanged = worker.last_status.as_deref() == Some(s.as_str());
+                if !unchanged {
+                    if let (Some(prev_status), Some(prev_at)) =
+                        (worker.last_status.take(), worker.last_status_at)
+                    {
+                        push_status_history(
+                            &mut worker.status_history,
+                            StatusEntry {
+                                status: prev_status,
+                                set_at: prev_at,
+                            },
+                        );
+                    }
+                    worker.last_status = Some(s);
+                    worker.last_status_at = Some(now);
+                }
             }
             Some(worker.expires_at)
         } else {
@@ -358,7 +381,10 @@ impl BrokerState {
         }
     }
 
-    /// Clear a worker's status without affecting registration.
+    /// Clear a worker's current status tagline. Does **not** touch
+    /// `status_history` — clear is a display-level operation so the recent
+    /// taglines stay visible on the agent card after the user resets the
+    /// current state.
     pub fn clear_status(&mut self, worker_id: &str) -> Result<(), String> {
         self.evict_expired();
         if let Some(worker) = self.workers.get_mut(worker_id) {
@@ -541,6 +567,21 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
         .as_secs()
+}
+
+/// Push a status entry into a worker's history ring, deduping against the
+/// most-recent entry and capping the ring at `STATUS_HISTORY_MAX`.
+///
+/// Dedupe protects the buffer from filling with duplicates when an upstream
+/// re-emits the same tagline — only transitions show up in the history.
+fn push_status_history(history: &mut VecDeque<StatusEntry>, entry: StatusEntry) {
+    if history.back().map(|e| e.status.as_str()) == Some(entry.status.as_str()) {
+        return;
+    }
+    history.push_back(entry);
+    while history.len() > STATUS_HISTORY_MAX {
+        history.pop_front();
+    }
 }
 
 /// Derive the Unix domain socket path for a given cell identity.
@@ -1761,6 +1802,83 @@ mod tests {
             state.heartbeat_worker(&id, None).is_none(),
             "heartbeat for expired worker should return None"
         );
+    }
+
+    /// Pushing 5 distinct statuses leaves the current one on `last_status`
+    /// and the most recent `STATUS_HISTORY_MAX` priors in `status_history`,
+    /// oldest first. The very first status (A) drops off when the ring caps.
+    #[test]
+    fn test_status_history_caps_at_max() {
+        let mut state = BrokerState::new();
+        let id = state.register_worker(
+            "hist".into(),
+            "role".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
+        for s in ["A", "B", "C", "D", "E"] {
+            state.heartbeat_worker(&id, Some(s.into())).unwrap();
+        }
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.last_status.as_deref(), Some("E"));
+        let history: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(history, vec!["B", "C", "D"]);
+        assert_eq!(w.status_history.len(), STATUS_HISTORY_MAX);
+    }
+
+    /// Re-setting an identical status is a no-op for both `last_status_at`
+    /// and `status_history` — heartbeats that re-emit the same tagline must
+    /// not pollute the buffer with copies.
+    #[test]
+    fn test_status_history_dedupes_consecutive_repeats() {
+        let mut state = BrokerState::new();
+        let id = state.register_worker(
+            "dedup".into(),
+            "role".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
+        state.heartbeat_worker(&id, Some("running".into())).unwrap();
+        let first_at = state.workers.get(&id).unwrap().last_status_at;
+        // Same status again — should not push, should not bump last_status_at.
+        state.heartbeat_worker(&id, Some("running".into())).unwrap();
+        let w = state.workers.get(&id).unwrap();
+        assert!(
+            w.status_history.is_empty(),
+            "no transition, no history push"
+        );
+        assert_eq!(
+            w.last_status_at, first_at,
+            "identical status must not bump last_status_at",
+        );
+    }
+
+    /// `status --clear` is a display-level reset: it nulls the current
+    /// tagline but leaves the historical buffer alone so the card still
+    /// shows the recent timeline.
+    #[test]
+    fn test_clear_status_preserves_history() {
+        let mut state = BrokerState::new();
+        let id = state.register_worker(
+            "clr".into(),
+            "role".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        );
+        state.heartbeat_worker(&id, Some("phase 1".into())).unwrap();
+        state.heartbeat_worker(&id, Some("phase 2".into())).unwrap();
+        state.clear_status(&id).unwrap();
+        let w = state.workers.get(&id).unwrap();
+        assert!(w.last_status.is_none());
+        assert!(w.last_status_at.is_none());
+        let history: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(history, vec!["phase 1"]);
     }
 
     #[tokio::test]
