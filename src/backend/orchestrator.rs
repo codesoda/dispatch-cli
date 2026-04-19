@@ -16,7 +16,10 @@ use crate::errors::DispatchError;
 const MAX_RESTART_ATTEMPTS: u32 = 5;
 
 /// Duration an agent must stay running before its restart attempt counter
-/// resets. A process that crashes after this threshold gets a fresh budget.
+/// resets. A process that stayed up at least this long is treated as a
+/// fresh first-attempt restart when it next exits — the counter is set
+/// back to `1` (not `0`), so the agent gets the full `MAX_RESTART_ATTEMPTS`
+/// budget from that point forward.
 const STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// Kill an entire process group. Sends SIGTERM first, then SIGKILL after a timeout.

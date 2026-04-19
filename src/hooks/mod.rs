@@ -67,9 +67,17 @@ pub async fn run_stop_hook(cwd: &Path) {
 /// to the config-derived path. Returns `None` if neither source yields a
 /// path (e.g. config resolution fails outside a project).
 fn resolve_socket_path(cwd: &Path) -> Option<PathBuf> {
-    if let Ok(env_path) = std::env::var("DISPATCH_SOCKET_PATH") {
-        if !env_path.is_empty() {
-            return Some(PathBuf::from(env_path));
+    let env = std::env::var("DISPATCH_SOCKET_PATH").ok();
+    resolve_socket_path_with_env(env.as_deref(), cwd)
+}
+
+/// Internal helper that separates the process-global `DISPATCH_SOCKET_PATH`
+/// read from the resolution logic so tests can exercise the env-precedence
+/// branch without mutating `std::env` (which races across parallel tests).
+fn resolve_socket_path_with_env(env_path: Option<&str>, cwd: &Path) -> Option<PathBuf> {
+    if let Some(p) = env_path {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
         }
     }
     match resolve_config(None, None, cwd) {
@@ -120,21 +128,31 @@ mod tests {
         assert!(!probe_broker(&sock).await);
     }
 
+    /// Env-var precedence: when DISPATCH_SOCKET_PATH is set, resolution
+    /// returns it verbatim without touching the config file. Exercises
+    /// `resolve_socket_path_with_env` so tests don't race on the
+    /// process-global env (which `std::env::set_var` is documented to
+    /// require serialising across threads).
     #[tokio::test]
     async fn resolve_socket_path_prefers_env_var() {
         let tmp = tempfile::tempdir().unwrap();
         let explicit = tmp.path().join("from-env.sock");
-        // Use a test-local env mutation guard; std::env is process-global so
-        // we set and then unset within the same test. Serial in practice
-        // because tokio::test uses the current_thread runtime.
-        // SAFETY: tests are single-threaded within a single `#[tokio::test]`.
-        unsafe {
-            std::env::set_var("DISPATCH_SOCKET_PATH", &explicit);
-        }
-        let resolved = resolve_socket_path(tmp.path());
-        unsafe {
-            std::env::remove_var("DISPATCH_SOCKET_PATH");
-        }
+        let resolved =
+            resolve_socket_path_with_env(Some(&explicit.display().to_string()), tmp.path());
         assert_eq!(resolved, Some(explicit));
+    }
+
+    /// Empty env value falls through to config-derived resolution, same as
+    /// an unset variable.
+    #[tokio::test]
+    async fn resolve_socket_path_empty_env_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolved = resolve_socket_path_with_env(Some(""), tmp.path());
+        // No config in tmp → config resolver derives cell_id from the path,
+        // so we still get *some* path back (not the empty-string one).
+        match resolved {
+            Some(p) => assert!(!p.as_os_str().is_empty()),
+            None => panic!("expected a derived path, not None"),
+        }
     }
 }

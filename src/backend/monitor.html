@@ -467,8 +467,10 @@ function renderAgentCard(cfg) {
   const { kind, label, pid, extra } = describeAgentState(st, cfg);
   const worker = (teamWorkers || []).find(w => w.name === cfg.name);
 
-  // Status block: current + last 2 priors (oldest first in history, so the
-  // most recent prior is at the tail).
+  // Status block: current + last 2 priors. `status_history` arrives
+  // oldest-first (most recent prior at the tail), so take the tail 2 with
+  // slice(-2) and then reverse() to render newest-prior-first below the
+  // current status line.
   const currentStatus = worker?.last_status || '';
   const history = (worker?.status_history || []).slice(-2).reverse();
   let statusBlock = '';
