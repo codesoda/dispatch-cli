@@ -79,12 +79,13 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         return Ok(());
     }
 
-    // Hook subcommands are local file operations / stdout — no broker, no config.
+    // Hook subcommands run without resolving a config up front — Stop probes
+    // the broker itself, install/uninstall touch vendor files only.
     if let Commands::CodexHook { action } = &cli.command {
-        return run_codex_hook(action, &cwd);
+        return run_codex_hook(action, &cwd).await;
     }
     if let Commands::ClaudeHook { action } = &cli.command {
-        return run_claude_hook(action, &cwd);
+        return run_claude_hook(action, &cwd).await;
     }
 
     let config = resolve_config(cli.cell_id.as_deref(), cli.config.as_deref(), &cwd)?;
@@ -217,13 +218,13 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
     Ok(())
 }
 
-fn run_codex_hook(
+async fn run_codex_hook(
     action: &HookAction,
     cwd: &std::path::Path,
 ) -> Result<(), dispatch::errors::DispatchError> {
     match action {
         HookAction::Stop => {
-            println!("{}", hooks::stop_decision_json());
+            hooks::run_stop_hook(cwd).await;
         }
         HookAction::Install => {
             let path = hooks::codex::install(cwd)?;
@@ -240,13 +241,13 @@ fn run_codex_hook(
     Ok(())
 }
 
-fn run_claude_hook(
+async fn run_claude_hook(
     action: &HookAction,
     cwd: &std::path::Path,
 ) -> Result<(), dispatch::errors::DispatchError> {
     match action {
         HookAction::Stop => {
-            println!("{}", hooks::stop_decision_json());
+            hooks::run_stop_hook(cwd).await;
         }
         HookAction::Install => {
             let path = hooks::claude::install(cwd)?;
