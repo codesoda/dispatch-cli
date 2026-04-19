@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-19
+
+### Added
+- `POST /api/agents/{name}/start|stop|restart` — monitor UI and external callers can drive the orchestrator directly (local-loopback, unauthenticated; matches `/api/shutdown`)
+- `Worker.status_history` — last 3 prior status taglines retained per worker with dedupe, surfaced via `/api/team`
+- `AgentState::Running` now carries `started_at` (Unix seconds) alongside `pid` for client-side uptime
+- Expanded monitor agent cards: adapter badge, current + last 2 prior statuses, uptime, heartbeat age, Start/Stop/Restart buttons, and a Copy-command button for `launch = false` agents
+- Toast feedback in the dashboard for action outcomes (disables buttons while in-flight)
+
+### Changed
+- `dispatch {codex,claude}-hook stop` probes the broker socket before emitting the block decision: when dispatch is unreachable the hook prints nothing and exits 0 so the vendor can stop the agent cleanly
+- `dispatch status --clear` no longer wipes the historical status buffer — clear is a display-level reset only
+
 ## [0.4.1] - 2026-04-19
 
 ### Added

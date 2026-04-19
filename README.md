@@ -170,7 +170,18 @@ dispatch codex-hook install       # writes .codex/hooks.json + enables features.
 dispatch claude-hook install      # merges a Stop hook into .claude/settings.json
 ```
 
-The hook runs `dispatch {codex,claude}-hook stop`, which emits `{"decision":"block","reason":"..."}` on stdout. The reason tells the agent to call `dispatch listen` again with its worker ID. Uninstall with `... uninstall`.
+The hook runs `dispatch {codex,claude}-hook stop`, which emits `{"decision":"block","reason":"..."}` on stdout when a dispatch broker is reachable on the project's socket. When it can't reach a broker (dispatch is shutting down, was never started, or the agent is running outside a dispatch project), the hook prints nothing and exits `0` so the vendor can stop the agent cleanly instead of pinning it alive. Uninstall with `... uninstall`.
+
+### Monitor dashboard
+
+`dispatch serve --monitor <port>` (or `[monitor] port = ...` in config) starts a dashboard at `http://localhost:<port>`. Each configured agent gets a card:
+
+- **Adapter badge** (`codex` / `claude` / `command`) and a **state pill** (running / starting / restarting / crashed / stopped / unmanaged).
+- **Current status tagline** (whatever the agent last set via `dispatch status` / `dispatch heartbeat --status`) plus the last two prior taglines as faded context.
+- **Uptime** for running agents and **last heartbeat age** for registered workers, ticked locally every second so the card stays live between polls.
+- **Start / Stop / Restart** buttons wired to `POST /api/agents/{name}/{action}`. A **Copy cmd** button appears for `launch = false` agents so you can paste the launch command into another terminal.
+
+The card endpoints are unauthenticated and local-loopback only — the same posture as `POST /api/shutdown`.
 
 ## Stale & Refresh Control Messages
 
