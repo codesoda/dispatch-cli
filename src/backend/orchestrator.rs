@@ -371,16 +371,33 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Stop a running agent by name. Returns `true` if an agent was found and
-    /// stopped, `false` if no agent by that name is currently supervised.
+    /// Signal a running agent to shut down and return its supervisor's
+    /// `JoinHandle`. Does **not** await the handle — the caller is expected
+    /// to `.await` it after releasing the orchestrator mutex. This avoids
+    /// holding `Arc<Mutex<AgentOrchestrator>>` across the 500ms
+    /// SIGTERM→SIGKILL window inside `kill_process_group`, which would
+    /// otherwise block every concurrent read of `list_state` (e.g. the
+    /// dashboard's 2s `/api/agents/state` poll).
+    ///
+    /// Returns `None` if no agent by that name is currently supervised.
+    pub fn signal_stop_by_name(&mut self, name: &str) -> Option<JoinHandle<()>> {
+        let idx = self.agents.iter().position(|a| a.name == name)?;
+        let agent = self.agents.remove(idx);
+        agent.shutdown.notify_one();
+        Some(agent.supervisor)
+    }
+
+    /// Stop a running agent by name. Convenience wrapper around
+    /// `signal_stop_by_name` for test / non-HTTP callers that are fine
+    /// awaiting inside the critical section (e.g. the full `shutdown_all`
+    /// path). Returns `true` if an agent was found and stopped.
     pub async fn stop_by_name(&mut self, name: &str) -> bool {
-        if let Some(idx) = self.agents.iter().position(|a| a.name == name) {
-            let agent = self.agents.remove(idx);
-            agent.shutdown.notify_one();
-            let _ = agent.supervisor.await;
-            true
-        } else {
-            false
+        match self.signal_stop_by_name(name) {
+            Some(handle) => {
+                let _ = handle.await;
+                true
+            }
+            None => false,
         }
     }
 }

@@ -353,7 +353,9 @@ async fn api_agent_start(
     }
 }
 
-/// Stop a running managed agent by name.
+/// Stop a running managed agent by name. Releases the orchestrator mutex
+/// before awaiting the supervisor's shutdown so the 500ms SIGTERM→SIGKILL
+/// window doesn't stall concurrent `/api/agents/state` polls.
 async fn api_agent_stop(
     State(state): State<MonitorState>,
     Path(name): Path<String>,
@@ -361,19 +363,29 @@ async fn api_agent_stop(
     if !super::orchestrator::is_safe_name(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid agent name");
     }
-    let mut orch = state.orchestrator.lock().await;
-    if !orch.has_config(&name) {
-        return error_response(StatusCode::NOT_FOUND, "no such agent in config");
-    }
-    if orch.stop_by_name(&name).await {
-        ok_response()
-    } else {
-        error_response(StatusCode::CONFLICT, "agent is not running")
+
+    // Phase 1 (locked): validate + signal the supervisor to stop.
+    let handle = {
+        let mut orch = state.orchestrator.lock().await;
+        if !orch.has_config(&name) {
+            return error_response(StatusCode::NOT_FOUND, "no such agent in config");
+        }
+        orch.signal_stop_by_name(&name)
+    };
+
+    // Phase 2 (unlocked): wait for the supervisor to exit without pinning
+    // the mutex that list_state / restart / poll all contend for.
+    match handle {
+        Some(h) => {
+            let _ = h.await;
+            ok_response()
+        }
+        None => error_response(StatusCode::CONFLICT, "agent is not running"),
     }
 }
 
-/// Stop-then-start an agent by name. Succeeds even if the agent is not
-/// currently running (only the re-spawn needs to succeed).
+/// Stop-then-start an agent by name. Does not hold the orchestrator mutex
+/// across the stop's await; the respawn re-acquires the lock afterwards.
 async fn api_agent_restart(
     State(state): State<MonitorState>,
     Path(name): Path<String>,
@@ -381,8 +393,25 @@ async fn api_agent_restart(
     if !super::orchestrator::is_safe_name(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid agent name");
     }
+
+    // Phase 1 (locked): validate name + signal any running instance to stop.
+    let handle = {
+        let mut orch = state.orchestrator.lock().await;
+        if !orch.has_config(&name) {
+            return error_response(StatusCode::NOT_FOUND, "no such agent in config");
+        }
+        orch.signal_stop_by_name(&name)
+    };
+
+    // Phase 2 (unlocked): await the old supervisor's exit.
+    if let Some(h) = handle {
+        let _ = h.await;
+    }
+
+    // Phase 3 (locked): respawn. `start_by_name` reaps any finished
+    // supervisor entry in case one slipped through between phases.
     let mut orch = state.orchestrator.lock().await;
-    match orch.restart_by_name(&name).await {
+    match orch.start_by_name(&name).await {
         Ok(()) => ok_response(),
         Err(e) => error_response(classify_agent_error(&e), &e.to_string()),
     }

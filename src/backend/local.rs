@@ -1233,21 +1233,46 @@ async fn handle_request(
         }
         BrokerRequest::AgentStop { name } => {
             let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
-            let mut orch = orchestrator.lock().await;
-            if orch.stop_by_name(&resolved).await {
-                BrokerResponse::Ok {
-                    payload: ResponsePayload::Ack {},
+            // Release the orchestrator mutex before awaiting the supervisor's
+            // shutdown so concurrent list_state / monitor polls don't stall
+            // for 500ms+ per stop.
+            let handle = {
+                let mut orch = orchestrator.lock().await;
+                orch.signal_stop_by_name(&resolved)
+            };
+            match handle {
+                Some(h) => {
+                    let _ = h.await;
+                    BrokerResponse::Ok {
+                        payload: ResponsePayload::Ack {},
+                    }
                 }
-            } else {
-                BrokerResponse::Error {
+                None => BrokerResponse::Error {
                     message: format!("agent '{resolved}' is not running"),
-                }
+                },
             }
         }
         BrokerRequest::AgentRestart { name } => {
             let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            // Split phases mirror api_agent_restart: lock → signal stop →
+            // unlock → await → lock → start. Avoids pinning the orchestrator
+            // mutex across the kill window.
+            let handle = {
+                let mut orch = orchestrator.lock().await;
+                if !orch.has_config(&resolved) {
+                    return BrokerResponse::Error {
+                        message: format!(
+                            "agent restart failed: failed to launch agent \"{resolved}\": no such agent in config"
+                        ),
+                    };
+                }
+                orch.signal_stop_by_name(&resolved)
+            };
+            if let Some(h) = handle {
+                let _ = h.await;
+            }
             let mut orch = orchestrator.lock().await;
-            match orch.restart_by_name(&resolved).await {
+            match orch.start_by_name(&resolved).await {
                 Ok(()) => BrokerResponse::Ok {
                     payload: ResponsePayload::Ack {},
                 },
