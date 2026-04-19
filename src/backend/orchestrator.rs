@@ -49,8 +49,9 @@ fn restart_backoff(attempt: u32) -> Duration {
 pub enum AgentState {
     /// Supervisor has been created but the first spawn hasn't landed yet.
     Starting,
-    /// A child process is alive.
-    Running { pid: u32 },
+    /// A child process is alive. `started_at` is a Unix-seconds timestamp of
+    /// the most recent spawn — the UI renders uptime as `now - started_at`.
+    Running { pid: u32, started_at: u64 },
     /// Process exited; supervisor is waiting before respawning.
     Restarting { attempt: u32, backoff_secs: u64 },
     /// Restart budget exhausted — supervisor has given up.
@@ -172,7 +173,10 @@ impl AgentOrchestrator {
             config.name, config.role, pid
         );
 
-        let state = Arc::new(Mutex::new(AgentState::Running { pid }));
+        let state = Arc::new(Mutex::new(AgentState::Running {
+            pid,
+            started_at: super::local::now_secs(),
+        }));
         let shutdown = Arc::new(Notify::new());
 
         let supervisor = tokio::spawn(supervise_agent(
@@ -548,7 +552,10 @@ async fn supervise_agent(
                         child = new_child;
                         started_at = Instant::now();
                         let new_pid = child.id().unwrap_or(0);
-                        *state.lock().await = AgentState::Running { pid: new_pid };
+                        *state.lock().await = AgentState::Running {
+                            pid: new_pid,
+                            started_at: super::local::now_secs(),
+                        };
                     }
                     Err(e) => {
                         tracing::warn!(agent = %config.name, error = %e, "respawn failed");
