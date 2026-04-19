@@ -152,34 +152,47 @@ async fn tokio_file_exists(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
 }
 
-/// Append `[features] codex_hooks = true` to `config.toml` if the flag isn't
-/// already present. Uses a simple string merge rather than round-tripping
-/// the TOML AST — so comments, ordering, and formatting of unrelated config
-/// are preserved. Line-ending agnostic: walks `split_inclusive('\n')` so
-/// CRLF-terminated files aren't split mid-pair when we compute the
-/// insertion offset.
+/// Ensure `[features] codex_hooks = true` is present in `config.toml`.
+///
+/// Cases (in order):
+/// 1. File already has `codex_hooks = true` somewhere → no change.
+/// 2. File has `codex_hooks = <anything-else>` (e.g. `false`) → the existing
+///    line is rewritten to `= true` in place. Avoids inserting a duplicate
+///    key that would make the TOML invalid.
+/// 3. `[features]` section exists but no `codex_hooks` key → append the key
+///    at the end of the section.
+/// 4. No `[features]` section → append a fresh section.
+///
+/// Uses a simple string merge rather than round-tripping the TOML AST — so
+/// comments, ordering, and formatting of unrelated config are preserved.
+/// Line-ending agnostic: walks `split_inclusive('\n')` so CRLF-terminated
+/// files aren't split mid-pair when we compute offsets.
 fn ensure_codex_hooks_feature(existing: &str) -> String {
-    if existing
-        .lines()
-        .any(|l| l.trim_start().starts_with("codex_hooks") && l.contains("true"))
-    {
-        return existing.to_string();
-    }
-
-    // Walk sections, preserving the original line terminators so byte
-    // offsets stay correct on both LF and CRLF files.
+    // Single pass: note whether we're inside `[features]`, find the end of
+    // that section (start of the next `[header]` or EOF), and capture the
+    // byte range of any existing `codex_hooks = …` line so we can rewrite
+    // it in place instead of appending a duplicate.
     let mut in_features = false;
     let mut features_end: Option<usize> = None;
+    let mut existing_key: Option<(usize, usize, bool)> = None; // (start, end, is_true)
     let mut offset = 0usize;
     for segment in existing.split_inclusive('\n') {
         let trimmed = segment.trim_end_matches(['\r', '\n']).trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             if in_features {
                 features_end = Some(offset);
-                break;
+                in_features = false;
             }
             if trimmed == "[features]" {
                 in_features = true;
+            }
+        } else if in_features && trimmed.starts_with("codex_hooks") {
+            // Accept `codex_hooks = <value>` with any spacing. Value is the
+            // substring after `=`, stripped and with trailing comment removed.
+            if let Some((_, rhs)) = trimmed.split_once('=') {
+                let value = rhs.split('#').next().unwrap_or("").trim();
+                let is_true = value == "true";
+                existing_key = Some((offset, offset + segment.len(), is_true));
             }
         }
         offset += segment.len();
@@ -188,8 +201,31 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
         features_end = Some(existing.len());
     }
 
-    match (in_features, features_end) {
-        (true, Some(end)) => {
+    // Case 1 + 2: an existing `codex_hooks = …` line — short-circuit if
+    // already true, otherwise rewrite in place (preserving the original
+    // line terminator).
+    if let Some((start, end, is_true)) = existing_key {
+        if is_true {
+            return existing.to_string();
+        }
+        let terminator = if existing[start..end].ends_with("\r\n") {
+            "\r\n"
+        } else if existing[start..end].ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let mut out = String::with_capacity(existing.len());
+        out.push_str(&existing[..start]);
+        out.push_str("codex_hooks = true");
+        out.push_str(terminator);
+        out.push_str(&existing[end..]);
+        return out;
+    }
+
+    match features_end {
+        // Case 3: [features] section exists, no codex_hooks key.
+        Some(end) => {
             let mut out = String::with_capacity(existing.len() + 24);
             out.push_str(&existing[..end]);
             if !out.ends_with('\n') {
@@ -199,7 +235,8 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
             out.push_str(&existing[end..]);
             out
         }
-        _ => {
+        // Case 4: no [features] section at all.
+        None => {
             let mut out = existing.to_string();
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
@@ -389,6 +426,47 @@ mod tests {
             toml::Value::Boolean(true)
         );
         assert_eq!(parsed["features"]["other"], toml::Value::Boolean(true));
+    }
+
+    /// A pre-existing `codex_hooks = false` inside `[features]` must be
+    /// rewritten to `= true` in place, NOT appended after — appending
+    /// would produce a duplicate key and make the TOML invalid.
+    #[test]
+    fn rewrites_existing_false_value_in_place() {
+        let input = "[features]\ncodex_hooks = false\nother = true\n";
+        let out = ensure_codex_hooks_feature(input);
+        assert_eq!(out.matches("codex_hooks").count(), 1);
+        assert!(out.contains("codex_hooks = true"));
+        assert!(!out.contains("codex_hooks = false"));
+        assert!(out.contains("other = true"));
+        // Must remain parseable TOML.
+        let parsed: toml::Value = toml::from_str(&out).expect("merge must yield valid TOML");
+        assert_eq!(
+            parsed["features"]["codex_hooks"],
+            toml::Value::Boolean(true)
+        );
+    }
+
+    /// Non-boolean / unexpected values (e.g. a string) should also be
+    /// rewritten to the canonical `= true` rather than appended after.
+    #[test]
+    fn rewrites_unexpected_value_in_place() {
+        let input = "[features]\ncodex_hooks = \"yes\"\n";
+        let out = ensure_codex_hooks_feature(input);
+        assert_eq!(out.matches("codex_hooks").count(), 1);
+        assert!(out.contains("codex_hooks = true"));
+        assert!(!out.contains("\"yes\""));
+    }
+
+    /// When the in-place rewrite hits a CRLF-terminated line, the new line
+    /// must also end with CRLF so the rest of the file's terminator style
+    /// is preserved.
+    #[test]
+    fn in_place_rewrite_preserves_crlf() {
+        let input = "[features]\r\ncodex_hooks = false\r\n";
+        let out = ensure_codex_hooks_feature(input);
+        assert!(out.contains("codex_hooks = true\r\n"));
+        assert!(!out.contains("codex_hooks = false"));
     }
 
     /// Rejects a hooks.json whose top-level JSON is not an object (array,
