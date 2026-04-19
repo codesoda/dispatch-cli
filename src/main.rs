@@ -216,13 +216,13 @@ async fn run_codex_hook(
             hooks::run_stop_hook(cwd).await;
         }
         HookAction::Install => {
-            let path = hooks::codex::install(cwd)?;
+            let path = hooks::codex::install(cwd).await?;
             eprintln!(
                 "installed codex hook at {}\nensure features.codex_hooks = true is set in .codex/config.toml (already added if missing)",
                 path.display()
             );
         }
-        HookAction::Uninstall => match hooks::codex::uninstall(cwd)? {
+        HookAction::Uninstall => match hooks::codex::uninstall(cwd).await? {
             Some(path) => eprintln!("removed {}", path.display()),
             None => eprintln!("no codex hook installed"),
         },
@@ -239,10 +239,10 @@ async fn run_claude_hook(
             hooks::run_stop_hook(cwd).await;
         }
         HookAction::Install => {
-            let path = hooks::claude::install(cwd)?;
+            let path = hooks::claude::install(cwd).await?;
             eprintln!("installed claude hook at {}", path.display());
         }
-        HookAction::Uninstall => match hooks::claude::uninstall(cwd)? {
+        HookAction::Uninstall => match hooks::claude::uninstall(cwd).await? {
             Some(path) => eprintln!("removed entry from {}", path.display()),
             None => eprintln!("no claude hook installed"),
         },
