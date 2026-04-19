@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-worker status history on `Worker.status_history` — up to 3 most recent prior status entries (each `{status, set_at}`), oldest first. Updated automatically on `heartbeat --status <...>`; surfaced on `/api/team` so the dashboard can render a "prior statuses" strip next to the current tagline. Dedupes repeated same-status heartbeats; `dispatch status --clear` clears only the current entry and leaves history intact.
+
 ### Changed
 - `dispatch {codex,claude}-hook stop` now probes the broker socket before deciding. If the broker is reachable, it emits the block decision as before. If the socket is missing, refused, or times out (≤250ms), it exits 0 with empty stdout so the vendor CLI is free to stop the agent cleanly. Lets dispatch shut down without holding vendor agents hostage.
 

@@ -131,6 +131,18 @@ pub enum BrokerResponse {
     Error { message: String },
 }
 
+/// One entry in a worker's status history.
+///
+/// Captured when `heartbeat --status <...>` mutates `last_status`. Newest
+/// entry lives on `Worker.last_status` / `last_status_at`; the last two
+/// prior entries (oldest first) are held in `Worker.status_history` for
+/// the dashboard's "previous statuses" strip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub status: String,
+    pub set_at: u64,
+}
+
 /// A registered worker in the broker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worker {
@@ -152,6 +164,12 @@ pub struct Worker {
     /// Unix timestamp when `last_status` was last set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_status_at: Option<u64>,
+    /// Prior status entries (oldest first), excluding the current
+    /// `last_status`. Bounded to the most recent N prior entries — see
+    /// `BrokerState::STATUS_HISTORY_MAX`. Elided when empty so older
+    /// clients parsing a response without this field stay compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_history: Vec<StatusEntry>,
 }
 
 /// The payload inside a successful response, varies by request type.
@@ -270,8 +288,12 @@ mod tests {
                     capabilities: vec![],
                     ttl_secs: 300,
                     expires_at: 1000,
-                    last_status: None,
-                    last_status_at: None,
+                    last_status: Some("running".into()),
+                    last_status_at: Some(900),
+                    status_history: vec![StatusEntry {
+                        status: "starting".into(),
+                        set_at: 800,
+                    }],
                 }],
             },
             ResponsePayload::HeartbeatAck {
@@ -300,6 +322,46 @@ mod tests {
                 serde_json::to_value(&back).unwrap(),
             );
         }
+    }
+
+    /// Worker.status_history round-trips through JSON and survives empty
+    /// payloads from older brokers (skip-if-empty + #[serde(default)]).
+    #[test]
+    fn worker_status_history_round_trip() {
+        let full = Worker {
+            id: "w1".into(),
+            name: "n".into(),
+            role: "r".into(),
+            description: "d".into(),
+            capabilities: vec![],
+            ttl_secs: 60,
+            expires_at: 10_000,
+            last_status: Some("current".into()),
+            last_status_at: Some(9_999),
+            status_history: vec![
+                StatusEntry {
+                    status: "earlier".into(),
+                    set_at: 9_990,
+                },
+                StatusEntry {
+                    status: "even-earlier".into(),
+                    set_at: 9_980,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            json.contains("\"status_history\""),
+            "non-empty history must be present on the wire: {json}"
+        );
+        let back: Worker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status_history, full.status_history);
+
+        // An older broker's response without the field must still deserialize.
+        let legacy_json = r#"{"id":"w1","name":"n","role":"r","description":"d","capabilities":[],"ttl_secs":60,"expires_at":10000}"#;
+        let legacy: Worker = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.status_history.is_empty());
+        assert!(legacy.last_status.is_none());
     }
 
     /// BrokerResponse::Error round-trips correctly.

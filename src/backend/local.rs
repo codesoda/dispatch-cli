@@ -22,6 +22,12 @@ const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
 /// Default maximum number of events retained in history.
 const DEFAULT_EVENT_HISTORY_MAX: usize = 10_000;
 
+/// How many *prior* status entries to keep per worker, on top of the
+/// current `last_status`. The dashboard's "previous statuses" strip shows
+/// up to two, so three total (current + two prior) with a bit of headroom
+/// feels right; bump later if the UI wants more.
+const STATUS_HISTORY_MAX: usize = 3;
+
 /// Event emitted by the broker for the monitor dashboard.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BrokerEvent {
@@ -230,6 +236,7 @@ impl BrokerState {
             expires_at: now + ttl,
             last_status: None,
             last_status_at: None,
+            status_history: Vec::new(),
         };
         self.workers.insert(id.clone(), worker);
         id
@@ -267,19 +274,40 @@ impl BrokerState {
 
     /// Renew a worker's TTL and optionally update status.
     /// Returns the new expiry timestamp, or None if not found/expired.
+    ///
+    /// When `status` is `Some(...)` and differs from `last_status`, the prior
+    /// status (if any) is pushed onto `status_history` and the buffer is
+    /// truncated to `STATUS_HISTORY_MAX`. Setting the same status twice in
+    /// a row is a no-op for history so repeated heartbeats from a polling
+    /// loop don't poison the ring.
     pub fn heartbeat_worker(&mut self, worker_id: &str, status: Option<String>) -> Option<u64> {
         self.evict_expired();
-        if let Some(worker) = self.workers.get_mut(worker_id) {
-            let now = now_secs();
-            worker.expires_at = now + worker.ttl_secs;
-            if let Some(s) = status {
-                worker.last_status = Some(s);
+        let worker = self.workers.get_mut(worker_id)?;
+        let now = now_secs();
+        worker.expires_at = now + worker.ttl_secs;
+        if let Some(new_status) = status {
+            let unchanged = worker.last_status.as_deref() == Some(new_status.as_str());
+            if !unchanged {
+                if let (Some(prev_status), Some(prev_set_at)) =
+                    (worker.last_status.take(), worker.last_status_at)
+                {
+                    worker.status_history.push(crate::protocol::StatusEntry {
+                        status: prev_status,
+                        set_at: prev_set_at,
+                    });
+                    let len = worker.status_history.len();
+                    if len > STATUS_HISTORY_MAX {
+                        worker.status_history.drain(..len - STATUS_HISTORY_MAX);
+                    }
+                }
+                worker.last_status = Some(new_status);
+                worker.last_status_at = Some(now);
+            } else {
+                // Same status as before — just refresh the timestamp.
                 worker.last_status_at = Some(now);
             }
-            Some(worker.expires_at)
-        } else {
-            None
         }
+        Some(worker.expires_at)
     }
 
     /// Get status summaries for all active workers or a specific worker.
@@ -1760,6 +1788,99 @@ mod tests {
         assert!(
             state.heartbeat_worker(&id, None).is_none(),
             "heartbeat for expired worker should return None"
+        );
+    }
+
+    /// Helper: short-name worker registration for status-history tests.
+    fn register_simple(state: &mut BrokerState, name: &str) -> String {
+        state.register_worker(
+            name.into(),
+            "role".into(),
+            "desc".into(),
+            vec![],
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn test_status_history_first_heartbeat_leaves_history_empty() {
+        let mut state = BrokerState::new();
+        let id = register_simple(&mut state, "hist-empty");
+        state
+            .heartbeat_worker(&id, Some("running tests 1/10".into()))
+            .unwrap();
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.last_status.as_deref(), Some("running tests 1/10"));
+        assert!(
+            w.status_history.is_empty(),
+            "no prior status means history stays empty"
+        );
+    }
+
+    #[test]
+    fn test_status_history_retains_last_n_in_order() {
+        let mut state = BrokerState::new();
+        let id = register_simple(&mut state, "hist-ring");
+        for s in ["s1", "s2", "s3", "s4", "s5"] {
+            state.heartbeat_worker(&id, Some(s.into())).unwrap();
+        }
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.last_status.as_deref(), Some("s5"));
+        let prior: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(
+            prior,
+            vec!["s2", "s3", "s4"],
+            "ring keeps the most recent STATUS_HISTORY_MAX prior entries, oldest first"
+        );
+    }
+
+    #[test]
+    fn test_status_history_dedupes_same_status_in_a_row() {
+        let mut state = BrokerState::new();
+        let id = register_simple(&mut state, "hist-dedupe");
+        state.heartbeat_worker(&id, Some("working".into())).unwrap();
+        state.heartbeat_worker(&id, Some("working".into())).unwrap();
+        state.heartbeat_worker(&id, Some("working".into())).unwrap();
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.last_status.as_deref(), Some("working"));
+        assert!(
+            w.status_history.is_empty(),
+            "same status repeated should not poison the ring"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_without_status_does_not_touch_history() {
+        let mut state = BrokerState::new();
+        let id = register_simple(&mut state, "hist-notouch");
+        state.heartbeat_worker(&id, Some("a".into())).unwrap();
+        state.heartbeat_worker(&id, Some("b".into())).unwrap();
+        // Several plain ttl heartbeats — must not shift history.
+        state.heartbeat_worker(&id, None).unwrap();
+        state.heartbeat_worker(&id, None).unwrap();
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.last_status.as_deref(), Some("b"));
+        let prior: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(prior, vec!["a"]);
+    }
+
+    #[test]
+    fn test_clear_status_preserves_history() {
+        let mut state = BrokerState::new();
+        let id = register_simple(&mut state, "hist-clear");
+        state.heartbeat_worker(&id, Some("a".into())).unwrap();
+        state.heartbeat_worker(&id, Some("b".into())).unwrap();
+        state.heartbeat_worker(&id, Some("c".into())).unwrap();
+        state.clear_status(&id).unwrap();
+        let w = state.workers.get(&id).unwrap();
+        assert!(w.last_status.is_none());
+        assert!(w.last_status_at.is_none());
+        let prior: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
+        assert_eq!(
+            prior,
+            vec!["a", "b"],
+            "clear_status clears current only; history remains for the card's prior-status strip"
         );
     }
 
