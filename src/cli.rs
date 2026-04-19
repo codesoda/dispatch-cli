@@ -102,7 +102,7 @@ pub enum Commands {
     /// Query event history
     Events {
         /// Filter by event type (register, send, deliver, ack, heartbeat, expire)
-        #[arg(long, name = "type")]
+        #[arg(long = "type", value_name = "type")]
         event_type: Option<String>,
 
         /// Filter by worker ID

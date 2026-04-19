@@ -23,7 +23,16 @@ const MAX_RESTART_ATTEMPTS: u32 = 5;
 const STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// Kill an entire process group. Sends SIGTERM first, then SIGKILL after a timeout.
+///
+/// Refuses to signal `pid == 0`: `libc::kill(-0, …)` signals the *caller's*
+/// process group, which would tear down `dispatch serve` itself along with
+/// every sibling supervisor. A missing/zero PID means the child already
+/// exited or was never spawned, so there is nothing to kill.
 async fn kill_process_group(pid: u32) {
+    if pid == 0 {
+        tracing::warn!("kill_process_group called with pid=0; refusing to signal caller's pgid");
+        return;
+    }
     let pgid = pid as i32;
     // Send SIGTERM to the process group.
     unsafe {

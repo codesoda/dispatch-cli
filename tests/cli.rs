@@ -511,7 +511,7 @@ fn events_command_filters_by_type() {
         .success();
 
     let output = dispatch_cmd(&dir, cell_id)
-        .args(["events", "--event-type", "send"])
+        .args(["events", "--type", "send"])
         .assert()
         .success()
         .get_output()
@@ -524,10 +524,14 @@ fn events_command_filters_by_type() {
     assert!(events.iter().all(|e| e["kind"] == "send"));
 }
 
+/// Default `dispatch messages --worker-id <id>` (no `--sent` flag) queries
+/// the worker's *inbox* — messages delivered **to** that worker. Named
+/// accordingly so the assertion (`to == worker_id`) and the test intent
+/// line up.
 #[test]
-fn messages_command_returns_sent_messages() {
+fn messages_command_returns_worker_inbox() {
     let dir = TempDir::new().unwrap();
-    let cell_id = "test-messages-history";
+    let cell_id = "test-messages-inbox";
     let _broker = start_broker(&dir, cell_id);
     let worker_id = register_worker(&dir, cell_id, "msg-worker", "tester");
     dispatch_cmd(&dir, cell_id)
@@ -557,6 +561,45 @@ fn messages_command_returns_sent_messages() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["body"], "payload-body");
     assert_eq!(messages[0]["to"], worker_id);
+}
+
+/// `--sent` flips the query to the worker's *outbox* — messages the worker
+/// sent to others. Covers the flag branch the inbox test above does not.
+#[test]
+fn messages_command_with_sent_flag_returns_outbox() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-messages-sent";
+    let _broker = start_broker(&dir, cell_id);
+    let sender_id = register_worker(&dir, cell_id, "sender-worker", "sender");
+    let recipient_id = register_worker(&dir, cell_id, "recipient-worker", "recipient");
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "send",
+            "--to",
+            &recipient_id,
+            "--body",
+            "outbound-payload",
+            "--from",
+            &sender_id,
+        ])
+        .assert()
+        .success();
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args(["messages", "--worker-id", &sender_id, "--sent"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["status"], "ok");
+    let messages = json["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["body"], "outbound-payload");
+    assert_eq!(messages[0]["from"], sender_id);
+    assert_eq!(messages[0]["to"], recipient_id);
 }
 
 #[test]
