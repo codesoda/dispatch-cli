@@ -130,7 +130,11 @@ impl AgentOrchestrator {
     }
 
     /// Build the environment variables injected into every agent subprocess.
-    fn env_vars(&self, name: &str, role: &str) -> HashMap<String, String> {
+    ///
+    /// `worker_id` is `Some` once dispatch pre-registers the worker server-side
+    /// at spawn time (see issue #43). When `None`, the var is omitted and the
+    /// agent must fall back to the legacy "register myself" flow.
+    fn env_vars(&self, name: &str, role: &str, worker_id: Option<&str>) -> HashMap<String, String> {
         let mut vars = HashMap::new();
         vars.insert("DISPATCH_CELL_ID".into(), self.cell_id.clone());
         vars.insert(
@@ -142,6 +146,9 @@ impl AgentOrchestrator {
         }
         vars.insert("DISPATCH_AGENT_NAME".into(), name.into());
         vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
+        if let Some(id) = worker_id {
+            vars.insert("DISPATCH_WORKER_ID".into(), id.into());
+        }
         vars
     }
 
@@ -173,7 +180,10 @@ impl AgentOrchestrator {
     /// comes from the adapter's `stdin_file` (typically the prompt file) or
     /// is `/dev/null` if the adapter doesn't need one.
     pub async fn spawn_agent(&mut self, config: &ResolvedAgentConfig) -> Result<(), DispatchError> {
-        let env_vars = self.env_vars(&config.name, &config.role);
+        // Step 4 of the issue-#43 rollout will pre-register the worker here
+        // and pass the assigned id. Until then, leave `DISPATCH_WORKER_ID`
+        // unset so the legacy in-agent register flow keeps working.
+        let env_vars = self.env_vars(&config.name, &config.role, None);
 
         // Initial spawn is synchronous so the caller sees config errors
         // (bad prompt file, missing binary) as a proper Err instead of
@@ -611,11 +621,14 @@ async fn supervise_agent(
 /// Build an agent command string for the user to paste.
 ///
 /// Includes the dispatch env vars (shell-escaped) and the adapter-assembled
-/// launch string.
+/// launch string. `worker_id` is `Some` only for the managed-spawn print path
+/// (issue #43); the unmanaged copy-paste path leaves it `None` so the agent
+/// receives a broker-assigned id from its own `dispatch register` call.
 pub fn build_agent_command(
     config: &ResolvedAgentConfig,
     cell_id: &str,
     monitor_url: Option<&str>,
+    worker_id: Option<&str>,
 ) -> String {
     let mut parts = vec![
         format!("DISPATCH_CELL_ID={}", shell_escape(cell_id)),
@@ -625,6 +638,10 @@ pub fn build_agent_command(
 
     if let Some(url) = monitor_url {
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
+    }
+
+    if let Some(id) = worker_id {
+        parts.push(format!("DISPATCH_WORKER_ID={}", shell_escape(id)));
     }
 
     let cmd_str = AgentOrchestrator::build_launch(config)
@@ -720,6 +737,68 @@ pub(super) fn sanitize_name(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::adapter::Adapter;
+
+    /// Constructing `env_vars(_, _, Some(id))` injects `DISPATCH_WORKER_ID`;
+    /// `None` omits the key entirely so legacy register-yourself agents see
+    /// exactly the previous environment.
+    #[test]
+    fn env_vars_includes_worker_id_when_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orch = AgentOrchestrator::new(
+            "cell-x",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+        );
+
+        let with_id = orch.env_vars("alice", "test-runner", Some("w-123"));
+        assert_eq!(
+            with_id.get("DISPATCH_WORKER_ID").map(String::as_str),
+            Some("w-123")
+        );
+        assert_eq!(
+            with_id.get("DISPATCH_AGENT_NAME").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            with_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
+            Some("test-runner")
+        );
+
+        let without_id = orch.env_vars("alice", "test-runner", None);
+        assert!(!without_id.contains_key("DISPATCH_WORKER_ID"));
+        // The other vars must match exactly so the legacy code path is bit-for-bit unchanged.
+        assert_eq!(
+            without_id.get("DISPATCH_AGENT_NAME").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            without_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
+            Some("test-runner")
+        );
+    }
+
+    /// `build_agent_command` emits `DISPATCH_WORKER_ID=<id>` only when the id
+    /// is supplied — the unmanaged copy-paste path keeps its previous output.
+    #[test]
+    fn build_agent_command_includes_worker_id_when_some() {
+        let cfg = test_config("alice", "echo hi");
+        let with_id = build_agent_command(&cfg, "cell-x", None, Some("w-123"));
+        // shell_escape wraps the value in single quotes; assert on the
+        // assignment as it would appear after escaping.
+        assert!(
+            with_id.contains("DISPATCH_WORKER_ID='w-123'"),
+            "expected worker id in: {with_id}",
+        );
+
+        let without_id = build_agent_command(&cfg, "cell-x", None, None);
+        assert!(
+            !without_id.contains("DISPATCH_WORKER_ID"),
+            "did not expect worker id in: {without_id}",
+        );
+    }
 
     /// Exponential doubling capped at 30s — table-driven so the intent is
     /// obvious if anyone tunes the backoff schedule later.

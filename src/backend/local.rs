@@ -757,8 +757,12 @@ pub async fn serve(
     if !manual.is_empty() {
         eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
         for agent in &manual {
-            let cmd =
-                super::orchestrator::build_agent_command(agent, cell_id, monitor_url.as_deref());
+            let cmd = super::orchestrator::build_agent_command(
+                agent,
+                cell_id,
+                monitor_url.as_deref(),
+                None,
+            );
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
         }
