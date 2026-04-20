@@ -54,6 +54,13 @@ pub enum BrokerRequest {
         /// re-issues `dispatch register` to fetch its prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_id: Option<String>,
+        /// Role prompt body to associate with this worker (issue #43). Only
+        /// the orchestrator sets this — at pre-register time it loads the
+        /// agent's `prompt_file` and ships the content here so the spawned
+        /// agent can fetch it back as the response body of its own
+        /// `dispatch register` call. Agents never set this themselves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_prompt: Option<String>,
     },
     /// List active workers.
     Team {
@@ -198,8 +205,15 @@ pub enum ResponsePayload {
     HeartbeatAck { worker_id: String, expires_at: u64 },
     /// List of active workers.
     WorkerList { workers: Vec<Worker> },
-    /// A worker was registered; returns the assigned worker ID.
-    WorkerRegistered { worker_id: String },
+    /// A worker was registered; returns the assigned worker ID. When the
+    /// broker has a role prompt stored for this worker (issue #43), it is
+    /// returned here so the spawned agent receives its first instructions
+    /// as the response body of its own `dispatch register` call.
+    WorkerRegistered {
+        worker_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_prompt: Option<String>,
+    },
     /// Message acknowledgement confirmed. MUST appear before `MessageAck`:
     /// serde's untagged deserializer tries variants in declaration order and
     /// ignores unknown fields, so an `AckConfirm` payload would otherwise
@@ -242,8 +256,9 @@ mod tests {
                 ttl_secs: None,
                 evict: false,
                 worker_id: None,
+                role_prompt: None,
             },
-            // Pre-assigned worker_id (issue #43) must round-trip cleanly.
+            // Pre-assigned worker_id + role_prompt (issue #43) must round-trip cleanly.
             BrokerRequest::Register {
                 name: "w1".into(),
                 role: "builder".into(),
@@ -252,6 +267,7 @@ mod tests {
                 ttl_secs: None,
                 evict: false,
                 worker_id: Some("w-fixed-id".into()),
+                role_prompt: Some("Run: dispatch listen --timeout 270".into()),
             },
             BrokerRequest::Team { from: None },
             BrokerRequest::Send {
@@ -319,6 +335,12 @@ mod tests {
         let payloads = vec![
             ResponsePayload::WorkerRegistered {
                 worker_id: "abc".into(),
+                role_prompt: None,
+            },
+            // Issue #43: WorkerRegistered must round-trip with a prompt body too.
+            ResponsePayload::WorkerRegistered {
+                worker_id: "abc".into(),
+                role_prompt: Some("Run: dispatch listen --timeout 270".into()),
             },
             ResponsePayload::MessageAck {
                 message_id: "msg-1".into(),

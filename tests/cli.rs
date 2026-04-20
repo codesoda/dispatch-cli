@@ -199,6 +199,135 @@ fn register_with_worker_id_is_idempotent() {
     assert_eq!(workers[0]["id"], supplied_id);
 }
 
+/// Issue #43: `dispatch register --role-prompt <body> --for-agent` routes
+/// the prompt body to stdout and the JSON envelope to stderr — so when
+/// the spawned agent runs this command as its first tool call, the prompt
+/// body lands directly in the model's tool result.
+#[test]
+fn register_for_agent_routes_prompt_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-for-agent";
+    let _broker = start_broker(&dir, cell_id);
+
+    let prompt = "Run: dispatch listen --timeout 270";
+    let output = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "test worker",
+            "--worker-id",
+            "w-prompt-test",
+            "--role-prompt",
+            prompt,
+            "--for-agent",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+
+    assert_eq!(
+        stdout.trim(),
+        prompt,
+        "prompt body must be on stdout for the model to see it",
+    );
+    assert!(
+        stderr.contains("\"status\":\"ok\""),
+        "JSON envelope must be on stderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("w-prompt-test"),
+        "JSON envelope must contain worker_id: {stderr}",
+    );
+}
+
+/// Issue #43: `--for-agent` without a stored prompt exits nonzero so the
+/// supervisor can restart rather than have the model see empty stdout.
+#[test]
+fn register_for_agent_without_prompt_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-for-agent-nopr";
+    let _broker = start_broker(&dir, cell_id);
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "no prompt here",
+            "--for-agent",
+        ])
+        .assert()
+        .failure();
+}
+
+/// Issue #43: an agent claim (re-register with same id) returns the prompt
+/// originally stored at orchestrator pre-register time. The claim itself
+/// passes no `--role-prompt`, so the broker must produce it from storage.
+#[test]
+fn register_claim_returns_originally_stored_prompt() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-claim-prompt";
+    let _broker = start_broker(&dir, cell_id);
+
+    let supplied_id = "w-claim-test";
+    let prompt = "Run: dispatch listen --timeout 270";
+
+    // Pre-register: orchestrator-style call carrying the prompt.
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "pre-register",
+            "--worker-id",
+            supplied_id,
+            "--role-prompt",
+            prompt,
+        ])
+        .assert()
+        .success();
+
+    // Agent claim: no --role-prompt, but --for-agent should return the stored one.
+    let output = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "agent claim",
+            "--worker-id",
+            supplied_id,
+            "--for-agent",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout.trim(),
+        prompt,
+        "claim must return the prompt the orchestrator originally stored",
+    );
+}
+
 #[test]
 fn team_lists_registered_workers() {
     let dir = TempDir::new().unwrap();

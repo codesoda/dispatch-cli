@@ -8,7 +8,7 @@ use dispatch::cli::{AgentAction, Cli, Commands, HookAction};
 use dispatch::config::resolve_config;
 use dispatch::hooks;
 use dispatch::logging::init_tracing;
-use dispatch::protocol::BrokerRequest;
+use dispatch::protocol::{BrokerRequest, BrokerResponse, ResponsePayload};
 
 /// Parse a timestamp string as either a relative duration (e.g. "5m", "1h", "30s")
 /// or an absolute Unix timestamp. Returns a Unix timestamp in seconds.
@@ -95,6 +95,16 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
             backend.serve().await?;
         }
         cmd => {
+            // Issue #43: when `dispatch register --for-agent` is invoked,
+            // route the prompt body to stdout (so it lands in the model's
+            // tool result) and the structured envelope to stderr.
+            let for_agent = matches!(
+                &cmd,
+                Commands::Register {
+                    for_agent: true,
+                    ..
+                }
+            );
             let request = match cmd {
                 Commands::Init => unreachable!(),
                 Commands::Serve { .. } => unreachable!(),
@@ -106,6 +116,8 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     ttl,
                     evict,
                     worker_id,
+                    role_prompt,
+                    for_agent: _,
                 } => BrokerRequest::Register {
                     name,
                     role,
@@ -114,6 +126,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     ttl_secs: ttl,
                     evict,
                     worker_id,
+                    role_prompt,
                 },
                 Commands::Team => BrokerRequest::Team {
                     from: cli.from.clone(),
@@ -202,7 +215,29 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
             };
             let response = backend.send_request(&request).await?;
             let json = serde_json::to_string(&response)?;
-            println!("{json}");
+            if for_agent {
+                // Prompt body to stdout, JSON envelope to stderr. If the
+                // broker has no prompt stored for this worker, exit nonzero
+                // — the agent has nothing to do and the supervisor should
+                // restart rather than have the model see empty stdout.
+                if let BrokerResponse::Ok {
+                    payload:
+                        ResponsePayload::WorkerRegistered {
+                            role_prompt: Some(prompt),
+                            ..
+                        },
+                } = &response
+                {
+                    println!("{prompt}");
+                    eprintln!("{json}");
+                } else {
+                    eprintln!("{json}");
+                    eprintln!("dispatch: --for-agent set but response carries no role prompt");
+                    process::exit(1);
+                }
+            } else {
+                println!("{json}");
+            }
         }
     }
 

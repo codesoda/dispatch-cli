@@ -162,6 +162,11 @@ pub struct BrokerState {
     pub messages_delivered: u64,
     /// Total number of requests handled.
     pub requests_handled: u64,
+    /// Per-worker role-prompt body keyed by worker ID (issue #43). Populated
+    /// at orchestrator pre-register time; returned in the `WorkerRegistered`
+    /// response when the spawned agent calls `dispatch register` to claim
+    /// its session. Absent for workers registered the legacy way.
+    pub role_prompts: HashMap<String, String>,
 }
 
 impl Default for BrokerState {
@@ -189,6 +194,7 @@ impl BrokerState {
             messages_sent: 0,
             messages_delivered: 0,
             requests_handled: 0,
+            role_prompts: HashMap::new(),
         }
     }
 
@@ -209,6 +215,14 @@ impl BrokerState {
     /// - Otherwise, the supplied id is used verbatim.
     ///
     /// If `worker_id` is `None`, a fresh UUID is generated (legacy behavior).
+    ///
+    /// `role_prompt` (issue #43) is the agent's role prompt body. Only the
+    /// orchestrator passes it — at pre-register time it loads the agent's
+    /// prompt file and ships the content here. The broker stores it under
+    /// the worker id so the spawned agent can fetch it back via the
+    /// `WorkerRegistered` response of its own `dispatch register` claim.
+    /// Agents themselves never pass `role_prompt`, so the claim path leaves
+    /// the stored value untouched when `role_prompt` is `None`.
     // Splitting these into a struct buys nothing — every caller passes them
     // positionally and clippy's 7-arg threshold is an arbitrary heuristic.
     #[allow(clippy::too_many_arguments)]
@@ -221,6 +235,7 @@ impl BrokerState {
         ttl_secs: Option<u64>,
         evict: bool,
         worker_id: Option<String>,
+        role_prompt: Option<String>,
     ) -> Result<String, String> {
         // Idempotent-claim short-circuit: if the supplied id already exists
         // and matches name+role, return it (and renew TTL) without touching
@@ -233,7 +248,14 @@ impl BrokerState {
                     let ttl = ttl_secs.unwrap_or(self.default_ttl);
                     existing.ttl_secs = ttl;
                     existing.expires_at = now_secs() + ttl;
-                    return Ok(supplied.clone());
+                    let id = supplied.clone();
+                    // Only overwrite the stored prompt if the caller supplied
+                    // one — agent claims pass `None` and must not erase what
+                    // the orchestrator stored at pre-register time.
+                    if let Some(prompt) = role_prompt {
+                        self.role_prompts.insert(id.clone(), prompt);
+                    }
+                    return Ok(id);
                 }
                 return Err(format!(
                     "worker_id {supplied} already registered as {}/{} -- supplied {name}/{role} does not match",
@@ -253,6 +275,7 @@ impl BrokerState {
                 self.workers.remove(old_id);
                 self.mailboxes.remove(old_id);
                 self.notifiers.remove(old_id);
+                self.role_prompts.remove(old_id);
             }
         }
 
@@ -272,6 +295,9 @@ impl BrokerState {
             status_history: VecDeque::new(),
         };
         self.workers.insert(id.clone(), worker);
+        if let Some(prompt) = role_prompt {
+            self.role_prompts.insert(id.clone(), prompt);
+        }
         Ok(id)
     }
 
@@ -290,6 +316,7 @@ impl BrokerState {
             self.workers.remove(id);
             self.mailboxes.remove(id);
             self.notifiers.remove(id);
+            self.role_prompts.remove(id);
         }
         expired
     }
@@ -932,6 +959,7 @@ async fn handle_request(
             ttl_secs,
             evict,
             worker_id,
+            role_prompt,
         } => {
             let mut state = state.lock().await;
             let worker_id = match state.register_worker(
@@ -942,6 +970,7 @@ async fn handle_request(
                 ttl_secs,
                 evict,
                 worker_id,
+                role_prompt,
             ) {
                 Ok(id) => id,
                 Err(message) => {
@@ -961,8 +990,15 @@ async fn handle_request(
                     "role": role,
                 })),
             );
+            // Issue #43: include the stored role prompt (if any) so the
+            // spawned agent receives its first instructions as the response
+            // body of its own `dispatch register` claim.
+            let role_prompt = state.role_prompts.get(&worker_id).cloned();
             BrokerResponse::Ok {
-                payload: ResponsePayload::WorkerRegistered { worker_id },
+                payload: ResponsePayload::WorkerRegistered {
+                    worker_id,
+                    role_prompt,
+                },
             }
         }
         BrokerRequest::Team { from } => {
@@ -1633,6 +1669,7 @@ mod tests {
                 None,
                 false,
                 Some("w-fixed".into()),
+                None,
             )
             .expect("register");
         assert_eq!(id, "w-fixed");
@@ -1653,6 +1690,7 @@ mod tests {
                 Some(60),
                 false,
                 Some("w-fixed".into()),
+                None,
             )
             .expect("first register");
         // Force the expiry into the past so we can detect the renewal.
@@ -1667,6 +1705,7 @@ mod tests {
                 Some(60),
                 false,
                 Some("w-fixed".into()),
+                None,
             )
             .expect("idempotent claim");
         assert_eq!(id, id2);
@@ -1691,6 +1730,7 @@ mod tests {
                 None,
                 false,
                 Some("w-fixed".into()),
+                None,
             )
             .expect("first register");
         let err = state
@@ -1702,6 +1742,7 @@ mod tests {
                 None,
                 false,
                 Some("w-fixed".into()),
+                None,
             )
             .expect_err("collision must be rejected");
         assert!(
@@ -1715,6 +1756,91 @@ mod tests {
         // The original worker is still there, untouched.
         assert_eq!(state.workers.len(), 1);
         assert_eq!(state.workers.get("w-fixed").unwrap().name, "alice");
+    }
+
+    /// Issue #43: a fresh registration with `role_prompt` stores the prompt
+    /// keyed by worker id; subsequent claims with `role_prompt: None` see
+    /// the stored prompt back via `role_prompts`.
+    #[test]
+    fn test_register_worker_stores_and_returns_role_prompt() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                Some("Run: dispatch listen --timeout 270".into()),
+            )
+            .expect("pre-register");
+        assert_eq!(
+            state.role_prompts.get(&id).map(String::as_str),
+            Some("Run: dispatch listen --timeout 270"),
+        );
+
+        // Agent claim with role_prompt=None must NOT erase the stored prompt.
+        let claimed = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim");
+        assert_eq!(claimed, id);
+        assert_eq!(
+            state.role_prompts.get(&id).map(String::as_str),
+            Some("Run: dispatch listen --timeout 270"),
+            "claim must not erase the stored prompt",
+        );
+    }
+
+    /// Issue #43: evicting a worker (via `evict=true` or TTL expiry) drops
+    /// its stored prompt too — no stale prompts left behind.
+    #[test]
+    fn test_register_worker_evict_clears_role_prompt() {
+        let mut state = BrokerState::new();
+        let first = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                Some("first prompt".into()),
+            )
+            .expect("first");
+        // Evict and re-register with a different id. Old prompt must be gone.
+        let second = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                true,
+                None,
+                Some("second prompt".into()),
+            )
+            .expect("evict + re-register");
+        assert_ne!(first, second);
+        assert!(
+            !state.role_prompts.contains_key(&first),
+            "evicted worker's prompt must be cleared",
+        );
+        assert_eq!(
+            state.role_prompts.get(&second).map(String::as_str),
+            Some("second prompt"),
+        );
     }
 
     /// Idempotent claim runs BEFORE evict, so a same-name evict cannot wipe a
@@ -1731,6 +1857,7 @@ mod tests {
                 None,
                 false,
                 Some("w-fixed".into()),
+                None,
             )
             .expect("pre-register");
         let claimed = state
@@ -1742,6 +1869,7 @@ mod tests {
                 None,
                 true, // evict
                 Some("w-fixed".into()),
+                None,
             )
             .expect("claim should win over evict");
         assert_eq!(id, claimed);
@@ -1760,6 +1888,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         let id2 = state
@@ -1770,6 +1899,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -1788,6 +1918,7 @@ mod tests {
                 vec!["review:code".into(), "review:docs".into()],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -1815,6 +1946,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         let worker = state.workers.get(&id).unwrap();
@@ -1834,6 +1966,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -1970,6 +2103,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         let expired_id = state
@@ -1980,6 +2114,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2002,6 +2137,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2035,6 +2171,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         state.workers.get_mut(&id).unwrap().expires_at = 0;
@@ -2059,6 +2196,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2086,6 +2224,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2118,6 +2257,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2245,6 +2385,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
 
@@ -2279,6 +2420,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         state.workers.get_mut(&worker_id).unwrap().expires_at = 0;
@@ -2298,6 +2440,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2323,6 +2466,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2424,6 +2568,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         state.send_message(worker_id.clone(), "first".into(), None);
@@ -2448,6 +2593,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         assert!(state.pop_message(&worker_id).is_none());
@@ -2470,6 +2616,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2499,6 +2646,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         let err = state
@@ -2519,6 +2667,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .expect("register");
         let bob = state
@@ -2529,6 +2678,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");
@@ -2553,6 +2703,7 @@ mod tests {
                 vec![],
                 None,
                 false,
+                None,
                 None,
             )
             .expect("register");

@@ -80,6 +80,22 @@ pub enum Commands {
         /// worker that dispatch pre-registered for them at spawn time.
         #[arg(long = "worker-id")]
         worker_id: Option<String>,
+
+        /// Role prompt body to associate with this worker (issue #43).
+        /// Only the orchestrator passes this — at pre-register time it
+        /// loads the agent's `prompt_file` and ships the content here so
+        /// the spawned agent can fetch it back via `--for-agent`.
+        #[arg(long = "role-prompt")]
+        role_prompt: Option<String>,
+
+        /// Output the role prompt body to stdout instead of the JSON
+        /// envelope (issue #43). Intentional CLI wart whose only purpose
+        /// is to be friendly to a downstream LLM tool result: the spawned
+        /// agent's first tool call is `dispatch register --for-agent`,
+        /// and the prompt body landing on stdout becomes its next
+        /// instruction. Without the flag, behavior is unchanged.
+        #[arg(long = "for-agent")]
+        for_agent: bool,
     },
 
     /// List active workers in the current cell
