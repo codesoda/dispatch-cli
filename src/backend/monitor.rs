@@ -484,6 +484,7 @@ mod tests {
             tmp,
             tmp.join("logs"),
             configs,
+            Arc::clone(&broker),
         )));
         MonitorState {
             broker,

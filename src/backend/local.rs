@@ -765,6 +765,7 @@ pub async fn serve(
         &config.agent_cwd,
         log_dir.clone(),
         config.agents.clone(),
+        Arc::clone(&state),
     )));
 
     // Optionally start the HTTP monitor dashboard.
