@@ -124,6 +124,81 @@ fn register_returns_worker_id() {
     );
 }
 
+/// Issue #43: registering with `--worker-id` uses the supplied id verbatim,
+/// and re-registering with the same id+name+role is an idempotent claim
+/// (returns the same id without creating a duplicate worker).
+#[test]
+fn register_with_worker_id_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-claim";
+    let _broker = start_broker(&dir, cell_id);
+
+    let supplied_id = "w-fixed-id-for-test";
+
+    let first = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "test worker",
+            "--worker-id",
+            supplied_id,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_json: serde_json::Value =
+        serde_json::from_slice(&first).expect("stdout should be valid JSON");
+    assert_eq!(first_json["worker_id"], supplied_id);
+
+    // Re-register with the same id+name+role: should claim, not duplicate.
+    let second = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "test worker",
+            "--worker-id",
+            supplied_id,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second).expect("stdout should be valid JSON");
+    assert_eq!(second_json["worker_id"], supplied_id);
+
+    // Team should report exactly one worker.
+    let team = dispatch_cmd(&dir, cell_id)
+        .arg("team")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let team_json: serde_json::Value =
+        serde_json::from_slice(&team).expect("team stdout should be valid JSON");
+    let workers = team_json["workers"]
+        .as_array()
+        .expect("workers should be an array");
+    assert_eq!(
+        workers.len(),
+        1,
+        "claim must not create duplicates: {team_json}"
+    );
+    assert_eq!(workers[0]["id"], supplied_id);
+}
+
 #[test]
 fn team_lists_registered_workers() {
     let dir = TempDir::new().unwrap();

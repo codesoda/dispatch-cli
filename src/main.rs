@@ -105,6 +105,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     capabilities,
                     ttl,
                     evict,
+                    worker_id,
                 } => BrokerRequest::Register {
                     name,
                     role,
@@ -112,6 +113,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     capabilities,
                     ttl_secs: ttl,
                     evict,
+                    worker_id,
                 },
                 Commands::Team => BrokerRequest::Team {
                     from: cli.from.clone(),

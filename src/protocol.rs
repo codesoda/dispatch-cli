@@ -46,6 +46,14 @@ pub enum BrokerRequest {
         /// If true, evict any existing worker with the same name.
         #[serde(default)]
         evict: bool,
+        /// Pre-assigned worker id from the orchestrator (issue #43). When set,
+        /// the broker uses this id instead of generating a UUID. If a worker
+        /// with this id already exists and matches the supplied name+role,
+        /// the call is treated as an idempotent claim — useful when dispatch
+        /// pre-registers a worker server-side and the spawned agent then
+        /// re-issues `dispatch register` to fetch its prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_id: Option<String>,
     },
     /// List active workers.
     Team {
@@ -233,6 +241,17 @@ mod tests {
                 capabilities: vec!["rust".into()],
                 ttl_secs: None,
                 evict: false,
+                worker_id: None,
+            },
+            // Pre-assigned worker_id (issue #43) must round-trip cleanly.
+            BrokerRequest::Register {
+                name: "w1".into(),
+                role: "builder".into(),
+                description: "test".into(),
+                capabilities: vec!["rust".into()],
+                ttl_secs: None,
+                evict: false,
+                worker_id: Some("w-fixed-id".into()),
             },
             BrokerRequest::Team { from: None },
             BrokerRequest::Send {

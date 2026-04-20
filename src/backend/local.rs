@@ -197,6 +197,21 @@ impl BrokerState {
     /// If `evict` is true and a worker with the same name already exists, the
     /// old registration is removed (including its mailbox and notifier) before
     /// the new one is created.
+    ///
+    /// If `worker_id` is `Some(id)` (issue #43 pre-register flow):
+    /// - When the id already exists with the same name+role, this is treated
+    ///   as an idempotent claim — the existing id is returned and TTL is
+    ///   renewed. This lets dispatch pre-register a worker server-side and
+    ///   the spawned agent then call `dispatch register` to fetch its prompt
+    ///   without creating a duplicate worker record.
+    /// - When the id already exists with a different name or role, the call
+    ///   is rejected with an error (config drift / collision).
+    /// - Otherwise, the supplied id is used verbatim.
+    ///
+    /// If `worker_id` is `None`, a fresh UUID is generated (legacy behavior).
+    // Splitting these into a struct buys nothing — every caller passes them
+    // positionally and clippy's 7-arg threshold is an arbitrary heuristic.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_worker(
         &mut self,
         name: String,
@@ -205,7 +220,28 @@ impl BrokerState {
         capabilities: Vec<String>,
         ttl_secs: Option<u64>,
         evict: bool,
-    ) -> String {
+        worker_id: Option<String>,
+    ) -> Result<String, String> {
+        // Idempotent-claim short-circuit: if the supplied id already exists
+        // and matches name+role, return it (and renew TTL) without touching
+        // the rest of the state. This must run BEFORE the evict pass so that
+        // a pre-registered worker can be claimed by its agent without being
+        // wiped by a same-name evict.
+        if let Some(ref supplied) = worker_id {
+            if let Some(existing) = self.workers.get_mut(supplied) {
+                if existing.name == name && existing.role == role {
+                    let ttl = ttl_secs.unwrap_or(self.default_ttl);
+                    existing.ttl_secs = ttl;
+                    existing.expires_at = now_secs() + ttl;
+                    return Ok(supplied.clone());
+                }
+                return Err(format!(
+                    "worker_id {supplied} already registered as {}/{} -- supplied {name}/{role} does not match",
+                    existing.name, existing.role,
+                ));
+            }
+        }
+
         if evict {
             let old_ids: Vec<String> = self
                 .workers
@@ -220,7 +256,7 @@ impl BrokerState {
             }
         }
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = worker_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_secs();
         let ttl = ttl_secs.unwrap_or(self.default_ttl);
         let worker = Worker {
@@ -236,7 +272,7 @@ impl BrokerState {
             status_history: VecDeque::new(),
         };
         self.workers.insert(id.clone(), worker);
-        id
+        Ok(id)
     }
 
     /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
@@ -895,16 +931,24 @@ async fn handle_request(
             capabilities,
             ttl_secs,
             evict,
+            worker_id,
         } => {
             let mut state = state.lock().await;
-            let worker_id = state.register_worker(
+            let worker_id = match state.register_worker(
                 name.clone(),
                 role.clone(),
                 description,
                 capabilities,
                 ttl_secs,
                 evict,
-            );
+                worker_id,
+            ) {
+                Ok(id) => id,
+                Err(message) => {
+                    tracing::warn!(%message, "register rejected");
+                    return BrokerResponse::Error { message };
+                }
+            };
             tracing::info!(worker_id = %worker_id, "worker registered");
             state.emit_and_record(
                 event_tx,
@@ -1576,25 +1620,159 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    /// Issue #43: when an id is supplied, the broker uses it verbatim.
+    #[test]
+    fn test_register_worker_uses_supplied_id() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+            )
+            .expect("register");
+        assert_eq!(id, "w-fixed");
+        assert!(state.workers.contains_key("w-fixed"));
+    }
+
+    /// Issue #43: re-registering an existing id with the same name+role is an
+    /// idempotent claim — same id returned, no duplicate worker, TTL renewed.
+    #[test]
+    fn test_register_worker_idempotent_claim_renews_ttl() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                Some(60),
+                false,
+                Some("w-fixed".into()),
+            )
+            .expect("first register");
+        // Force the expiry into the past so we can detect the renewal.
+        state.workers.get_mut(&id).unwrap().expires_at = 0;
+
+        let id2 = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                Some(60),
+                false,
+                Some("w-fixed".into()),
+            )
+            .expect("idempotent claim");
+        assert_eq!(id, id2);
+        assert_eq!(state.workers.len(), 1, "no duplicate worker created");
+        assert!(
+            state.workers.get(&id).unwrap().expires_at > 0,
+            "claim should renew TTL",
+        );
+    }
+
+    /// Issue #43: re-registering an existing id with a *different* name or
+    /// role is rejected — silent overwriting would mask config drift.
+    #[test]
+    fn test_register_worker_collision_rejected() {
+        let mut state = BrokerState::new();
+        state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+            )
+            .expect("first register");
+        let err = state
+            .register_worker(
+                "bob".into(),
+                "reviewer".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+            )
+            .expect_err("collision must be rejected");
+        assert!(
+            err.contains("w-fixed"),
+            "error should name the colliding id: {err}"
+        );
+        assert!(
+            err.contains("alice"),
+            "error should name the existing worker: {err}"
+        );
+        // The original worker is still there, untouched.
+        assert_eq!(state.workers.len(), 1);
+        assert_eq!(state.workers.get("w-fixed").unwrap().name, "alice");
+    }
+
+    /// Idempotent claim runs BEFORE evict, so a same-name evict cannot wipe a
+    /// pre-registered worker that an agent is about to claim.
+    #[test]
+    fn test_register_worker_claim_beats_evict() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+            )
+            .expect("pre-register");
+        let claimed = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                true, // evict
+                Some("w-fixed".into()),
+            )
+            .expect("claim should win over evict");
+        assert_eq!(id, claimed);
+        assert_eq!(state.workers.len(), 1);
+    }
+
     #[test]
     fn test_register_worker_returns_unique_ids() {
         let mut state = BrokerState::new();
-        let id1 = state.register_worker(
-            "worker-a".into(),
-            "planner".into(),
-            "Plans things".into(),
-            vec!["plan:create plans".into()],
-            None,
-            false,
-        );
-        let id2 = state.register_worker(
-            "worker-b".into(),
-            "coder".into(),
-            "Writes code".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id1 = state
+            .register_worker(
+                "worker-a".into(),
+                "planner".into(),
+                "Plans things".into(),
+                vec!["plan:create plans".into()],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
+        let id2 = state
+            .register_worker(
+                "worker-b".into(),
+                "coder".into(),
+                "Writes code".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         assert_ne!(id1, id2, "each registration must produce a unique ID");
         assert_eq!(state.workers.len(), 2);
     }
@@ -1602,14 +1780,17 @@ mod tests {
     #[test]
     fn test_register_worker_stores_fields() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "my-worker".into(),
-            "reviewer".into(),
-            "Reviews pull requests".into(),
-            vec!["review:code".into(), "review:docs".into()],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "my-worker".into(),
+                "reviewer".into(),
+                "Reviews pull requests".into(),
+                vec!["review:code".into(), "review:docs".into()],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let worker = state.workers.get(&id).unwrap();
         assert_eq!(worker.name, "my-worker");
         assert_eq!(worker.role, "reviewer");
@@ -1625,14 +1806,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let id = state.register_worker(
-            "ttl-worker".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "ttl-worker".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let worker = state.workers.get(&id).unwrap();
         // Should expire roughly DEFAULT_WORKER_TTL_SECS from now.
         assert!(worker.expires_at >= now + DEFAULT_WORKER_TTL_SECS - 1);
@@ -1642,14 +1826,17 @@ mod tests {
     #[test]
     fn test_evict_expired_workers() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "soon-expired".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "soon-expired".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         // Manually set expiry to the past.
         state.workers.get_mut(&id).unwrap().expires_at = 0;
         state.evict_expired();
@@ -1774,22 +1961,28 @@ mod tests {
     #[test]
     fn test_list_workers_excludes_expired() {
         let mut state = BrokerState::new();
-        let active_id = state.register_worker(
-            "active".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
-        let expired_id = state.register_worker(
-            "expired".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let active_id = state
+            .register_worker(
+                "active".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
+        let expired_id = state
+            .register_worker(
+                "expired".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         // Expire one worker.
         state.workers.get_mut(&expired_id).unwrap().expires_at = 0;
 
@@ -1801,14 +1994,17 @@ mod tests {
     #[test]
     fn test_heartbeat_worker_renews_ttl() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "hb-worker".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "hb-worker".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let original_expiry = state.workers.get(&id).unwrap().expires_at;
 
         // Manually lower the expiry to simulate time passing.
@@ -1830,14 +2026,17 @@ mod tests {
     #[test]
     fn test_heartbeat_worker_expired() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "exp-worker".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "exp-worker".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         state.workers.get_mut(&id).unwrap().expires_at = 0;
 
         assert!(
@@ -1852,14 +2051,17 @@ mod tests {
     #[test]
     fn test_status_history_caps_at_max() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "hist".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "hist".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         for s in ["A", "B", "C", "D", "E"] {
             state.heartbeat_worker(&id, Some(s.into())).unwrap();
         }
@@ -1876,14 +2078,17 @@ mod tests {
     #[test]
     fn test_status_history_dedupes_consecutive_repeats() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "dedup".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "dedup".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         state.heartbeat_worker(&id, Some("running".into())).unwrap();
         let first_at = state.workers.get(&id).unwrap().last_status_at;
         // Same status again — should not push, should not bump last_status_at.
@@ -1905,14 +2110,17 @@ mod tests {
     #[test]
     fn test_clear_status_preserves_history() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "clr".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "clr".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         state.heartbeat_worker(&id, Some("phase 1".into())).unwrap();
         state.heartbeat_worker(&id, Some("phase 2".into())).unwrap();
         state.clear_status(&id).unwrap();
@@ -2028,14 +2236,17 @@ mod tests {
     #[test]
     fn test_send_message_queues_in_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
 
         let msg_id = state.send_message(worker_id.clone(), "hello".into(), Some("sender-1".into()));
         assert!(msg_id.is_some(), "send_message should return a message ID");
@@ -2059,14 +2270,17 @@ mod tests {
     #[test]
     fn test_send_message_expired_recipient() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "expiring".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "expiring".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         state.workers.get_mut(&worker_id).unwrap().expires_at = 0;
 
         let result = state.send_message(worker_id, "hello".into(), None);
@@ -2076,14 +2290,17 @@ mod tests {
     #[test]
     fn test_send_message_unique_ids() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
 
         let id1 = state
             .send_message(worker_id.clone(), "msg1".into(), None)
@@ -2098,14 +2315,17 @@ mod tests {
     #[test]
     fn test_send_message_without_from() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
 
         let msg_id = state
             .send_message(worker_id.clone(), "anon msg".into(), None)
@@ -2195,14 +2415,17 @@ mod tests {
     #[test]
     fn test_pop_message_returns_fifo_order() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         state.send_message(worker_id.clone(), "first".into(), None);
         state.send_message(worker_id.clone(), "second".into(), None);
 
@@ -2216,14 +2439,17 @@ mod tests {
     #[test]
     fn test_pop_message_empty_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         assert!(state.pop_message(&worker_id).is_none());
     }
 
@@ -2236,14 +2462,17 @@ mod tests {
     #[test]
     fn test_get_notifier_returns_same_instance() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let n1 = state.get_notifier(&worker_id);
         let n2 = state.get_notifier(&worker_id);
         assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");
@@ -2261,14 +2490,17 @@ mod tests {
     #[test]
     fn test_ack_message_rejects_unknown_message() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let err = state
             .ack_message(&worker_id, "nonexistent-message", None)
             .unwrap_err();
@@ -2278,9 +2510,28 @@ mod tests {
     #[test]
     fn test_ack_message_rejects_wrong_recipient() {
         let mut state = BrokerState::new();
-        let alice =
-            state.register_worker("alice".into(), "r".into(), "d".into(), vec![], None, false);
-        let bob = state.register_worker("bob".into(), "r".into(), "d".into(), vec![], None, false);
+        let alice = state
+            .register_worker(
+                "alice".into(),
+                "r".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
+        let bob = state
+            .register_worker(
+                "bob".into(),
+                "r".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let message_id = state
             .send_message(alice.clone(), "for alice".into(), None)
             .expect("send");
@@ -2294,8 +2545,17 @@ mod tests {
     #[test]
     fn test_ack_message_success_updates_history() {
         let mut state = BrokerState::new();
-        let alice =
-            state.register_worker("alice".into(), "r".into(), "d".into(), vec![], None, false);
+        let alice = state
+            .register_worker(
+                "alice".into(),
+                "r".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+            )
+            .expect("register");
         let message_id = state
             .send_message(alice.clone(), "hello".into(), None)
             .expect("send");

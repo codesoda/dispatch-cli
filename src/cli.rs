@@ -72,6 +72,14 @@ pub enum Commands {
         /// Evict any existing worker with the same name before registering
         #[arg(long)]
         evict: bool,
+
+        /// Pre-assigned worker id (issue #43). When set, the broker uses
+        /// this id rather than generating one. If a worker with this id
+        /// already exists with the same name+role, the call is treated as
+        /// an idempotent claim — used by spawned agents to attach to a
+        /// worker that dispatch pre-registered for them at spawn time.
+        #[arg(long = "worker-id")]
+        worker_id: Option<String>,
     },
 
     /// List active workers in the current cell
