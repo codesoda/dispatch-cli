@@ -59,6 +59,7 @@ mod tests {
             prompt_file: None,
             prompt_inline: None,
             command_string: command,
+            stream_json: false,
         }
     }
 

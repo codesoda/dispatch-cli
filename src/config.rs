@@ -51,6 +51,10 @@ pub struct ResolvedAgentConfig {
     /// substitution in command-adapter shell strings.
     pub prompt_file_path: Option<PathBuf>,
     pub ttl: Option<u64>,
+    /// Issue #43: when true, the claude adapter is launched with
+    /// `--output-format stream-json --verbose` so per-tool-use entries
+    /// appear in the agent log.
+    pub stream_json: bool,
     /// Whether `dispatch serve` should auto-launch and supervise this agent.
     pub launch: bool,
 }
@@ -128,6 +132,13 @@ pub struct AgentConfig {
     /// Whether `dispatch serve --launch` should auto-start this agent.
     #[serde(default)]
     pub launch: bool,
+    /// Issue #43: when true, the claude adapter is launched with
+    /// `--output-format stream-json --verbose` so per-tool-use entries
+    /// appear in the agent log. Verification mechanism — without it, a
+    /// hallucinated register call and a real one are visually identical
+    /// in the log. Default off so logs stay quiet for normal use.
+    #[serde(default)]
+    pub stream_json: bool,
 }
 
 /// On-disk main agent definition.
@@ -203,6 +214,7 @@ fn resolve_agent_config(
         prompt,
         prompt_file_path,
         ttl: agent.ttl,
+        stream_json: agent.stream_json,
         launch: agent.launch,
     })
 }
@@ -284,6 +296,10 @@ const CONFIG_TEMPLATE: &str = "\
 # prompt_file = \"prompts/reviewer.md\"            # role prompt body (see above)
 # launch = true
 # ttl = 3600
+# stream_json = false                            # when true, claude is launched with
+#                                                # `--output-format stream-json --verbose`
+#                                                # so per-tool-use entries appear in the
+#                                                # agent log (issue #43 verification).
 #
 # # `command` adapter — for bash-script / non-LLM workers:
 # [[agents]]
@@ -657,6 +673,39 @@ launch = true
         assert!(a.launch);
         assert!(a.command.is_none());
         assert!(a.prompt_file_path.is_some());
+        // Issue #43: stream_json defaults to false so existing configs see
+        // no behavior change.
+        assert!(!a.stream_json, "stream_json must default to false");
+    }
+
+    /// Issue #43: `stream_json = true` round-trips through TOML and lands
+    /// on the resolved config. Verified separately by the claude adapter
+    /// test that translates this flag into argv.
+    #[test]
+    fn agent_config_parses_stream_json_flag() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("reviewer.md");
+        fs::write(&prompt_path, "you are a reviewer").unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "reviewer"
+role = "reviewer"
+description = "reviews"
+adapter = "claude"
+prompt_file = "reviewer.md"
+stream_json = true
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert!(
+            resolved.agents[0].stream_json,
+            "stream_json = true in TOML must land on the resolved config",
+        );
     }
 
     #[test]

@@ -171,6 +171,7 @@ impl AgentOrchestrator {
             prompt_file: config.prompt_file_path.as_deref(),
             prompt_inline: config.prompt.as_deref(),
             command_string: config.command.as_deref(),
+            stream_json: config.stream_json,
         };
         config
             .adapter
@@ -973,6 +974,7 @@ mod tests {
             prompt: None,
             prompt_file_path: None,
             ttl: None,
+            stream_json: false,
             launch: true,
         }
     }
@@ -993,6 +995,7 @@ mod tests {
             prompt: None,
             prompt_file_path: Some(prompt_path),
             ttl: None,
+            stream_json: false,
             launch: true,
         }
     }

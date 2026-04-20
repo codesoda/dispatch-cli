@@ -467,6 +467,7 @@ mod tests {
             prompt: None,
             prompt_file_path: None,
             ttl: None,
+            stream_json: false,
             launch: false,
         }
     }
