@@ -261,14 +261,27 @@ const CONFIG_TEMPLATE: &str = "\
 # port = 8384
 # open = true  # open the dashboard in your default browser
 
-# Agent definitions — auto-started by `dispatch serve --launch` when launch = true
+# Agent definitions — auto-started by `dispatch serve --launch` when launch = true.
+#
+# When `launch = true` AND `prompt_file` is set (the managed-agent flow),
+# dispatch pre-registers the worker server-side at spawn time, injects
+# DISPATCH_WORKER_ID into the agent's environment, and feeds the agent a
+# one-line boot prompt. The first thing the model does is run
+# `dispatch register --worker-id \"$DISPATCH_WORKER_ID\" ... --for-agent`,
+# whose response body is the contents of `prompt_file` — so the role prompt
+# lands in the model's tool result instead of being narrated up front (this
+# kills a class of hallucination where the model fakes the register step).
+#
+# When `launch = false`, dispatch prints the command for you to copy into a
+# separate terminal and the agent registers itself the legacy way.
+#
 # [[agents]]
 # name = \"reviewer\"
 # role = \"code-reviewer\"
 # description = \"Reviews code changes\"
 # adapter = \"claude\"                            # one of: command | claude | codex
 # extra_args = [\"--model\", \"sonnet\"]          # appended to the adapter's argv
-# prompt_file = \"prompts/reviewer.md\"
+# prompt_file = \"prompts/reviewer.md\"            # role prompt body (see above)
 # launch = true
 # ttl = 3600
 #
