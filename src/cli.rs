@@ -99,10 +99,138 @@ pub enum Commands {
         timeout: u64,
     },
 
+    /// Query event history
+    Events {
+        /// Filter by event type (register, send, deliver, ack, heartbeat, expire)
+        #[arg(long = "type", value_name = "type")]
+        event_type: Option<String>,
+
+        /// Filter by worker ID
+        #[arg(long)]
+        worker: Option<String>,
+
+        /// Show events since timestamp (Unix seconds, or relative: 30s, 5m, 1h, 2d)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Show events until timestamp (Unix seconds, or relative: 30s, 5m, 1h, 2d)
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Maximum number of events to return (default: 100)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// Query message history (non-destructive)
+    Messages {
+        /// Worker ID to inspect messages for
+        #[arg(long)]
+        worker_id: String,
+
+        /// Show only delivered but unacked messages
+        #[arg(long)]
+        unacked: bool,
+
+        /// Show messages sent by this worker (instead of received)
+        #[arg(long)]
+        sent: bool,
+
+        /// Show messages since timestamp (Unix seconds, or relative: 30s, 5m, 1h, 2d)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Maximum number of messages to return
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Look up a single message by ID
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Query worker status
+    Status {
+        /// Show status for a specific worker
+        #[arg(long)]
+        worker_id: Option<String>,
+
+        /// Clear the worker's status (requires --worker-id)
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Acknowledge receipt of a message
+    Ack {
+        /// Worker ID that received the message
+        #[arg(long)]
+        worker_id: String,
+
+        /// Message ID to acknowledge
+        #[arg(long)]
+        message_id: String,
+
+        /// Optional note (e.g. "starting implementation")
+        #[arg(long)]
+        note: Option<String>,
+    },
+
     /// Renew worker liveness TTL
     Heartbeat {
         /// Worker ID to heartbeat
         #[arg(long)]
         worker_id: String,
+
+        /// Set a status tagline (e.g. "Running e2e tests 3/10")
+        #[arg(long)]
+        status: Option<String>,
     },
+
+    /// Manage the lifecycle of configured agents (start, stop, restart)
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
+    /// Codex CLI hook integration (stop handler, install, uninstall)
+    CodexHook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+
+    /// Claude Code CLI hook integration (stop handler, install, uninstall)
+    ClaudeHook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// Start a configured agent by name or worker ID
+    Start {
+        /// Agent name from config, or worker ID of a registered agent
+        name: String,
+    },
+    /// Stop a running agent by name or worker ID
+    Stop {
+        /// Agent name from config, or worker ID of a registered agent
+        name: String,
+    },
+    /// Restart a running agent by name or worker ID
+    Restart {
+        /// Agent name from config, or worker ID of a registered agent
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HookAction {
+    /// Handler invoked by the vendor CLI's Stop hook. Prints a JSON block
+    /// decision on stdout so the agent stays alive to wait for more messages.
+    Stop,
+    /// Register the dispatch stop hook in this project's vendor config files
+    Install,
+    /// Remove the dispatch stop hook from this project's vendor config files
+    Uninstall,
 }

@@ -370,6 +370,344 @@ fn listen_times_out_with_no_messages() {
     );
 }
 
+// ── Stop-hook broker-liveness probe ───────────────────────────────────
+
+/// With the broker unreachable (env points at a nonexistent socket, no
+/// config in cwd), the stop hook must emit nothing and exit 0 — the
+/// vendor CLI treats empty stdout as "allow stop" so a shutting-down
+/// dispatch doesn't strand the agent in a listen loop.
+#[test]
+fn codex_hook_stop_is_silent_when_broker_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let fake_socket = dir.path().join("does-not-exist.sock");
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &fake_socket)
+        .env_remove("DISPATCH_CELL_ID")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "expected empty stdout when broker unreachable, got: {stdout:?}",
+    );
+}
+
+#[test]
+fn claude_hook_stop_is_silent_when_broker_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let fake_socket = dir.path().join("does-not-exist.sock");
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("claude-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &fake_socket)
+        .env_remove("DISPATCH_CELL_ID")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "expected empty stdout when broker unreachable, got: {stdout:?}",
+    );
+}
+
+/// With a live broker, the stop hook prints the block-decision JSON so
+/// the agent keeps listening for the next dispatch message.
+#[test]
+fn codex_hook_stop_blocks_when_broker_alive() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-codex-hook-alive";
+    let _broker = start_broker(&dir, cell_id);
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &socket)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("stop hook stdout should be JSON: {stdout:?}"));
+    assert_eq!(json["decision"], "block");
+    assert!(
+        json["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "block decision must carry a non-empty reason",
+    );
+}
+
+// ── Introspection commands (events / messages / status / ack) ────────
+
+/// Helper: register a worker and return its ID.
+fn register_worker(dir: &TempDir, cell_id: &str, name: &str, role: &str) -> String {
+    let out = dispatch_cmd(dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            name,
+            "--role",
+            role,
+            "--description",
+            "integration test worker",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    json["worker_id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn events_command_returns_event_history() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-events-history";
+    let _broker = start_broker(&dir, cell_id);
+    let _worker = register_worker(&dir, cell_id, "ev-worker", "tester");
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--limit", "10"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["status"], "ok");
+    let events = json["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["kind"] == "register"),
+        "expected at least one register event, got: {json}"
+    );
+}
+
+#[test]
+fn events_command_filters_by_type() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-events-filter";
+    let _broker = start_broker(&dir, cell_id);
+    let worker_id = register_worker(&dir, cell_id, "ev-filter", "tester");
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "send", "--to", &worker_id, "--body", "ping", "--from", "harness",
+        ])
+        .assert()
+        .success();
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--type", "send"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let events = json["events"].as_array().unwrap();
+    assert!(!events.is_empty(), "expected at least one send event");
+    assert!(events.iter().all(|e| e["kind"] == "send"));
+}
+
+/// Default `dispatch messages --worker-id <id>` (no `--sent` flag) queries
+/// the worker's *inbox* — messages delivered **to** that worker. Named
+/// accordingly so the assertion (`to == worker_id`) and the test intent
+/// line up.
+#[test]
+fn messages_command_returns_worker_inbox() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-messages-inbox";
+    let _broker = start_broker(&dir, cell_id);
+    let worker_id = register_worker(&dir, cell_id, "msg-worker", "tester");
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "send",
+            "--to",
+            &worker_id,
+            "--body",
+            "payload-body",
+            "--from",
+            "harness",
+        ])
+        .assert()
+        .success();
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args(["messages", "--worker-id", &worker_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["status"], "ok");
+    let messages = json["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["body"], "payload-body");
+    assert_eq!(messages[0]["to"], worker_id);
+}
+
+/// `--sent` flips the query to the worker's *outbox* — messages the worker
+/// sent to others. Covers the flag branch the inbox test above does not.
+#[test]
+fn messages_command_with_sent_flag_returns_outbox() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-messages-sent";
+    let _broker = start_broker(&dir, cell_id);
+    let sender_id = register_worker(&dir, cell_id, "sender-worker", "sender");
+    let recipient_id = register_worker(&dir, cell_id, "recipient-worker", "recipient");
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "send",
+            "--to",
+            &recipient_id,
+            "--body",
+            "outbound-payload",
+            "--from",
+            &sender_id,
+        ])
+        .assert()
+        .success();
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args(["messages", "--worker-id", &sender_id, "--sent"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["status"], "ok");
+    let messages = json["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["body"], "outbound-payload");
+    assert_eq!(messages[0]["from"], sender_id);
+    assert_eq!(messages[0]["to"], recipient_id);
+}
+
+#[test]
+fn status_command_returns_worker_status() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-status";
+    let _broker = start_broker(&dir, cell_id);
+    let worker_id = register_worker(&dir, cell_id, "status-worker", "tester");
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "heartbeat",
+            "--worker-id",
+            &worker_id,
+            "--status",
+            "running e2e tests 3/10",
+        ])
+        .assert()
+        .success();
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args(["status", "--worker-id", &worker_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["status"], "ok");
+    let workers = json["workers"].as_array().expect("workers array");
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0]["last_status"], "running e2e tests 3/10");
+}
+
+#[test]
+fn ack_command_records_acknowledgement() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-ack";
+    let _broker = start_broker(&dir, cell_id);
+    let worker_id = register_worker(&dir, cell_id, "ack-worker", "tester");
+
+    // Send a message so there's a real message_id in history.
+    let send_out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "send", "--to", &worker_id, "--body", "ack me", "--from", "harness",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let send_json: serde_json::Value = serde_json::from_slice(&send_out).unwrap();
+    let message_id = send_json["message_id"].as_str().unwrap().to_string();
+
+    let ack_out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "ack",
+            "--worker-id",
+            &worker_id,
+            "--message-id",
+            &message_id,
+            "--note",
+            "starting impl",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&ack_out).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["message_id"], message_id);
+    assert_eq!(json["ack_confirmed"], true);
+}
+
+#[test]
+fn ack_command_rejects_unknown_message() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-ack-unknown";
+    let _broker = start_broker(&dir, cell_id);
+    let worker_id = register_worker(&dir, cell_id, "ack-unknown", "tester");
+
+    let output = dispatch_cmd(&dir, cell_id)
+        .args([
+            "ack",
+            "--worker-id",
+            &worker_id,
+            "--message-id",
+            "fabricated-message-id",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["status"], "error");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("message not found"),
+        "expected message-not-found error, got: {json}"
+    );
+}
+
 // ── stdout/stderr separation ──────────────────────────────────────────
 
 #[test]

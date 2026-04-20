@@ -1,6 +1,8 @@
+pub mod adapter;
 pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod errors;
+pub mod hooks;
 pub mod logging;
 pub mod protocol;

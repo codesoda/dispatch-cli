@@ -1,41 +1,88 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
+use crate::adapter::{shell_arg_quote, shell_escape, BuildContext, Launch};
 use crate::config::ResolvedAgentConfig;
 use crate::errors::DispatchError;
 
+/// Maximum consecutive restart attempts before marking an agent as crashed.
+/// Counter resets when the agent runs for at least `STABLE_AFTER` seconds.
+const MAX_RESTART_ATTEMPTS: u32 = 5;
+
+/// Duration an agent must stay running before its restart attempt counter
+/// resets. A process that stayed up at least this long is treated as a
+/// fresh first-attempt restart when it next exits — the counter is set
+/// back to `1` (not `0`), so the agent gets the full `MAX_RESTART_ATTEMPTS`
+/// budget from that point forward.
+const STABLE_AFTER: Duration = Duration::from_secs(30);
+
 /// Kill an entire process group. Sends SIGTERM first, then SIGKILL after a timeout.
+///
+/// Refuses to signal `pid == 0`: `libc::kill(-0, …)` signals the *caller's*
+/// process group, which would tear down `dispatch serve` itself along with
+/// every sibling supervisor. A missing/zero PID means the child already
+/// exited or was never spawned, so there is nothing to kill.
 async fn kill_process_group(pid: u32) {
+    if pid == 0 {
+        tracing::warn!("kill_process_group called with pid=0; refusing to signal caller's pgid");
+        return;
+    }
     let pgid = pid as i32;
     // Send SIGTERM to the process group.
     unsafe {
         libc::kill(-pgid, libc::SIGTERM);
     }
     // Give processes a moment to exit gracefully.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     // Force kill any remaining processes.
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
 }
 
-/// Info about a running agent for external queries.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AgentInfo {
-    pub name: String,
-    pub role: String,
-    pub pid: u32,
-    pub running: bool,
+/// Exponential backoff (capped at 30s) for consecutive restart attempts.
+/// attempt=1 → 1s, 2 → 2s, 3 → 4s, 4 → 8s, 5 → 16s, 6+ → 30s.
+fn restart_backoff(attempt: u32) -> Duration {
+    let secs = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    Duration::from_secs(secs.min(30))
 }
 
-/// A running agent subprocess.
-struct RunningAgent {
+/// Runtime state of a supervised agent. Consumed by the monitor UI and tests.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentState {
+    /// Supervisor has been created but the first spawn hasn't landed yet.
+    Starting,
+    /// A child process is alive. `started_at` is a Unix-seconds timestamp of
+    /// the most recent spawn — the UI renders uptime as `now - started_at`.
+    Running { pid: u32, started_at: u64 },
+    /// Process exited; supervisor is waiting before respawning.
+    Restarting { attempt: u32, backoff_secs: u64 },
+    /// Restart budget exhausted — supervisor has given up.
+    Crashed { reason: String, attempts: u32 },
+    /// Supervisor was asked to stop (either by the user or on shutdown).
+    Stopped,
+}
+
+/// An agent under supervisor control. The supervisor owns the `Child` handle
+/// and respawns on exit; the orchestrator only holds signaling primitives and
+/// observable state.
+struct ManagedAgent {
     name: String,
     role: String,
-    child: Child,
-    pid: u32,
+    state: Arc<Mutex<AgentState>>,
+    /// Notified when the supervisor should stop restarting. Using `notify_one`
+    /// is sufficient because each supervisor has at most one pending wait.
+    shutdown: Arc<Notify>,
+    supervisor: JoinHandle<()>,
 }
 
 /// A running heartbeat timer task.
@@ -46,7 +93,7 @@ struct RunningHeartbeat {
 
 /// Manages the lifecycle of agent subprocesses and heartbeat timers.
 pub struct AgentOrchestrator {
-    agents: Vec<RunningAgent>,
+    agents: Vec<ManagedAgent>,
     heartbeats: Vec<RunningHeartbeat>,
     cell_id: String,
     socket_path: PathBuf,
@@ -56,6 +103,9 @@ pub struct AgentOrchestrator {
     /// Where per-agent log files are written. Must match the directory the
     /// monitor's `/api/logs/{agent}` endpoint reads from.
     log_dir: PathBuf,
+    /// All configured agents, used to look up an agent's config by name
+    /// when responding to `dispatch agent start/restart <name>` requests.
+    configs: Vec<ResolvedAgentConfig>,
 }
 
 impl AgentOrchestrator {
@@ -65,6 +115,7 @@ impl AgentOrchestrator {
         monitor_url: Option<String>,
         agent_cwd: &Path,
         log_dir: PathBuf,
+        configs: Vec<ResolvedAgentConfig>,
     ) -> Self {
         Self {
             agents: Vec::new(),
@@ -74,6 +125,7 @@ impl AgentOrchestrator {
             monitor_url,
             agent_cwd: agent_cwd.to_path_buf(),
             log_dir,
+            configs,
         }
     }
 
@@ -93,174 +145,140 @@ impl AgentOrchestrator {
         vars
     }
 
-    /// Build the full shell command for an agent.
+    /// Build the adapter's Launch spec for this agent.
     ///
-    /// Pure function with no side effects. If `tempfile_override` is given,
-    /// it is used for `{prompt_file}` substitution (for spawn-time use); when
-    /// `None`, the substitution falls back to `config.prompt_file_path` and
-    /// finally leaves the literal `{prompt_file}` placeholder in the rendered
-    /// string (so display callers like the monitor don't trigger filesystem
-    /// writes).
-    pub(super) fn build_command(
-        config: &ResolvedAgentConfig,
-        tempfile_override: Option<&Path>,
-    ) -> String {
-        let base = &config.command;
-
-        if let Some(ref prompt) = config.prompt {
-            if base.contains("{prompt}") {
-                return base.replace("{prompt}", &shell_escape(prompt));
-            }
-            if base.contains("{prompt_file}") {
-                let resolved_path: Option<String> = tempfile_override
-                    .map(|p| p.display().to_string())
-                    .or_else(|| {
-                        config
-                            .prompt_file_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                    });
-                if let Some(path) = resolved_path {
-                    return base.replace("{prompt_file}", &shell_escape(&path));
-                }
-                // No file available — leave the placeholder so display callers
-                // can show users where the prompt file would be substituted.
-                return base.clone();
-            }
-            // Fallback: append prompt as a positional argument for LLM commands
-            let is_llm = base.starts_with("claude") || base.starts_with("codex");
-            if is_llm {
-                format!("{base} {}", shell_escape(prompt))
-            } else {
-                base.clone()
-            }
-        } else {
-            base.clone()
-        }
-    }
-
-    /// Spawn a single agent as a subprocess.
-    ///
-    /// Stdout and stderr are redirected to `<log_dir>/<sanitized-agent-name>.log`
-    /// so that agent output can be inspected after the fact.
-    pub async fn spawn_agent(&mut self, config: &ResolvedAgentConfig) -> Result<(), DispatchError> {
-        let env_vars = self.env_vars(&config.name, &config.role);
-
-        // If the command uses `{prompt_file}` and the prompt is inline
-        // (no prompt_file_path resolved at config time), write the prompt
-        // to a tempfile here so build_command stays side-effect free.
-        let tempfile_path: Option<PathBuf> =
-            if config.command.contains("{prompt_file}") && config.prompt_file_path.is_none() {
-                if let Some(ref prompt) = config.prompt {
-                    Some(write_prompt_tempfile(prompt, &config.name).map_err(|e| {
-                        DispatchError::AgentLaunchFailed {
-                            name: config.name.clone(),
-                            reason: format!("failed to write prompt tempfile: {e}"),
-                        }
-                    })?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        let full_command = Self::build_command(config, tempfile_path.as_deref());
-
-        tracing::info!(
-            agent = %config.name,
-            role = %config.role,
-            command = %full_command,
-            "launching agent"
-        );
-
-        // Ensure log directory exists and open a per-agent log file.
-        tokio::fs::create_dir_all(&self.log_dir)
-            .await
-            .map_err(|e| DispatchError::AgentLaunchFailed {
-                name: config.name.clone(),
-                reason: format!("failed to create log dir {}: {e}", self.log_dir.display()),
-            })?;
-        let safe_name = sanitize_name(&config.name);
-        let log_path = self.log_dir.join(format!("{safe_name}.log"));
-        let log_file = tokio::fs::File::create(&log_path).await.map_err(|e| {
-            DispatchError::AgentLaunchFailed {
-                name: config.name.clone(),
-                reason: format!("failed to create log file {}: {e}", log_path.display()),
-            }
-        })?;
-        // Clone the file handle so stdout and stderr write to the same file.
-        let log_file_err =
-            log_file
-                .try_clone()
-                .await
-                .map_err(|e| DispatchError::AgentLaunchFailed {
-                    name: config.name.clone(),
-                    reason: format!("failed to clone log file handle: {e}"),
-                })?;
-        // Convert to std::fs::File for use as Stdio.
-        let log_file_std = log_file.into_std().await;
-        let log_file_err_std = log_file_err.into_std().await;
-
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(&full_command)
-            .envs(&env_vars)
-            .current_dir(&self.agent_cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(log_file_std))
-            .stderr(std::process::Stdio::from(log_file_err_std))
-            .process_group(0) // Own process group so we can kill the whole tree.
-            .spawn()
+    /// The Launch describes the program, argv, shell-wrap hint, and optional
+    /// stdin source. Callers translate it into a concrete `Command` (for
+    /// spawning) or a shell-pasteable string (for display).
+    pub(super) fn build_launch(config: &ResolvedAgentConfig) -> Result<Launch, DispatchError> {
+        let ctx = BuildContext {
+            extra_args: &config.extra_args,
+            prompt_file: config.prompt_file_path.as_deref(),
+            prompt_inline: config.prompt.as_deref(),
+            command_string: config.command.as_deref(),
+        };
+        config
+            .adapter
+            .build(&ctx)
             .map_err(|e| DispatchError::AgentLaunchFailed {
                 name: config.name.clone(),
                 reason: e.to_string(),
-            })?;
+            })
+    }
 
+    /// Spawn an agent and attach a supervisor task that restarts it on exit
+    /// (with exponential backoff) until the restart budget is exhausted.
+    ///
+    /// Stdout/stderr go to `<log_dir>/<sanitized-agent-name>.log`. Stdin
+    /// comes from the adapter's `stdin_file` (typically the prompt file) or
+    /// is `/dev/null` if the adapter doesn't need one.
+    pub async fn spawn_agent(&mut self, config: &ResolvedAgentConfig) -> Result<(), DispatchError> {
+        let env_vars = self.env_vars(&config.name, &config.role);
+
+        // Initial spawn is synchronous so the caller sees config errors
+        // (bad prompt file, missing binary) as a proper Err instead of
+        // discovering them later via AgentState::Crashed.
+        let child = spawn_child_process(config, &env_vars, &self.agent_cwd, &self.log_dir).await?;
         let pid = child.id().unwrap_or(0);
         eprintln!(
-            "dispatch serve: launched agent '{}' (role={}, pid={}, log={})",
-            config.name,
-            config.role,
-            pid,
-            log_path.display()
+            "dispatch serve: launched agent '{}' (role={}, pid={})",
+            config.name, config.role, pid
         );
 
-        self.agents.push(RunningAgent {
+        let state = Arc::new(Mutex::new(AgentState::Running {
+            pid,
+            started_at: super::local::now_secs(),
+        }));
+        let shutdown = Arc::new(Notify::new());
+
+        let supervisor = tokio::spawn(supervise_agent(
+            config.clone(),
+            env_vars,
+            self.agent_cwd.clone(),
+            self.log_dir.clone(),
+            child,
+            Arc::clone(&state),
+            Arc::clone(&shutdown),
+        ));
+
+        self.agents.push(ManagedAgent {
             name: config.name.clone(),
             role: config.role.clone(),
-            child,
-            pid,
+            state,
+            shutdown,
+            supervisor,
         });
 
         Ok(())
     }
 
-    /// Launch all configured agents sequentially with a brief pause between.
-    pub async fn launch_all(
-        &mut self,
-        configs: &[ResolvedAgentConfig],
-    ) -> Result<(), DispatchError> {
-        for config in configs {
+    /// Snapshot of all managed agents' current runtime state.
+    pub async fn list_state(&self) -> Vec<(String, String, AgentState)> {
+        let mut out = Vec::with_capacity(self.agents.len());
+        for a in &self.agents {
+            out.push((a.name.clone(), a.role.clone(), a.state.lock().await.clone()));
+        }
+        out
+    }
+
+    /// Launch every agent marked `launch = true` in the stored configs,
+    /// sequentially with a brief pause between.
+    pub async fn launch_all(&mut self) -> Result<(), DispatchError> {
+        let launchable: Vec<ResolvedAgentConfig> =
+            self.configs.iter().filter(|a| a.launch).cloned().collect();
+        for config in &launchable {
             self.spawn_agent(config).await?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         Ok(())
     }
 
-    /// Return info about all agents.
-    pub fn list(&mut self) -> Vec<AgentInfo> {
-        self.agents
-            .iter_mut()
-            .map(|a| {
-                let running = a.child.try_wait().ok().flatten().is_none();
-                AgentInfo {
-                    name: a.name.clone(),
-                    role: a.role.clone(),
-                    pid: a.pid,
-                    running,
-                }
-            })
-            .collect()
+    /// Start a configured agent by name. Errors if the name is unknown or
+    /// an instance is already running.
+    ///
+    /// Before rejecting on `already running`, this reaps any ManagedAgent
+    /// whose supervisor task has already finished (Crashed or Stopped), so a
+    /// previously-failed agent can be started again without needing `restart`.
+    pub async fn start_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
+        self.agents.retain(|a| !a.supervisor.is_finished());
+
+        if self.agents.iter().any(|a| a.name == name) {
+            return Err(DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "already running".into(),
+            });
+        }
+        let config = self
+            .configs
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "no such agent in config".into(),
+            })?;
+        self.spawn_agent(&config).await
+    }
+
+    /// Restart a running agent: stop it (if running) then spawn it again.
+    /// Errors if the agent name isn't in config.
+    pub async fn restart_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
+        let config = self
+            .configs
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "no such agent in config".into(),
+            })?;
+        let _ = self.stop_by_name(name).await;
+        self.spawn_agent(&config).await
+    }
+
+    /// Whether an agent with this name exists in the config (running or not).
+    pub fn has_config(&self, name: &str) -> bool {
+        self.configs.iter().any(|a| a.name == name)
     }
 
     /// Start all configured heartbeat timers.
@@ -345,7 +363,8 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Kill all running agent processes, cancel heartbeats, and wait for cleanup.
+    /// Signal every supervisor to stop, cancel heartbeats, and wait for
+    /// supervisors to finish reaping their children.
     pub async fn shutdown_all(&mut self) {
         // Cancel heartbeat timers.
         for hb in &self.heartbeats {
@@ -354,40 +373,245 @@ impl AgentOrchestrator {
         }
         self.heartbeats.clear();
 
-        // Kill agent processes.
-        for agent in &mut self.agents {
-            if agent.child.try_wait().ok().flatten().is_none() {
-                tracing::info!(agent = %agent.name, pid = agent.pid, "stopping agent");
-                kill_process_group(agent.pid).await;
-                // Reap the child to avoid zombies.
-                let _ = agent.child.wait().await;
-            }
+        // Signal every supervisor to stop (no respawn), then await them.
+        for agent in &self.agents {
+            tracing::info!(agent = %agent.name, "stopping agent");
+            agent.shutdown.notify_one();
         }
-        self.agents.clear();
+        for agent in self.agents.drain(..) {
+            let _ = agent.supervisor.await;
+        }
     }
 
-    /// Stop a specific agent by name.
-    pub async fn stop_agent(&mut self, name: &str) -> bool {
-        if let Some(idx) = self.agents.iter().position(|a| a.name == name) {
-            let agent = &mut self.agents[idx];
-            if agent.child.try_wait().ok().flatten().is_none() {
-                kill_process_group(agent.pid).await;
-                let _ = agent.child.wait().await;
+    /// Signal a running agent to shut down and return its supervisor's
+    /// `JoinHandle`. Does **not** await the handle — the caller is expected
+    /// to `.await` it after releasing the orchestrator mutex. This avoids
+    /// holding `Arc<Mutex<AgentOrchestrator>>` across the 500ms
+    /// SIGTERM→SIGKILL window inside `kill_process_group`, which would
+    /// otherwise block every concurrent read of `list_state` (e.g. the
+    /// dashboard's 2s `/api/agents/state` poll).
+    ///
+    /// Returns `None` if no agent by that name is currently supervised.
+    pub fn signal_stop_by_name(&mut self, name: &str) -> Option<JoinHandle<()>> {
+        let idx = self.agents.iter().position(|a| a.name == name)?;
+        let agent = self.agents.remove(idx);
+        agent.shutdown.notify_one();
+        Some(agent.supervisor)
+    }
+
+    /// Stop a running agent by name. Convenience wrapper around
+    /// `signal_stop_by_name` for test / non-HTTP callers that are fine
+    /// awaiting inside the critical section (e.g. the full `shutdown_all`
+    /// path). Returns `true` if an agent was found and stopped.
+    pub async fn stop_by_name(&mut self, name: &str) -> bool {
+        match self.signal_stop_by_name(name) {
+            Some(handle) => {
+                let _ = handle.await;
+                true
             }
-            self.agents.remove(idx);
-            true
-        } else {
-            false
+            None => false,
+        }
+    }
+}
+
+/// Spawn the agent process (single attempt, no supervision).
+///
+/// Used both for the initial launch and for respawns inside the supervisor.
+/// Stdout/stderr append to `<log_dir>/<sanitized-name>.log`; restarts append
+/// to the same file so the full history is preserved across respawns.
+async fn spawn_child_process(
+    config: &ResolvedAgentConfig,
+    env_vars: &HashMap<String, String>,
+    agent_cwd: &Path,
+    log_dir: &Path,
+) -> Result<Child, DispatchError> {
+    let launch =
+        AgentOrchestrator::build_launch(config).map_err(|e| DispatchError::AgentLaunchFailed {
+            name: config.name.clone(),
+            reason: e.to_string(),
+        })?;
+
+    tracing::info!(
+        agent = %config.name,
+        role = %config.role,
+        adapter = %config.adapter,
+        program = %launch.program,
+        args = ?launch.args,
+        cwd = %agent_cwd.display(),
+        "launching agent"
+    );
+
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .map_err(|e| DispatchError::AgentLaunchFailed {
+            name: config.name.clone(),
+            reason: format!("failed to create log dir {}: {e}", log_dir.display()),
+        })?;
+    let safe_name = sanitize_name(&config.name);
+    let log_path = log_dir.join(format!("{safe_name}.log"));
+    // Append rather than truncate so restart logs are retained.
+    let log_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await
+        .map_err(|e| DispatchError::AgentLaunchFailed {
+            name: config.name.clone(),
+            reason: format!("failed to open log file {}: {e}", log_path.display()),
+        })?;
+    let log_file_err =
+        log_file
+            .try_clone()
+            .await
+            .map_err(|e| DispatchError::AgentLaunchFailed {
+                name: config.name.clone(),
+                reason: format!("failed to clone log file handle: {e}"),
+            })?;
+    let log_file_std = log_file.into_std().await;
+    let log_file_err_std = log_file_err.into_std().await;
+
+    let stdin = match &launch.stdin_file {
+        Some(path) => {
+            let f = tokio::fs::File::open(path).await.map_err(|e| {
+                DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: format!("failed to open prompt file {}: {e}", path.display()),
+                }
+            })?;
+            std::process::Stdio::from(f.into_std().await)
+        }
+        None => std::process::Stdio::null(),
+    };
+
+    Command::new(&launch.program)
+        .args(&launch.args)
+        .envs(env_vars)
+        .current_dir(agent_cwd)
+        .stdin(stdin)
+        .stdout(std::process::Stdio::from(log_file_std))
+        .stderr(std::process::Stdio::from(log_file_err_std))
+        .process_group(0)
+        .spawn()
+        .map_err(|e| DispatchError::AgentLaunchFailed {
+            name: config.name.clone(),
+            reason: e.to_string(),
+        })
+}
+
+/// Supervisor loop for a single agent.
+///
+/// - Waits for the initial `child` to exit or for a shutdown signal.
+/// - On exit: if the agent ran for at least `STABLE_AFTER`, reset the attempt
+///   counter (a long-lived process that dies once shouldn't exhaust the
+///   budget). Otherwise increment.
+/// - Applies `restart_backoff(attempt)` before respawning.
+/// - Gives up after `MAX_RESTART_ATTEMPTS` consecutive unstable failures and
+///   leaves `AgentState::Crashed` in place.
+async fn supervise_agent(
+    config: ResolvedAgentConfig,
+    env_vars: HashMap<String, String>,
+    agent_cwd: PathBuf,
+    log_dir: PathBuf,
+    initial_child: Child,
+    state: Arc<Mutex<AgentState>>,
+    shutdown: Arc<Notify>,
+) {
+    let mut child = initial_child;
+    let mut attempt: u32 = 0;
+    let mut started_at = Instant::now();
+
+    loop {
+        let pid = child.id().unwrap_or(0);
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::info!(agent = %config.name, pid, "shutdown requested");
+                kill_process_group(pid).await;
+                let _ = child.wait().await;
+                *state.lock().await = AgentState::Stopped;
+                return;
+            }
+            status = child.wait() => {
+                let ran_for = started_at.elapsed();
+                tracing::info!(
+                    agent = %config.name,
+                    ?status,
+                    ran_secs = ran_for.as_secs(),
+                    "agent exited",
+                );
+
+                if ran_for >= STABLE_AFTER {
+                    attempt = 1;
+                } else {
+                    attempt = attempt.saturating_add(1);
+                }
+
+                if attempt > MAX_RESTART_ATTEMPTS {
+                    let reason = match status {
+                        Ok(s) => format!("exited with {s}"),
+                        Err(e) => format!("wait error: {e}"),
+                    };
+                    tracing::warn!(
+                        agent = %config.name,
+                        attempts = attempt - 1,
+                        %reason,
+                        "restart budget exhausted; marking crashed",
+                    );
+                    *state.lock().await = AgentState::Crashed {
+                        reason,
+                        attempts: attempt - 1,
+                    };
+                    return;
+                }
+
+                let backoff = restart_backoff(attempt);
+                tracing::info!(
+                    agent = %config.name,
+                    attempt,
+                    backoff_secs = backoff.as_secs(),
+                    "restarting after backoff",
+                );
+                *state.lock().await = AgentState::Restarting {
+                    attempt,
+                    backoff_secs: backoff.as_secs(),
+                };
+
+                // Sleep with shutdown cancellation.
+                tokio::select! {
+                    _ = shutdown.notified() => {
+                        *state.lock().await = AgentState::Stopped;
+                        return;
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+
+                match spawn_child_process(&config, &env_vars, &agent_cwd, &log_dir).await {
+                    Ok(new_child) => {
+                        child = new_child;
+                        started_at = Instant::now();
+                        let new_pid = child.id().unwrap_or(0);
+                        *state.lock().await = AgentState::Running {
+                            pid: new_pid,
+                            started_at: super::local::now_secs(),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent = %config.name, error = %e, "respawn failed");
+                        *state.lock().await = AgentState::Crashed {
+                            reason: format!("respawn failed: {e}"),
+                            attempts: attempt,
+                        };
+                        return;
+                    }
+                }
+            }
         }
     }
 }
 
 /// Build an agent command string for the user to paste.
 ///
-/// Includes the dispatch env vars (shell-escaped) and the resolved command
-/// with prompt substitution. Side-effect free — does not write tempfiles
-/// even when the command uses `{prompt_file}`; the placeholder is left
-/// in place for inline prompts so the user knows where it'll be substituted.
+/// Includes the dispatch env vars (shell-escaped) and the adapter-assembled
+/// launch string.
 pub fn build_agent_command(
     config: &ResolvedAgentConfig,
     cell_id: &str,
@@ -403,8 +627,35 @@ pub fn build_agent_command(
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
     }
 
-    parts.push(AgentOrchestrator::build_command(config, None));
+    let cmd_str = AgentOrchestrator::build_launch(config)
+        .map(|launch| launch_to_shell_string(&launch))
+        .unwrap_or_else(|e| format!("# adapter error: {e}"));
+    parts.push(cmd_str);
     parts.join(" ")
+}
+
+/// Translate a Launch into a shell-pasteable command string.
+///
+/// For the `command` adapter, returns the user's original shell string
+/// verbatim (not wrapped in `sh -c '...'`). For claude/codex, quotes each
+/// argument as needed and appends `< <prompt_file>` if stdin is redirected.
+fn launch_to_shell_string(launch: &Launch) -> String {
+    if launch.wrap_in_shell {
+        return launch.args.get(1).cloned().unwrap_or_default();
+    }
+
+    let mut parts: Vec<String> = vec![shell_arg_quote(&launch.program)];
+    for arg in &launch.args {
+        parts.push(shell_arg_quote(arg));
+    }
+    let mut s = parts.join(" ");
+    if let Some(path) = &launch.stdin_file {
+        s.push_str(&format!(
+            " < {}",
+            shell_arg_quote(&path.display().to_string())
+        ));
+    }
+    s
 }
 
 /// Build the main agent command string for the user to paste.
@@ -437,11 +688,6 @@ pub fn build_main_agent_command(
     parts.join(" ")
 }
 
-/// Shell-escape a string for use in `sh -c` commands. POSIX single-quote escaping.
-pub(super) fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Whether `s` is safe to use as a single filename component on disk and as
 /// a path segment in a URL (no separators, no `..`, ASCII alphanumerics plus
 /// `-` and `_`).
@@ -470,11 +716,102 @@ pub(super) fn sanitize_name(s: &str) -> String {
     out
 }
 
-/// Write a prompt to a temporary file and return the path. The file is placed
-/// in the OS temp directory and named by sanitised agent name to aid debugging.
-fn write_prompt_tempfile(prompt: &str, agent_name: &str) -> std::io::Result<PathBuf> {
-    let safe_name = sanitize_name(agent_name);
-    let path = std::env::temp_dir().join(format!("dispatch-prompt-{safe_name}.md"));
-    std::fs::write(&path, prompt)?;
-    Ok(path)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::Adapter;
+
+    /// Exponential doubling capped at 30s — table-driven so the intent is
+    /// obvious if anyone tunes the backoff schedule later.
+    #[test]
+    fn restart_backoff_schedule() {
+        let cases = [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 30), (10, 30)];
+        for (attempt, expected) in cases {
+            assert_eq!(
+                restart_backoff(attempt).as_secs(),
+                expected,
+                "attempt {attempt} should back off {expected}s",
+            );
+        }
+    }
+
+    /// Build a ResolvedAgentConfig that runs a short sh command under the
+    /// `command` adapter — avoids needing `claude`/`codex` binaries on the
+    /// test host.
+    fn test_config(name: &str, command: &str) -> ResolvedAgentConfig {
+        ResolvedAgentConfig {
+            name: name.into(),
+            role: "test".into(),
+            description: "".into(),
+            adapter: Adapter::Command,
+            command: Some(command.into()),
+            extra_args: Vec::new(),
+            prompt: None,
+            prompt_file_path: None,
+            ttl: None,
+            launch: true,
+        }
+    }
+
+    /// Supervisor reports Running while a long-lived child is alive, and
+    /// transitions to Stopped after `stop_by_name`.
+    #[tokio::test]
+    async fn supervisor_running_then_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+        );
+        let cfg = test_config("alice", "sleep 30");
+        orch.spawn_agent(&cfg).await.expect("spawn");
+        // Let the supervisor publish its Running state.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let states = orch.list_state().await;
+        assert_eq!(states.len(), 1);
+        assert!(matches!(states[0].2, AgentState::Running { .. }));
+
+        assert!(orch.stop_by_name("alice").await);
+        assert!(orch.list_state().await.is_empty());
+    }
+
+    /// When the child exits quickly, the supervisor moves through
+    /// Running → Restarting (attempt=1) before the first-backoff sleep
+    /// completes. We probe at 300ms — well after exit, well before the 1s
+    /// backoff elapses.
+    #[tokio::test]
+    async fn supervisor_transitions_to_restarting_after_quick_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+        );
+        let cfg = test_config("flaky", "exit 1");
+        orch.spawn_agent(&cfg).await.expect("spawn");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let states = orch.list_state().await;
+        assert_eq!(states.len(), 1);
+        assert!(
+            matches!(
+                states[0].2,
+                AgentState::Restarting {
+                    attempt: 1,
+                    backoff_secs: 1
+                } | AgentState::Running { .. }
+            ),
+            "unexpected state: {:?}",
+            states[0].2
+        );
+
+        // Shutdown should cancel the backoff sleep cleanly.
+        orch.shutdown_all().await;
+        assert!(orch.list_state().await.is_empty());
+    }
 }

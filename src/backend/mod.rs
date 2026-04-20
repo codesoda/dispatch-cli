@@ -2,6 +2,8 @@ pub mod local;
 pub mod monitor;
 pub mod orchestrator;
 
+pub use local::socket_path;
+
 use async_trait::async_trait;
 
 use crate::config::ResolvedConfig;

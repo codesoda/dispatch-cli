@@ -40,13 +40,19 @@ pub struct ResolvedAgentConfig {
     pub name: String,
     pub role: String,
     pub description: String,
-    pub command: String,
+    pub adapter: crate::adapter::Adapter,
+    /// Full shell command — set only for `adapter = Command`.
+    pub command: Option<String>,
+    /// Extra args appended to the adapter-assembled argv (claude/codex).
+    pub extra_args: Vec<String>,
     pub prompt: Option<String>,
     /// The resolved absolute path to the prompt file, if one was specified.
-    /// Used by `{prompt_file}` substitution to reference the file directly
-    /// instead of writing to a temp file.
+    /// Used by adapters as stdin source (claude/codex) or for `{prompt_file}`
+    /// substitution in command-adapter shell strings.
     pub prompt_file_path: Option<PathBuf>,
     pub ttl: Option<u64>,
+    /// Whether `dispatch serve` should auto-launch and supervise this agent.
+    pub launch: bool,
 }
 
 /// On-disk config file shape.
@@ -109,10 +115,19 @@ pub struct AgentConfig {
     pub name: String,
     pub role: String,
     pub description: String,
-    pub command: String,
+    /// Which adapter to use: `command`, `claude`, or `codex`.
+    pub adapter: crate::adapter::Adapter,
+    /// Full shell command — required when `adapter = "command"`, ignored otherwise.
+    pub command: Option<String>,
+    /// Extra args appended to the adapter-assembled argv (claude/codex).
+    #[serde(default)]
+    pub extra_args: Vec<String>,
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     pub ttl: Option<u64>,
+    /// Whether `dispatch serve --launch` should auto-start this agent.
+    #[serde(default)]
+    pub launch: bool,
 }
 
 /// On-disk main agent definition.
@@ -125,11 +140,37 @@ pub struct MainAgentConfig {
     pub prompt_file: Option<String>,
 }
 
-/// Resolve an agent config by reading prompt_file if specified.
+/// Resolve an agent config by reading prompt_file if specified and validating
+/// adapter-specific requirements.
 fn resolve_agent_config(
     agent: &AgentConfig,
     project_root: &Path,
 ) -> Result<ResolvedAgentConfig, DispatchError> {
+    use crate::adapter::Adapter;
+
+    if agent.adapter == Adapter::Command && agent.command.is_none() {
+        return Err(DispatchError::AgentConfigError {
+            name: agent.name.clone(),
+            reason: "adapter = \"command\" requires `command = \"...\"`".into(),
+        });
+    }
+
+    // Claude/codex adapters pipe prompts as stdin from `prompt_file`. An
+    // inline `prompt = "..."` would be silently dropped, launching the agent
+    // with empty stdin; reject it up front so the misconfiguration surfaces.
+    if matches!(agent.adapter, Adapter::Claude | Adapter::Codex)
+        && agent.prompt.is_some()
+        && agent.prompt_file.is_none()
+    {
+        return Err(DispatchError::AgentConfigError {
+            name: agent.name.clone(),
+            reason: format!(
+                "adapter = \"{}\" requires `prompt_file = \"...\"` (inline `prompt` is not supported on this adapter)",
+                agent.adapter
+            ),
+        });
+    }
+
     let (prompt, prompt_file_path) = match (&agent.prompt, &agent.prompt_file) {
         (Some(_), Some(_)) => {
             return Err(DispatchError::AgentConfigError {
@@ -146,7 +187,6 @@ fn resolve_agent_config(
                     path: full_path.clone(),
                 }
             })?;
-            // Canonicalize to absolute path so {prompt_file} works regardless of agent cwd
             let abs_path = full_path.canonicalize().unwrap_or(full_path);
             (Some(content), Some(abs_path))
         }
@@ -157,10 +197,13 @@ fn resolve_agent_config(
         name: agent.name.clone(),
         role: agent.role.clone(),
         description: agent.description.clone(),
+        adapter: agent.adapter,
         command: agent.command.clone(),
+        extra_args: agent.extra_args.clone(),
         prompt,
         prompt_file_path,
         ttl: agent.ttl,
+        launch: agent.launch,
     })
 }
 
@@ -218,14 +261,25 @@ const CONFIG_TEMPLATE: &str = "\
 # port = 8384
 # open = true  # open the dashboard in your default browser
 
-# Agent definitions — launched automatically by `dispatch serve`
+# Agent definitions — auto-started by `dispatch serve --launch` when launch = true
 # [[agents]]
 # name = \"reviewer\"
 # role = \"code-reviewer\"
 # description = \"Reviews code changes\"
-# command = \"claude --model sonnet\"
+# adapter = \"claude\"                            # one of: command | claude | codex
+# extra_args = [\"--model\", \"sonnet\"]          # appended to the adapter's argv
 # prompt_file = \"prompts/reviewer.md\"
+# launch = true
 # ttl = 3600
+#
+# # `command` adapter — for bash-script / non-LLM workers:
+# [[agents]]
+# name = \"bash-worker\"
+# role = \"worker\"
+# description = \"Scripted worker\"
+# adapter = \"command\"
+# command = \"scripts/worker.sh --verbose\"
+# launch = true
 
 # Main interactive agent — printed as a ready-to-paste command
 # [main_agent]
@@ -559,5 +613,172 @@ backend = "https://example.com"
         let resolved = resolve_config_inner(None, None, Some(&config_path), tmp.path()).unwrap();
         assert_eq!(resolved.cell_id, "explicit");
         assert_eq!(resolved.project_root, config_dir);
+    }
+
+    #[test]
+    fn agent_config_parses_claude_adapter() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("reviewer.md");
+        fs::write(&prompt_path, "you are a reviewer").unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "reviewer"
+role = "reviewer"
+description = "reviews"
+adapter = "claude"
+extra_args = ["--model", "sonnet"]
+prompt_file = "reviewer.md"
+launch = true
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert_eq!(resolved.agents.len(), 1);
+        let a = &resolved.agents[0];
+        assert_eq!(a.adapter, crate::adapter::Adapter::Claude);
+        assert_eq!(a.extra_args, vec!["--model", "sonnet"]);
+        assert!(a.launch);
+        assert!(a.command.is_none());
+        assert!(a.prompt_file_path.is_some());
+    }
+
+    #[test]
+    fn agent_config_rejects_claude_adapter_with_inline_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "reviewer"
+role = "reviewer"
+description = "reviews"
+adapter = "claude"
+prompt = "you are a reviewer"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prompt_file") && msg.contains("claude"),
+            "expected prompt_file-required error for claude, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn agent_config_rejects_codex_adapter_with_inline_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "worker"
+role = "worker"
+description = "codex"
+adapter = "codex"
+prompt = "be helpful"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("prompt_file"));
+    }
+
+    #[test]
+    fn agent_config_parses_command_adapter() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "worker"
+role = "worker"
+description = "bash worker"
+adapter = "command"
+command = "./worker.sh --verbose"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let a = &resolved.agents[0];
+        assert_eq!(a.adapter, crate::adapter::Adapter::Command);
+        assert_eq!(a.command.as_deref(), Some("./worker.sh --verbose"));
+        assert!(!a.launch);
+        assert!(a.extra_args.is_empty());
+    }
+
+    #[test]
+    fn agent_config_rejects_command_adapter_without_command() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "broken"
+role = "worker"
+description = "no command"
+adapter = "command"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("adapter = \"command\""),
+            "expected command-required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_config_rejects_missing_adapter_field() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "legacy"
+role = "worker"
+description = "old shape"
+command = "./worker.sh"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("adapter"),
+            "expected adapter-related parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_config_rejects_unknown_adapter_value() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "x"
+role = "r"
+description = "d"
+adapter = "gpt"
+"#,
+        )
+        .unwrap();
+
+        assert!(resolve_config_inner(None, None, None, tmp.path()).is_err());
     }
 }

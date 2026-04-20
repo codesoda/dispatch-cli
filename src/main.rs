@@ -1,12 +1,43 @@
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
 use dispatch::backend::create_backend;
-use dispatch::cli::{Cli, Commands};
+use dispatch::cli::{AgentAction, Cli, Commands, HookAction};
 use dispatch::config::resolve_config;
+use dispatch::hooks;
 use dispatch::logging::init_tracing;
 use dispatch::protocol::BrokerRequest;
+
+/// Parse a timestamp string as either a relative duration (e.g. "5m", "1h", "30s")
+/// or an absolute Unix timestamp. Returns a Unix timestamp in seconds.
+fn parse_timestamp(s: &str) -> Result<u64, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let relative = [('s', 1u64), ('m', 60), ('h', 3600), ('d', 86400)];
+    for (suffix, factor) in relative {
+        if let Some(num_str) = s.strip_suffix(suffix) {
+            if let Ok(n) = num_str.parse::<u64>() {
+                let secs = n.checked_mul(factor).ok_or_else(|| {
+                    format!("invalid timestamp: {s} (relative duration overflows)")
+                })?;
+                return Ok(now.saturating_sub(secs));
+            }
+        }
+    }
+
+    if let Ok(ts) = s.parse::<u64>() {
+        return Ok(ts);
+    }
+
+    Err(format!(
+        "invalid timestamp: {s} (use relative like 5m/1h/30s or a Unix timestamp)"
+    ))
+}
 
 #[tokio::main]
 async fn main() {
@@ -35,6 +66,15 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
         println!("{}", path.display());
         eprintln!("Created dispatch.config.toml");
         return Ok(());
+    }
+
+    // Hook subcommands run without resolving a config up front — Stop probes
+    // the broker itself, install/uninstall touch vendor files only.
+    if let Commands::CodexHook { action } = &cli.command {
+        return run_codex_hook(action, &cwd).await;
+    }
+    if let Commands::ClaudeHook { action } = &cli.command {
+        return run_claude_hook(action, &cwd).await;
     }
 
     let config = resolve_config(cli.cell_id.as_deref(), cli.config.as_deref(), &cwd)?;
@@ -85,7 +125,78 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     worker_id,
                     timeout_secs: timeout,
                 },
-                Commands::Heartbeat { worker_id } => BrokerRequest::Heartbeat { worker_id },
+                Commands::Events {
+                    event_type,
+                    worker,
+                    since,
+                    until,
+                    limit,
+                } => {
+                    let since = since
+                        .map(|s| parse_timestamp(&s))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("dispatch: {e}");
+                            process::exit(2);
+                        });
+                    let until = until
+                        .map(|s| parse_timestamp(&s))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("dispatch: {e}");
+                            process::exit(2);
+                        });
+                    BrokerRequest::Events {
+                        since,
+                        until,
+                        event_type,
+                        worker,
+                        limit,
+                    }
+                }
+                Commands::Messages {
+                    worker_id,
+                    unacked,
+                    sent,
+                    since,
+                    limit,
+                    id,
+                } => {
+                    let since = since
+                        .map(|s| parse_timestamp(&s))
+                        .transpose()
+                        .unwrap_or_else(|e| {
+                            eprintln!("dispatch: {e}");
+                            process::exit(2);
+                        });
+                    BrokerRequest::Messages {
+                        worker_id,
+                        unacked,
+                        sent,
+                        since,
+                        limit,
+                        id,
+                    }
+                }
+                Commands::Status { worker_id, clear } => BrokerRequest::Status { worker_id, clear },
+                Commands::Ack {
+                    worker_id,
+                    message_id,
+                    note,
+                } => BrokerRequest::Ack {
+                    worker_id,
+                    message_id,
+                    note,
+                },
+                Commands::Heartbeat { worker_id, status } => {
+                    BrokerRequest::Heartbeat { worker_id, status }
+                }
+                Commands::Agent { action } => match action {
+                    AgentAction::Start { name } => BrokerRequest::AgentStart { name },
+                    AgentAction::Stop { name } => BrokerRequest::AgentStop { name },
+                    AgentAction::Restart { name } => BrokerRequest::AgentRestart { name },
+                },
+                Commands::CodexHook { .. } | Commands::ClaudeHook { .. } => unreachable!(),
             };
             let response = backend.send_request(&request).await?;
             let json = serde_json::to_string(&response)?;
@@ -94,4 +205,71 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
     }
 
     Ok(())
+}
+
+async fn run_codex_hook(
+    action: &HookAction,
+    cwd: &std::path::Path,
+) -> Result<(), dispatch::errors::DispatchError> {
+    match action {
+        HookAction::Stop => {
+            hooks::run_stop_hook(cwd).await;
+        }
+        HookAction::Install => {
+            let path = hooks::codex::install(cwd).await?;
+            eprintln!(
+                "installed codex hook at {}\nensure features.codex_hooks = true is set in .codex/config.toml (already added if missing)",
+                path.display()
+            );
+        }
+        HookAction::Uninstall => match hooks::codex::uninstall(cwd).await? {
+            Some(path) => eprintln!("removed {}", path.display()),
+            None => eprintln!("no codex hook installed"),
+        },
+    }
+    Ok(())
+}
+
+async fn run_claude_hook(
+    action: &HookAction,
+    cwd: &std::path::Path,
+) -> Result<(), dispatch::errors::DispatchError> {
+    match action {
+        HookAction::Stop => {
+            hooks::run_stop_hook(cwd).await;
+        }
+        HookAction::Install => {
+            let path = hooks::claude::install(cwd).await?;
+            eprintln!("installed claude hook at {}", path.display());
+        }
+        HookAction::Uninstall => match hooks::claude::uninstall(cwd).await? {
+            Some(path) => eprintln!("removed entry from {}", path.display()),
+            None => eprintln!("no claude hook installed"),
+        },
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_timestamp_accepts_unix_seconds() {
+        assert_eq!(parse_timestamp("1700000000").unwrap(), 1700000000);
+    }
+
+    #[test]
+    fn parse_timestamp_relative_does_not_overflow() {
+        // u64::MAX followed by a suffix must not panic in debug or wrap in
+        // release — it should return a readable error.
+        let input = format!("{}m", u64::MAX);
+        let err = parse_timestamp(&input).unwrap_err();
+        assert!(err.contains("overflow"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_timestamp_rejects_garbage() {
+        assert!(parse_timestamp("not-a-timestamp").is_err());
+    }
 }
