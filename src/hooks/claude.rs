@@ -42,8 +42,8 @@ pub async fn install(cwd: &Path) -> Result<PathBuf, DispatchError> {
             path: path.clone(),
             reason: "expected a JSON object at the top level of settings.json".into(),
         })?;
-    let hooks = ensure_object(obj, "hooks");
-    let stop = ensure_array(hooks, "Stop");
+    let hooks = require_object(obj, "hooks", &path)?;
+    let stop = require_array(hooks, "Stop", &path, "hooks.Stop")?;
 
     // Skip if any existing matcher contains our command.
     let already = stop.iter().any(|entry| {
@@ -137,27 +137,37 @@ async fn tokio_file_exists(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
 }
 
-/// Ensure `map[key]` is a JSON object and return a mutable reference to it.
-/// Overwrites non-object values at `key` — callers should have validated the
-/// surrounding shape before invoking this.
-fn ensure_object<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
-    let current = map.get(key);
-    if !matches!(current, Some(Value::Object(_))) {
-        map.insert(key.to_string(), Value::Object(Map::new()));
-    }
-    map.get_mut(key)
-        .and_then(Value::as_object_mut)
-        .expect("just inserted an object")
+/// Return a mutable reference to `map[key]` as a JSON object. Inserts an
+/// empty object when the key is absent; surfaces `ConfigInvalid` when the
+/// key is present but of the wrong type, so user-authored config isn't
+/// silently clobbered.
+fn require_object<'a>(
+    map: &'a mut Map<String, Value>,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut Map<String, Value>, DispatchError> {
+    map.entry(key.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| DispatchError::ConfigInvalid {
+            path: path.to_path_buf(),
+            reason: format!("expected `{key}` to be a JSON object in settings.json"),
+        })
 }
 
-fn ensure_array<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Vec<Value> {
-    let current = map.get(key);
-    if !matches!(current, Some(Value::Array(_))) {
-        map.insert(key.to_string(), Value::Array(Vec::new()));
-    }
-    map.get_mut(key)
-        .and_then(Value::as_array_mut)
-        .expect("just inserted an array")
+fn require_array<'a>(
+    map: &'a mut Map<String, Value>,
+    key: &str,
+    path: &Path,
+    json_pointer: &str,
+) -> Result<&'a mut Vec<Value>, DispatchError> {
+    map.entry(key.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| DispatchError::ConfigInvalid {
+            path: path.to_path_buf(),
+            reason: format!("expected `{json_pointer}` to be a JSON array in settings.json"),
+        })
 }
 
 #[cfg(test)]
@@ -253,6 +263,43 @@ mod tests {
         tokio::fs::write(dir.path().join(".claude/settings.json"), b"[]")
             .await
             .unwrap();
+        let err = install(dir.path()).await.unwrap_err();
+        assert!(matches!(err, DispatchError::ConfigInvalid { .. }));
+    }
+
+    /// If `hooks` exists but isn't a JSON object, don't clobber it — surface
+    /// `ConfigInvalid` so the user notices their settings file is malformed
+    /// (or holds a type they didn't intend).
+    #[tokio::test]
+    async fn install_rejects_non_object_hooks() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".claude"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".claude/settings.json"),
+            b"{\"hooks\": \"oops\"}",
+        )
+        .await
+        .unwrap();
+        let err = install(dir.path()).await.unwrap_err();
+        assert!(matches!(err, DispatchError::ConfigInvalid { .. }));
+    }
+
+    /// Same for `hooks.Stop`: a pre-existing non-array value must not be
+    /// silently replaced with our Stop entry.
+    #[tokio::test]
+    async fn install_rejects_non_array_stop() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".claude"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".claude/settings.json"),
+            b"{\"hooks\": {\"Stop\": {\"not\": \"an-array\"}}}",
+        )
+        .await
+        .unwrap();
         let err = install(dir.path()).await.unwrap_err();
         assert!(matches!(err, DispatchError::ConfigInvalid { .. }));
     }

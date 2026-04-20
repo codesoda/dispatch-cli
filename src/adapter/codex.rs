@@ -33,7 +33,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_preceeds_extra_args() {
+    fn exec_precedes_extra_args() {
         let extras = vec![
             "-s".to_string(),
             "danger-full-access".to_string(),

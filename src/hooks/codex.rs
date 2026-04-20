@@ -186,13 +186,22 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
             if trimmed == "[features]" {
                 in_features = true;
             }
-        } else if in_features && trimmed.starts_with("codex_hooks") {
-            // Accept `codex_hooks = <value>` with any spacing. Value is the
-            // substring after `=`, stripped and with trailing comment removed.
-            if let Some((_, rhs)) = trimmed.split_once('=') {
-                let value = rhs.split('#').next().unwrap_or("").trim();
-                let is_true = value == "true";
-                existing_key = Some((offset, offset + segment.len(), is_true));
+        } else if in_features {
+            // Match the exact `codex_hooks` key: next char must be `=` or
+            // whitespace so lookalikes such as `codex_hooks_extra = ...` are
+            // left untouched.
+            if let Some(rest) = trimmed.strip_prefix("codex_hooks") {
+                let boundary_ok = rest
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c == '=' || c.is_whitespace());
+                if boundary_ok {
+                    if let Some((_, rhs)) = trimmed.split_once('=') {
+                        let value = rhs.split('#').next().unwrap_or("").trim();
+                        let is_true = value == "true";
+                        existing_key = Some((offset, offset + segment.len(), is_true));
+                    }
+                }
             }
         }
         offset += segment.len();
@@ -467,6 +476,27 @@ mod tests {
         let out = ensure_codex_hooks_feature(input);
         assert!(out.contains("codex_hooks = true\r\n"));
         assert!(!out.contains("codex_hooks = false"));
+    }
+
+    /// A similarly-prefixed key such as `codex_hooks_extra = "foo"` inside
+    /// `[features]` must NOT be rewritten as the feature flag — the match
+    /// is only for the exact `codex_hooks` key.
+    #[test]
+    fn does_not_rewrite_similar_prefixed_key() {
+        let input = "[features]\ncodex_hooks_extra = \"foo\"\n";
+        let out = ensure_codex_hooks_feature(input);
+        assert!(out.contains("codex_hooks_extra = \"foo\""));
+        assert!(out.contains("codex_hooks = true"));
+        // Remains valid TOML with both keys intact.
+        let parsed: toml::Value = toml::from_str(&out).expect("merge must yield valid TOML");
+        assert_eq!(
+            parsed["features"]["codex_hooks"],
+            toml::Value::Boolean(true)
+        );
+        assert_eq!(
+            parsed["features"]["codex_hooks_extra"],
+            toml::Value::String("foo".to_string())
+        );
     }
 
     /// Rejects a hooks.json whose top-level JSON is not an object (array,
