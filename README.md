@@ -170,7 +170,11 @@ dispatch codex-hook install       # writes .codex/hooks.json + enables features.
 dispatch claude-hook install      # merges a Stop hook into .claude/settings.json
 ```
 
-The hook runs `dispatch {codex,claude}-hook stop`, which emits `{"decision":"block","reason":"..."}` on stdout when a dispatch broker is reachable on the project's socket. When it can't reach a broker (dispatch is shutting down, was never started, or the agent is running outside a dispatch project), the hook prints nothing and exits `0` so the vendor can stop the agent cleanly instead of pinning it alive. Uninstall with `... uninstall`.
+The hook runs `dispatch {codex,claude}-hook stop`, which emits `{"decision":"block","reason":"..."}` on stdout when a dispatch broker is reachable on the project's socket. The block decision tells the vendor not to exit at end-of-turn; the `reason` instructs the agent to call `dispatch listen` again with its `worker_id`, which keeps it alive and waiting for the next message instead of treating its job as done.
+
+The reason string is prefixed with an "if you are a dispatch agent" guard so ad-hoc sessions you start by hand inside the same repo can ignore it and stop normally — the hook fires for every claude/codex session in the repo, not just dispatch-launched ones.
+
+When the hook can't reach a broker (dispatch is shutting down, was never started, or the agent is running outside a dispatch project), it prints nothing and exits `0` so the vendor stops the agent cleanly instead of pinning it alive. Uninstall with `... uninstall`.
 
 ### Monitor dashboard
 

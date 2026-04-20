@@ -22,7 +22,12 @@ pub mod codex;
 ///
 /// Kept short and imperative so the LLM treats it as a continuation
 /// instruction rather than conversational text.
-pub const CONTINUE_REASON: &str = "The dispatch broker may still have work queued for you. Do not stop yet — call `dispatch listen` again with your registered worker_id and a timeout (e.g. 600) to wait for the next message. When a message arrives, process it and then return to this listen step.";
+///
+/// Prefixed with an "if you are a dispatch agent" guard because both vendor
+/// stop hooks fire for *every* claude/codex session inside a repo where the
+/// hook is installed — including ad-hoc sessions the user runs by hand. A
+/// non-dispatch session that reads this should treat it as a no-op.
+pub const CONTINUE_REASON: &str = "If you are a dispatch agent (you have a registered worker_id from `dispatch register`): the dispatch broker may still have work queued for you. Do not stop yet — call `dispatch listen` again with your worker_id and a timeout (e.g. 600) to wait for the next message. When a message arrives, process it and then return to this listen step.\n\nIf you are NOT a dispatch agent (you have no worker_id and the user did not start you via dispatch), ignore this notice and stop normally.";
 
 /// How long the stop hook waits for a connection to the broker socket
 /// before treating it as unreachable. Kept short because the hook is in

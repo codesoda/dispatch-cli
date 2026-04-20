@@ -361,18 +361,26 @@ impl BrokerState {
             payload,
             timestamp: now_secs(),
         };
-        let ts = chrono_ts();
+        // Foreground console echo for `dispatch serve`. Routed through
+        // `tracing::info!` so it lands in both the daily log file AND on
+        // stderr (the same place the previous `eprintln!` wrote), and so
+        // `DISPATCH_LOG=warn` etc. can quiet the broker without losing
+        // file-side logs.
         let display_name = event.worker_name.as_deref().unwrap_or(worker_id);
-        if let Some(ref p) = event.payload {
-            eprintln!(
-                "[{ts}] {:>10}  {display_name}  {}  {p}",
-                event.kind, event.detail
-            );
-        } else {
-            eprintln!(
-                "[{ts}] {:>10}  {display_name}  {}",
-                event.kind, event.detail
-            );
+        match event.payload.as_ref() {
+            Some(p) => tracing::info!(
+                kind = %event.kind,
+                worker = %display_name,
+                detail = %event.detail,
+                payload = %p,
+                "broker event",
+            ),
+            None => tracing::info!(
+                kind = %event.kind,
+                worker = %display_name,
+                detail = %event.detail,
+                "broker event",
+            ),
         }
         let _ = tx.send(event.clone());
         self.event_history.push_back(event);
@@ -862,15 +870,6 @@ async fn handle_connection(
         .map_err(DispatchError::Io)?;
 
     Ok(())
-}
-
-/// Format current time as HH:MM:SS for console output.
-fn chrono_ts() -> String {
-    let secs = now_secs();
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// Route a parsed request to the appropriate handler.

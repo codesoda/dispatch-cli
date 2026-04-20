@@ -7,19 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-04-19
-
-### Added
-- `POST /api/agents/{name}/start|stop|restart` — monitor UI and external callers can drive the orchestrator directly (local-loopback, unauthenticated; matches `/api/shutdown`)
-- `Worker.status_history` — last 3 prior status taglines retained per worker with dedupe, surfaced via `/api/team`
-- `AgentState::Running` now carries `started_at` (Unix seconds) alongside `pid` for client-side uptime
-- Expanded monitor agent cards: adapter badge, current + last 2 prior statuses, uptime, heartbeat age, Start/Stop/Restart buttons, and a Copy-command button for `launch = false` agents
-- Toast feedback in the dashboard for action outcomes (disables buttons while in-flight)
-
-### Changed
-- `dispatch {codex,claude}-hook stop` probes the broker socket before emitting the block decision: when dispatch is unreachable the hook prints nothing and exits 0 so the vendor can stop the agent cleanly
-- `dispatch status --clear` no longer wipes the historical status buffer — clear is a display-level reset only
-
 ## [0.4.1] - 2026-04-19
 
 ### Added
@@ -32,10 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Agent supervisor with exponential-backoff auto-restart (1s → 30s cap, 5 consecutive failures = crashed; counter resets after 30s stable)
 - `dispatch codex-hook {stop,install,uninstall}` — writes `.codex/hooks.json` + enables `features.codex_hooks`; Stop handler emits a block decision so the agent keeps listening for dispatch messages
 - `dispatch claude-hook {stop,install,uninstall}` — same pattern via `.claude/settings.local.json` (merges into existing `settings.json` if present)
+- `POST /api/agents/{name}/start|stop|restart` — monitor UI and external callers can drive the orchestrator directly (local-loopback, unauthenticated; matches `/api/shutdown`)
+- `Worker.status_history` — last 3 prior status taglines retained per worker with dedupe, surfaced via `/api/team`
+- `AgentState::Running` now carries `started_at` (Unix seconds) alongside `pid` for client-side uptime
 - Monitor dashboard: agent cards grid showing supervisor state per agent (running/starting/restarting/crashed/stopped), PID, short worker ID; clicking a card opens the existing agent detail view
+- Expanded monitor agent cards: adapter badge, current + last 2 prior statuses, uptime, heartbeat age, Start/Stop/Restart buttons, and a Copy-command button for `launch = false` agents
+- Toast feedback in the dashboard for action outcomes (disables buttons while in-flight)
 - `GET /api/agents/state` — live supervisor state for each managed agent
 - Monitor UI: events history drawer, messages tab, status taglines, ack-aware row colors
 - Per-agent log files at `logs/<name>.log`
+
+### Changed
+- `dispatch {codex,claude}-hook stop` probes the broker socket before emitting the block decision: when dispatch is unreachable the hook prints nothing and exits 0 so the vendor can stop the agent cleanly
+- `dispatch status --clear` no longer wipes the historical status buffer — clear is a display-level reset only
 
 ### Changed
 - Agent configs require `adapter = "..."`; the old `command = "..."` shell-one-liner shape no longer parses and must be migrated

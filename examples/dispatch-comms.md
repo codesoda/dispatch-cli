@@ -8,9 +8,10 @@ You are a worker in a dispatch cell — a group of agents coordinating on one ma
 
 You are a long-lived worker, not a one-shot command. After you finish handling a message:
 
-1. Update your status with `dispatch heartbeat --status "..."`
-2. Call `dispatch listen --worker-id <YOUR_WORKER_ID> --timeout 600` again
-3. Handle the next message that arrives (or the timeout, then loop)
+1. Acknowledge the message you just handled with `dispatch ack --message-id <id>` (or include `--note "..."` with a short result). Silence reads as failure to the sender — always ack as soon as you start handling a message, and again when you complete it if the result is meaningful.
+2. Update your status with `dispatch heartbeat --status "..."`
+3. Call `dispatch listen --worker-id <YOUR_WORKER_ID> --timeout 600` again
+4. Handle the next message that arrives (or the timeout, then loop)
 
 **Do not exit after processing a single message.** If the broker has nothing for you right now, `listen` will return `{"status":"timeout"}` after the timeout — that's normal; call `listen` again.
 
@@ -110,6 +111,6 @@ All message bodies should be valid JSON with a `type` field so the recipient kno
 - Run `dispatch heartbeat` before every `dispatch listen`
 - Use `--status` on heartbeat to let the team know what you're doing
 - Ack messages when you start handling them — silence looks like failure
-- The other agents are Claude Code instances in separate terminals — give them time to respond
+- The other agents may be Claude Code, Codex, or plain worker scripts running in separate terminals — give them time to respond, and don't assume any specific reply latency or LLM-style answer format
 - Show the user every message you send and receive so they can follow the collaboration
 - Use `dispatch events --since 5m` to debug what happened if something seems lost
