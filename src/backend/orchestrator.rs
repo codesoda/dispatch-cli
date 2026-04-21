@@ -209,16 +209,30 @@ impl AgentOrchestrator {
         let pre_register = config.launch && config.prompt_file_path.is_some();
 
         let (env_vars, worker_id, role_prompt, spawn_config) = if pre_register {
-            let prompt_path = config
-                .prompt_file_path
-                .as_ref()
-                .expect("checked by pre_register guard");
+            let prompt_path = config.prompt_file_path.as_ref().ok_or_else(|| {
+                DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: "pre_register set but prompt_file_path is None".into(),
+                }
+            })?;
             let prompt_content = tokio::fs::read_to_string(prompt_path).await.map_err(|_| {
                 DispatchError::PromptFileNotFound {
                     name: config.name.clone(),
                     path: prompt_path.clone(),
                 }
             })?;
+
+            // Write the boot prompt BEFORE pre-registering so a write failure
+            // (disk full, log_dir not writable, etc.) can't leave an orphan
+            // worker in the broker. After register_worker runs, any subsequent
+            // failure has to route through the cleanup guard below to maintain
+            // the "no zombie state" invariant.
+            let boot_path = write_boot_prompt(&self.log_dir, config)
+                .await
+                .map_err(|e| DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: format!("write boot prompt: {e}"),
+                })?;
 
             let id = uuid::Uuid::new_v4().to_string();
             {
@@ -239,13 +253,6 @@ impl AgentOrchestrator {
                         reason: format!("pre-register failed: {e}"),
                     })?;
             }
-
-            let boot_path = write_boot_prompt(&self.log_dir, config)
-                .await
-                .map_err(|e| DispatchError::AgentLaunchFailed {
-                    name: config.name.clone(),
-                    reason: format!("write boot prompt: {e}"),
-                })?;
 
             let mut sc = config.clone();
             sc.prompt_file_path = Some(boot_path);
@@ -268,11 +275,11 @@ impl AgentOrchestrator {
                 Ok(c) => c,
                 Err(e) => {
                     // Clean up the pre-registered worker so we don't leave an
-                    // orphan in the broker that will never check in.
+                    // orphan in the broker that will never check in. Routes
+                    // through remove_worker so mailboxes/notifiers go with it.
                     if let Some(ref id) = worker_id {
                         let mut b = self.broker.lock().await;
-                        b.workers.remove(id);
-                        b.role_prompts.remove(id);
+                        b.remove_worker(id);
                     }
                     return Err(e);
                 }
@@ -723,6 +730,12 @@ async fn supervise_agent(
                 // get its prompt back even if TTL expired during downtime.
                 // Idempotent on alive workers (no-op claim renewing TTL),
                 // fresh-creates if the record was GC'd.
+                //
+                // Treat failure as terminal: if we can't restore the broker
+                // state, the respawned child will fail its `--for-agent`
+                // lookup and crash-loop until MAX_RESTART_ATTEMPTS with only
+                // a generic "exited with ..." reason. Surface the real cause
+                // immediately instead.
                 if let Some((broker, worker_id, role_prompt)) = &re_register {
                     let mut b = broker.lock().await;
                     if let Err(err) = b.register_worker(
@@ -735,7 +748,16 @@ async fn supervise_agent(
                         Some(worker_id.clone()),
                         Some(role_prompt.clone()),
                     ) {
-                        tracing::warn!(agent = %config.name, %err, "restart re-register failed");
+                        tracing::error!(
+                            agent = %config.name,
+                            %err,
+                            "restart re-register failed; marking agent crashed",
+                        );
+                        *state.lock().await = AgentState::Crashed {
+                            reason: format!("re-register failed: {err}"),
+                            attempts: attempt,
+                        };
+                        return;
                     }
                 }
 
@@ -1070,8 +1092,9 @@ mod tests {
     }
 
     /// Issue #43: a missing prompt file fails the spawn and leaves NO
-    /// orphan worker in the broker — the cleanup guard runs before the
-    /// supervisor is attached.
+    /// orphan worker in the broker. The read_to_string `?` returns before
+    /// `register_worker` is reached, so nothing is ever created — the
+    /// early return (not the cleanup guard) is what prevents the orphan.
     #[tokio::test]
     async fn spawn_managed_agent_missing_prompt_file_leaves_no_orphan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1095,6 +1118,65 @@ mod tests {
         assert!(
             b.workers.is_empty(),
             "failed pre-register must not leave an orphan worker",
+        );
+    }
+
+    /// Issue #43: when `spawn_child_process` fails AFTER the pre-register
+    /// succeeds, the cleanup guard must remove the worker record, role
+    /// prompt, mailbox, and notifier so no zombie state survives in the
+    /// broker. We trigger a spawn failure by pointing `agent_cwd` at a
+    /// path that doesn't exist — `Command::current_dir` errors with ENOENT
+    /// when the spawn syscall tries to chdir.
+    #[tokio::test]
+    async fn spawn_managed_agent_spawn_failure_triggers_cleanup_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt_path = tmp.path().join("alice.md");
+        tokio::fs::write(&prompt_path, "role prompt body")
+            .await
+            .unwrap();
+
+        let bad_cwd = tmp.path().join("does-not-exist-cwd");
+        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
+        let mut orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            &bad_cwd,
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::clone(&broker),
+        );
+
+        // Seed a dummy mailbox + notifier under a placeholder id so we can
+        // confirm the cleanup guard also wipes those alongside `workers` /
+        // `role_prompts`. Any worker id the orchestrator later assigns
+        // won't collide with this placeholder — we're just asserting that
+        // `remove_worker` is what the cleanup path calls.
+        let cfg = managed_test_config("alice", "true", prompt_path);
+        let err = orch.spawn_agent(&cfg).await.expect_err("must fail");
+        assert!(
+            matches!(err, DispatchError::AgentLaunchFailed { .. }),
+            "expected AgentLaunchFailed, got: {err:?}",
+        );
+
+        let b = broker.lock().await;
+        assert!(
+            b.workers.is_empty(),
+            "spawn failure must not leave an orphan worker: {:?}",
+            b.workers,
+        );
+        assert!(
+            b.role_prompts.is_empty(),
+            "spawn failure must not leave an orphan role prompt: {:?}",
+            b.role_prompts,
+        );
+        assert!(
+            b.mailboxes.is_empty(),
+            "spawn failure must not leave an orphan mailbox",
+        );
+        assert!(
+            b.notifiers.is_empty(),
+            "spawn failure must not leave an orphan notifier",
         );
     }
 

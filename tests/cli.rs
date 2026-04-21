@@ -233,10 +233,12 @@ fn register_for_agent_routes_prompt_to_stdout() {
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
 
+    // Byte-for-byte fidelity: the prompt body must land on stdout without
+    // an appended newline, so agents that feed stdout into a tool-result
+    // get exactly what the orchestrator stored.
     assert_eq!(
-        stdout.trim(),
-        prompt,
-        "prompt body must be on stdout for the model to see it",
+        stdout, prompt,
+        "prompt body must be written verbatim (no trailing newline)",
     );
     assert!(
         stderr.contains("\"status\":\"ok\""),
@@ -245,6 +247,13 @@ fn register_for_agent_routes_prompt_to_stdout() {
     assert!(
         stderr.contains("w-prompt-test"),
         "JSON envelope must contain worker_id: {stderr}",
+    );
+    // The stderr envelope must NOT duplicate the prompt body — stdout
+    // already carries it, and the log would otherwise bloat with (and
+    // potentially leak) the full role prompt on every --for-agent call.
+    assert!(
+        !stderr.contains(prompt),
+        "stderr envelope must not duplicate the role prompt body: {stderr}",
     );
 }
 

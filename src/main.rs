@@ -214,7 +214,6 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 Commands::CodexHook { .. } | Commands::ClaudeHook { .. } => unreachable!(),
             };
             let response = backend.send_request(&request).await?;
-            let json = serde_json::to_string(&response)?;
             if for_agent {
                 // Prompt body to stdout, JSON envelope to stderr. If the
                 // broker has no prompt stored for this worker, exit nonzero
@@ -223,19 +222,37 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 if let BrokerResponse::Ok {
                     payload:
                         ResponsePayload::WorkerRegistered {
+                            worker_id,
                             role_prompt: Some(prompt),
-                            ..
                         },
                 } = &response
                 {
-                    println!("{prompt}");
+                    // Write the prompt body verbatim (no trailing newline
+                    // added) so the agent receives byte-for-byte what the
+                    // orchestrator stored.
+                    use std::io::Write as _;
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(prompt.as_bytes())?;
+                    stdout.flush()?;
+
+                    // Strip `role_prompt` from the stderr envelope so the
+                    // prompt body isn't duplicated into agent logs.
+                    let stripped = BrokerResponse::Ok {
+                        payload: ResponsePayload::WorkerRegistered {
+                            worker_id: worker_id.clone(),
+                            role_prompt: None,
+                        },
+                    };
+                    let json = serde_json::to_string(&stripped)?;
                     eprintln!("{json}");
                 } else {
+                    let json = serde_json::to_string(&response)?;
                     eprintln!("{json}");
                     eprintln!("dispatch: --for-agent set but response carries no role prompt");
                     process::exit(1);
                 }
             } else {
+                let json = serde_json::to_string(&response)?;
                 println!("{json}");
             }
         }

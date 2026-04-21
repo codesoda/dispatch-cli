@@ -248,6 +248,15 @@ impl BrokerState {
                     let ttl = ttl_secs.unwrap_or(self.default_ttl);
                     existing.ttl_secs = ttl;
                     existing.expires_at = now_secs() + ttl;
+                    // Refresh mutable metadata so a re-register with updated
+                    // config values isn't silently dropped. `capabilities` is
+                    // only overwritten when non-empty — agent-side claims pass
+                    // an empty vec and must not erase what the orchestrator
+                    // registered.
+                    existing.description = description;
+                    if !capabilities.is_empty() {
+                        existing.capabilities = capabilities;
+                    }
                     let id = supplied.clone();
                     // Only overwrite the stored prompt if the caller supplied
                     // one — agent claims pass `None` and must not erase what
@@ -272,10 +281,7 @@ impl BrokerState {
                 .map(|(id, _)| id.clone())
                 .collect();
             for old_id in &old_ids {
-                self.workers.remove(old_id);
-                self.mailboxes.remove(old_id);
-                self.notifiers.remove(old_id);
-                self.role_prompts.remove(old_id);
+                self.remove_worker(old_id);
             }
         }
 
@@ -301,6 +307,18 @@ impl BrokerState {
         Ok(id)
     }
 
+    /// Remove a worker and all per-worker state (mailbox, notifier, role
+    /// prompt). Callers should route every worker removal through this so
+    /// the broker never retains partial state for a worker that no longer
+    /// exists — an invariant the issue-#43 pre-register cleanup path relies
+    /// on.
+    pub fn remove_worker(&mut self, id: &str) {
+        self.workers.remove(id);
+        self.mailboxes.remove(id);
+        self.notifiers.remove(id);
+        self.role_prompts.remove(id);
+    }
+
     /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
     /// Returns `(id, name)` pairs for the evicted workers so callers can populate
     /// expire events with the worker's name (which is otherwise lost on removal).
@@ -313,10 +331,7 @@ impl BrokerState {
             .map(|(id, w)| (id.clone(), w.name.clone()))
             .collect();
         for (id, _) in &expired {
-            self.workers.remove(id);
-            self.mailboxes.remove(id);
-            self.notifiers.remove(id);
-            self.role_prompts.remove(id);
+            self.remove_worker(id);
         }
         expired
     }
@@ -1714,6 +1729,68 @@ mod tests {
         assert!(
             state.workers.get(&id).unwrap().expires_at > 0,
             "claim should renew TTL",
+        );
+    }
+
+    /// Issue #43: an idempotent claim with updated `description` /
+    /// `capabilities` must refresh the stored worker record so `dispatch
+    /// team` reflects current config — stale metadata from the initial
+    /// pre-register otherwise lingers. Empty capabilities (agent-side
+    /// claim shape) must NOT clobber the stored list.
+    #[test]
+    fn test_register_worker_idempotent_claim_updates_metadata() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "original description".into(),
+                vec!["cap-a".into(), "cap-b".into()],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("first register");
+
+        // Re-register with a new description and fresh capabilities —
+        // both must flow through to the stored worker.
+        state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "updated description".into(),
+                vec!["cap-c".into()],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim with updated metadata");
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.description, "updated description");
+        assert_eq!(w.capabilities, vec!["cap-c".to_string()]);
+
+        // Agent-style claim with empty capabilities must preserve the
+        // existing list rather than blanking it.
+        state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "third description".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("agent-style claim");
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.description, "third description");
+        assert_eq!(
+            w.capabilities,
+            vec!["cap-c".to_string()],
+            "empty capabilities must not wipe stored list",
         );
     }
 
