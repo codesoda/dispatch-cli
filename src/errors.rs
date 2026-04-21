@@ -43,6 +43,12 @@ pub enum DispatchError {
     #[error("prompt file not found for agent \"{name}\": {path}")]
     PromptFileNotFound { name: String, path: PathBuf },
 
+    #[error("register --for-agent failed: {message}")]
+    RegisterForAgentFailed { message: String },
+
+    #[error("--for-agent set but response carries no role prompt")]
+    NoRolePromptReturned,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

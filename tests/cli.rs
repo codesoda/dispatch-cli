@@ -124,6 +124,218 @@ fn register_returns_worker_id() {
     );
 }
 
+/// Issue #43: registering with `--worker-id` uses the supplied id verbatim,
+/// and re-registering with the same id+name+role is an idempotent claim
+/// (returns the same id without creating a duplicate worker).
+#[test]
+fn register_with_worker_id_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-claim";
+    let _broker = start_broker(&dir, cell_id);
+
+    let supplied_id = "w-fixed-id-for-test";
+
+    let first = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "test worker",
+            "--worker-id",
+            supplied_id,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_json: serde_json::Value =
+        serde_json::from_slice(&first).expect("stdout should be valid JSON");
+    assert_eq!(first_json["worker_id"], supplied_id);
+
+    // Re-register with the same id+name+role: should claim, not duplicate.
+    let second = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "test worker",
+            "--worker-id",
+            supplied_id,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second).expect("stdout should be valid JSON");
+    assert_eq!(second_json["worker_id"], supplied_id);
+
+    // Team should report exactly one worker.
+    let team = dispatch_cmd(&dir, cell_id)
+        .arg("team")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let team_json: serde_json::Value =
+        serde_json::from_slice(&team).expect("team stdout should be valid JSON");
+    let workers = team_json["workers"]
+        .as_array()
+        .expect("workers should be an array");
+    assert_eq!(
+        workers.len(),
+        1,
+        "claim must not create duplicates: {team_json}"
+    );
+    assert_eq!(workers[0]["id"], supplied_id);
+}
+
+/// Issue #43: `dispatch register --role-prompt <body> --for-agent` routes
+/// the prompt body to stdout and the JSON envelope to stderr — so when
+/// the spawned agent runs this command as its first tool call, the prompt
+/// body lands directly in the model's tool result.
+#[test]
+fn register_for_agent_routes_prompt_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-for-agent";
+    let _broker = start_broker(&dir, cell_id);
+
+    let prompt = "Run: dispatch listen --timeout 270";
+    let output = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "test worker",
+            "--worker-id",
+            "w-prompt-test",
+            "--role-prompt",
+            prompt,
+            "--for-agent",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+
+    // Byte-for-byte fidelity: the prompt body must land on stdout without
+    // an appended newline, so agents that feed stdout into a tool-result
+    // get exactly what the orchestrator stored.
+    assert_eq!(
+        stdout, prompt,
+        "prompt body must be written verbatim (no trailing newline)",
+    );
+    assert!(
+        stderr.contains("\"status\":\"ok\""),
+        "JSON envelope must be on stderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("w-prompt-test"),
+        "JSON envelope must contain worker_id: {stderr}",
+    );
+    // The stderr envelope must NOT duplicate the prompt body — stdout
+    // already carries it, and the log would otherwise bloat with (and
+    // potentially leak) the full role prompt on every --for-agent call.
+    assert!(
+        !stderr.contains(prompt),
+        "stderr envelope must not duplicate the role prompt body: {stderr}",
+    );
+}
+
+/// Issue #43: `--for-agent` without a stored prompt exits nonzero so the
+/// supervisor can restart rather than have the model see empty stdout.
+#[test]
+fn register_for_agent_without_prompt_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-for-agent-nopr";
+    let _broker = start_broker(&dir, cell_id);
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "no prompt here",
+            "--for-agent",
+        ])
+        .assert()
+        .failure();
+}
+
+/// Issue #43: an agent claim (re-register with same id) returns the prompt
+/// originally stored at orchestrator pre-register time. The claim itself
+/// passes no `--role-prompt`, so the broker must produce it from storage.
+#[test]
+fn register_claim_returns_originally_stored_prompt() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-claim-prompt";
+    let _broker = start_broker(&dir, cell_id);
+
+    let supplied_id = "w-claim-test";
+    let prompt = "Run: dispatch listen --timeout 270";
+
+    // Pre-register: orchestrator-style call carrying the prompt.
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "pre-register",
+            "--worker-id",
+            supplied_id,
+            "--role-prompt",
+            prompt,
+        ])
+        .assert()
+        .success();
+
+    // Agent claim: no --role-prompt, but --for-agent should return the stored one.
+    let output = dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "alice",
+            "--role",
+            "test-runner",
+            "--description",
+            "agent claim",
+            "--worker-id",
+            supplied_id,
+            "--for-agent",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout, prompt,
+        "claim must return exactly the prompt the orchestrator originally stored",
+    );
+}
+
 #[test]
 fn team_lists_registered_workers() {
     let dir = TempDir::new().unwrap();

@@ -46,6 +46,21 @@ pub enum BrokerRequest {
         /// If true, evict any existing worker with the same name.
         #[serde(default)]
         evict: bool,
+        /// Pre-assigned worker id from the orchestrator (issue #43). When set,
+        /// the broker uses this id instead of generating a UUID. If a worker
+        /// with this id already exists and matches the supplied name+role,
+        /// the call is treated as an idempotent claim — useful when dispatch
+        /// pre-registers a worker server-side and the spawned agent then
+        /// re-issues `dispatch register` to fetch its prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_id: Option<String>,
+        /// Role prompt body to associate with this worker (issue #43). Only
+        /// the orchestrator sets this — at pre-register time it loads the
+        /// agent's `prompt_file` and ships the content here so the spawned
+        /// agent can fetch it back as the response body of its own
+        /// `dispatch register` call. Agents never set this themselves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_prompt: Option<String>,
     },
     /// List active workers.
     Team {
@@ -116,6 +131,17 @@ pub enum BrokerRequest {
     AgentStop { name: String },
     /// Restart a managed agent by name (stop then start).
     AgentRestart { name: String },
+}
+
+/// Payload for a `ResponsePayload::Timeout`. Wrapped in its own struct so
+/// `deny_unknown_fields` can apply (variant-level attribute isn't supported
+/// in this serde version) — see the doc comment on the variant for why
+/// rejecting unknown fields is what makes `Timeout` and `WorkerRegistered`
+/// distinguishable in the untagged enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeoutPayload {
+    pub worker_id: String,
 }
 
 /// Summary of a worker's status for the status query response.
@@ -190,8 +216,27 @@ pub enum ResponsePayload {
     HeartbeatAck { worker_id: String, expires_at: u64 },
     /// List of active workers.
     WorkerList { workers: Vec<Worker> },
-    /// A worker was registered; returns the assigned worker ID.
-    WorkerRegistered { worker_id: String },
+    /// Listen timed out with no messages. MUST appear before
+    /// `WorkerRegistered`: serde's untagged dispatcher treats `Option`
+    /// fields as defaultable, so a payload `{"worker_id":"x"}` would
+    /// otherwise silently deserialize as
+    /// `WorkerRegistered { role_prompt: None }` (declared further down)
+    /// and the timeout signal would be lost. The `deny_unknown_fields`
+    /// on `TimeoutPayload` stops Timeout from swallowing payloads that
+    /// DO carry `role_prompt` — those fall through to `WorkerRegistered`
+    /// as intended. (Variant-level `deny_unknown_fields` is not supported
+    /// in this serde version, hence the wrapper struct.)
+    Timeout(TimeoutPayload),
+    /// A worker was registered; returns the assigned worker ID. When the
+    /// broker has a role prompt stored for this worker (issue #43), it is
+    /// returned here so the spawned agent receives its first instructions
+    /// as the response body of its own `dispatch register` call. The
+    /// `role_prompt` field is always serialized (even when `None`) so the
+    /// wire shape is unambiguously distinct from `Timeout` above.
+    WorkerRegistered {
+        worker_id: String,
+        role_prompt: Option<String>,
+    },
     /// Message acknowledgement confirmed. MUST appear before `MessageAck`:
     /// serde's untagged deserializer tries variants in declaration order and
     /// ignores unknown fields, so an `AckConfirm` payload would otherwise
@@ -208,8 +253,6 @@ pub enum ResponsePayload {
     EventList { events: Vec<serde_json::Value> },
     /// Message history query result.
     MessageList { messages: Vec<Message> },
-    /// Listen timed out with no messages.
-    Timeout { worker_id: String },
     /// Map of arbitrary key-value data (used as a flexible response shape).
     Data {
         data: HashMap<String, serde_json::Value>,
@@ -233,6 +276,19 @@ mod tests {
                 capabilities: vec!["rust".into()],
                 ttl_secs: None,
                 evict: false,
+                worker_id: None,
+                role_prompt: None,
+            },
+            // Pre-assigned worker_id + role_prompt (issue #43) must round-trip cleanly.
+            BrokerRequest::Register {
+                name: "w1".into(),
+                role: "builder".into(),
+                description: "test".into(),
+                capabilities: vec!["rust".into()],
+                ttl_secs: None,
+                evict: false,
+                worker_id: Some("w-fixed-id".into()),
+                role_prompt: Some("Run: dispatch listen --timeout 270".into()),
             },
             BrokerRequest::Team { from: None },
             BrokerRequest::Send {
@@ -300,6 +356,12 @@ mod tests {
         let payloads = vec![
             ResponsePayload::WorkerRegistered {
                 worker_id: "abc".into(),
+                role_prompt: None,
+            },
+            // Issue #43: WorkerRegistered must round-trip with a prompt body too.
+            ResponsePayload::WorkerRegistered {
+                worker_id: "abc".into(),
+                role_prompt: Some("Run: dispatch listen --timeout 270".into()),
             },
             ResponsePayload::MessageAck {
                 message_id: "msg-1".into(),
@@ -328,9 +390,9 @@ mod tests {
                 to: "w1".into(),
                 body: "payload".into(),
             },
-            ResponsePayload::Timeout {
+            ResponsePayload::Timeout(TimeoutPayload {
                 worker_id: "w1".into(),
-            },
+            }),
             ResponsePayload::AckConfirm {
                 message_id: "msg-2".into(),
                 ack_confirmed: true,
@@ -414,6 +476,62 @@ mod tests {
             } => assert!(ack_confirmed),
             other => panic!("expected AckConfirm, got {other:?}"),
         }
+    }
+
+    /// Regression: `WorkerRegistered { role_prompt: None }` and `Timeout`
+    /// would both serialize to `{"worker_id":"..."}` if `role_prompt` were
+    /// skipped on `None`, and the untagged deserializer would always pick
+    /// the first matching variant — silently swapping `Timeout` into
+    /// `WorkerRegistered` or vice versa. Match-arm on the variant (not on
+    /// JSON equality, which is unable to detect this) so any future change
+    /// that reintroduces field-skipping or drops `deny_unknown_fields` on
+    /// `TimeoutPayload` fails this test.
+    #[test]
+    fn timeout_does_not_degrade_to_worker_registered() {
+        let payload = ResponsePayload::Timeout(TimeoutPayload {
+            worker_id: "w1".into(),
+        });
+        let resp = BrokerResponse::Ok { payload };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: BrokerResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                back,
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::Timeout(_)
+                }
+            ),
+            "Timeout round-tripped as the wrong variant: {json}"
+        );
+
+        // Symmetric: the no-prompt WorkerRegistered case must NOT degrade to
+        // Timeout either. With `role_prompt` always serialized, both forms
+        // (Some and None) carry the field. `TimeoutPayload`'s
+        // `deny_unknown_fields` rejects the `role_prompt` key, so untagged
+        // dispatch falls through to `WorkerRegistered`.
+        let payload = ResponsePayload::WorkerRegistered {
+            worker_id: "w1".into(),
+            role_prompt: None,
+        };
+        let resp = BrokerResponse::Ok { payload };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"role_prompt\":null"),
+            "role_prompt must be serialized even when None to keep Timeout/WorkerRegistered distinguishable: {json}"
+        );
+        let back: BrokerResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                back,
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::WorkerRegistered {
+                        role_prompt: None,
+                        ..
+                    }
+                }
+            ),
+            "WorkerRegistered with None prompt round-tripped as the wrong variant: {json}"
+        );
     }
 
     /// BrokerResponse::Error round-trips correctly.

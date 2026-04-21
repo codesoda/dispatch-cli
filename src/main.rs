@@ -8,7 +8,7 @@ use dispatch::cli::{AgentAction, Cli, Commands, HookAction};
 use dispatch::config::resolve_config;
 use dispatch::hooks;
 use dispatch::logging::init_tracing;
-use dispatch::protocol::BrokerRequest;
+use dispatch::protocol::{BrokerRequest, BrokerResponse, ResponsePayload};
 
 /// Parse a timestamp string as either a relative duration (e.g. "5m", "1h", "30s")
 /// or an absolute Unix timestamp. Returns a Unix timestamp in seconds.
@@ -95,6 +95,16 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
             backend.serve().await?;
         }
         cmd => {
+            // Issue #43: when `dispatch register --for-agent` is invoked,
+            // route the prompt body to stdout (so it lands in the model's
+            // tool result) and the structured envelope to stderr.
+            let for_agent = matches!(
+                &cmd,
+                Commands::Register {
+                    for_agent: true,
+                    ..
+                }
+            );
             let request = match cmd {
                 Commands::Init => unreachable!(),
                 Commands::Serve { .. } => unreachable!(),
@@ -105,6 +115,9 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     capabilities,
                     ttl,
                     evict,
+                    worker_id,
+                    role_prompt,
+                    for_agent: _,
                 } => BrokerRequest::Register {
                     name,
                     role,
@@ -112,6 +125,8 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     capabilities,
                     ttl_secs: ttl,
                     evict,
+                    worker_id,
+                    role_prompt,
                 },
                 Commands::Team => BrokerRequest::Team {
                     from: cli.from.clone(),
@@ -199,8 +214,61 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 Commands::CodexHook { .. } | Commands::ClaudeHook { .. } => unreachable!(),
             };
             let response = backend.send_request(&request).await?;
-            let json = serde_json::to_string(&response)?;
-            println!("{json}");
+            if for_agent {
+                // Prompt body to stdout, JSON envelope to stderr. If the
+                // broker has no prompt stored for this worker, exit nonzero
+                // — the agent has nothing to do and the supervisor should
+                // restart rather than have the model see empty stdout.
+                match &response {
+                    BrokerResponse::Ok {
+                        payload:
+                            ResponsePayload::WorkerRegistered {
+                                worker_id,
+                                role_prompt: Some(prompt),
+                            },
+                    } => {
+                        // Write the prompt body verbatim (no trailing newline
+                        // added) so the agent receives byte-for-byte what the
+                        // orchestrator stored.
+                        use std::io::Write as _;
+                        let mut stdout = std::io::stdout().lock();
+                        stdout.write_all(prompt.as_bytes())?;
+                        stdout.flush()?;
+
+                        // Strip `role_prompt` from the stderr envelope so the
+                        // prompt body isn't duplicated into agent logs.
+                        let stripped = BrokerResponse::Ok {
+                            payload: ResponsePayload::WorkerRegistered {
+                                worker_id: worker_id.clone(),
+                                role_prompt: None,
+                            },
+                        };
+                        let json = serde_json::to_string(&stripped)?;
+                        eprintln!("{json}");
+                    }
+                    // `send_request` returns `Ok(BrokerResponse::Error { .. })`
+                    // for broker-side errors (e.g. worker_id collision when
+                    // DISPATCH_AGENT_NAME drifted from what was pre-registered).
+                    // Forward `message` verbatim via a typed error so the
+                    // exit-code classifier in `main` stays authoritative.
+                    BrokerResponse::Error { message } => {
+                        return Err(dispatch::errors::DispatchError::RegisterForAgentFailed {
+                            message: message.clone(),
+                        });
+                    }
+                    _ => {
+                        // Log the unexpected JSON envelope to stderr before
+                        // bubbling the typed error — useful for debugging a
+                        // response shape that shouldn't happen in practice.
+                        let json = serde_json::to_string(&response)?;
+                        eprintln!("{json}");
+                        return Err(dispatch::errors::DispatchError::NoRolePromptReturned);
+                    }
+                }
+            } else {
+                let json = serde_json::to_string(&response)?;
+                println!("{json}");
+            }
         }
     }
 

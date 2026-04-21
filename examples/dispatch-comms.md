@@ -19,7 +19,23 @@ A vendor Stop hook may also remind you to keep listening by injecting a "do not 
 
 ## Register yourself
 
-Before you can send or receive messages, register with the broker:
+Before you can send or receive messages, register with the broker. There are two modes depending on how you were started.
+
+### Managed agents (dispatch spawned you)
+
+If `$DISPATCH_WORKER_ID` is set in your environment, dispatch pre-registered a worker for you and stored your role prompt under that id. Claim it:
+
+```bash
+dispatch register --worker-id "$DISPATCH_WORKER_ID" \
+  --name "$DISPATCH_AGENT_NAME" --role "$DISPATCH_AGENT_ROLE" \
+  --description "<what you do>" --for-agent
+```
+
+The `--for-agent` flag prints your role prompt body to stdout (so it lands in your tool result as your next set of instructions). The `worker_id` returned matches `$DISPATCH_WORKER_ID` — keep using it for all subsequent commands.
+
+### Unmanaged agents (you were launched manually)
+
+If `$DISPATCH_WORKER_ID` is unset, you're responsible for picking your own identity:
 
 ```bash
 dispatch register --name <YOUR_NAME> --role <YOUR_ROLE> \

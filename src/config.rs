@@ -51,6 +51,10 @@ pub struct ResolvedAgentConfig {
     /// substitution in command-adapter shell strings.
     pub prompt_file_path: Option<PathBuf>,
     pub ttl: Option<u64>,
+    /// Issue #43: when true, the claude adapter is launched with
+    /// `--output-format stream-json --verbose` so per-tool-use entries
+    /// appear in the agent log.
+    pub stream_json: bool,
     /// Whether `dispatch serve` should auto-launch and supervise this agent.
     pub launch: bool,
 }
@@ -128,6 +132,13 @@ pub struct AgentConfig {
     /// Whether `dispatch serve --launch` should auto-start this agent.
     #[serde(default)]
     pub launch: bool,
+    /// Issue #43: when true, the claude adapter is launched with
+    /// `--output-format stream-json --verbose` so per-tool-use entries
+    /// appear in the agent log. Verification mechanism — without it, a
+    /// hallucinated register call and a real one are visually identical
+    /// in the log. Default off so logs stay quiet for normal use.
+    #[serde(default)]
+    pub stream_json: bool,
 }
 
 /// On-disk main agent definition.
@@ -147,6 +158,23 @@ fn resolve_agent_config(
     project_root: &Path,
 ) -> Result<ResolvedAgentConfig, DispatchError> {
     use crate::adapter::Adapter;
+
+    // Reject names that can't be used as a single on-disk filename
+    // component. The HTTP boundaries (`api_agent_start/stop/restart`) already
+    // gate on `is_safe_name`, but the `launch_all` / `spawn_agent` path
+    // derives the issue-#43 boot-prompt filename from `sanitize_name`, which
+    // lossily collapses non-`[A-Za-z0-9_-]` characters to `_`. Two configs
+    // like `alice/foo` and `alice_foo` would both map to
+    // `alice_foo.boot.prompt`, silently overwriting each other. Enforce the
+    // same rule at config time so both paths use the identical gate.
+    if !crate::backend::orchestrator::is_safe_name(&agent.name) {
+        return Err(DispatchError::AgentConfigError {
+            name: agent.name.clone(),
+            reason:
+                "agent name must be non-empty and contain only ASCII alphanumerics, '-', or '_'"
+                    .into(),
+        });
+    }
 
     if agent.adapter == Adapter::Command && agent.command.is_none() {
         return Err(DispatchError::AgentConfigError {
@@ -203,6 +231,7 @@ fn resolve_agent_config(
         prompt,
         prompt_file_path,
         ttl: agent.ttl,
+        stream_json: agent.stream_json,
         launch: agent.launch,
     })
 }
@@ -261,16 +290,33 @@ const CONFIG_TEMPLATE: &str = "\
 # port = 8384
 # open = true  # open the dashboard in your default browser
 
-# Agent definitions — auto-started by `dispatch serve --launch` when launch = true
+# Agent definitions — auto-started by `dispatch serve --launch` when launch = true.
+#
+# When `launch = true` AND `prompt_file` is set (the managed-agent flow),
+# dispatch pre-registers the worker server-side at spawn time, injects
+# DISPATCH_WORKER_ID into the agent's environment, and feeds the agent a
+# one-line boot prompt. The first thing the model does is run
+# `dispatch register --worker-id \"$DISPATCH_WORKER_ID\" ... --for-agent`,
+# whose response body is the contents of `prompt_file` — so the role prompt
+# lands in the model's tool result instead of being narrated up front (this
+# kills a class of hallucination where the model fakes the register step).
+#
+# When `launch = false`, dispatch prints the command for you to copy into a
+# separate terminal and the agent registers itself the legacy way.
+#
 # [[agents]]
 # name = \"reviewer\"
 # role = \"code-reviewer\"
 # description = \"Reviews code changes\"
 # adapter = \"claude\"                            # one of: command | claude | codex
 # extra_args = [\"--model\", \"sonnet\"]          # appended to the adapter's argv
-# prompt_file = \"prompts/reviewer.md\"
+# prompt_file = \"prompts/reviewer.md\"            # role prompt body (see above)
 # launch = true
 # ttl = 3600
+# stream_json = false                            # when true, claude is launched with
+#                                                # `--output-format stream-json --verbose`
+#                                                # so per-tool-use entries appear in the
+#                                                # agent log (issue #43 verification).
 #
 # # `command` adapter — for bash-script / non-LLM workers:
 # [[agents]]
@@ -644,6 +690,39 @@ launch = true
         assert!(a.launch);
         assert!(a.command.is_none());
         assert!(a.prompt_file_path.is_some());
+        // Issue #43: stream_json defaults to false so existing configs see
+        // no behavior change.
+        assert!(!a.stream_json, "stream_json must default to false");
+    }
+
+    /// Issue #43: `stream_json = true` round-trips through TOML and lands
+    /// on the resolved config. Verified separately by the claude adapter
+    /// test that translates this flag into argv.
+    #[test]
+    fn agent_config_parses_stream_json_flag() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("reviewer.md");
+        fs::write(&prompt_path, "you are a reviewer").unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "reviewer"
+role = "reviewer"
+description = "reviews"
+adapter = "claude"
+prompt_file = "reviewer.md"
+stream_json = true
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert!(
+            resolved.agents[0].stream_json,
+            "stream_json = true in TOML must land on the resolved config",
+        );
     }
 
     #[test]
@@ -780,5 +859,33 @@ adapter = "gpt"
         .unwrap();
 
         assert!(resolve_config_inner(None, None, None, tmp.path()).is_err());
+    }
+
+    /// Agent names must pass `is_safe_name` at resolve time so the
+    /// boot-prompt filename (derived via lossy `sanitize_name`) cannot
+    /// collide across distinct raw names under `dispatch serve --launch`.
+    #[test]
+    fn agent_config_rejects_name_with_unsafe_characters() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "alice/foo"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alice/foo") && msg.contains("ASCII"),
+            "expected safe-name rejection for 'alice/foo', got: {msg}"
+        );
     }
 }

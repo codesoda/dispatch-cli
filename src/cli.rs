@@ -72,6 +72,32 @@ pub enum Commands {
         /// Evict any existing worker with the same name before registering
         #[arg(long)]
         evict: bool,
+
+        /// Pre-assigned worker id (issue #43). When set, the broker uses
+        /// this id rather than generating one. If a worker with this id
+        /// already exists with the same name+role, the call is treated as
+        /// an idempotent claim — used by spawned agents to attach to a
+        /// worker that dispatch pre-registered for them at spawn time.
+        #[arg(long = "worker-id")]
+        worker_id: Option<String>,
+
+        /// Role prompt body to associate with this worker (issue #43).
+        /// Only the orchestrator passes this — at pre-register time it
+        /// loads the agent's `prompt_file` and ships the content here so
+        /// the spawned agent can fetch it back via `--for-agent`.
+        #[arg(long = "role-prompt")]
+        role_prompt: Option<String>,
+
+        /// Route the role prompt body to stdout (for downstream LLM tool
+        /// result consumption); the JSON envelope is redirected to stderr
+        /// with `role_prompt` stripped (issue #43). Intentional CLI wart
+        /// whose only purpose is to be friendly to a downstream LLM tool
+        /// result: the spawned agent's first tool call is `dispatch
+        /// register --for-agent`, and the prompt body landing on stdout
+        /// becomes its next instruction. Without the flag, behavior is
+        /// unchanged.
+        #[arg(long = "for-agent")]
+        for_agent: bool,
     },
 
     /// List active workers in the current cell

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-21
+
+### Added
+- Dispatch now pre-registers `launch = true` agents with a `prompt_file` server-side at spawn time, injects `DISPATCH_WORKER_ID` into the agent's environment, and feeds the model a one-line boot prompt (`Run: dispatch register --worker-id "$DISPATCH_WORKER_ID" ... --for-agent`). The model's first observable action is a real tool call by construction — eliminates a class of hallucination where agents skipped `dispatch register` and emitted fabricated status messages (issue #43).
+- `BrokerRequest::Register` accepts `worker_id: Option<String>` and `role_prompt: Option<String>`. Re-registering an existing id with a matching name+role is an idempotent claim (same id returned, TTL renewed); a mismatched claim is rejected. The broker stores the supplied prompt keyed by worker id and returns it in the `WorkerRegistered` response so a spawned agent can fetch its role prompt as its first tool result.
+- `dispatch register --worker-id <id>` — CLI flag for claiming a pre-assigned worker id.
+- `dispatch register --role-prompt <body>` — CLI flag used by the orchestrator to ship prompt content into the broker.
+- `dispatch register --for-agent` — routes the role prompt body to stdout and the JSON envelope to stderr. Exits nonzero when no prompt is stored so the supervisor can restart.
+- `stream_json = true` on `[[agents]]` entries — launches the claude adapter with `--output-format stream-json --verbose` so per-tool-use entries appear in the agent log. Verification mechanism for the pre-register work: without it, hallucinated and real `dispatch register` calls are indistinguishable in the log.
+- Supervisor re-registers managed workers on every respawn (idempotent claim renews TTL, fresh-creates if the record was garbage-collected during downtime).
+
+### Changed
+- `launch = false` agents are unchanged — they continue to register themselves via the legacy stdin-pipe flow. The new pre-register machinery is opt-in via `launch = true` + a configured `prompt_file`.
+- `examples/dispatch-comms.md` splits the "Register yourself" guidance into managed (`$DISPATCH_WORKER_ID` present → claim with `--for-agent`) and unmanaged (legacy self-register) sections.
+
 ## [0.4.1] - 2026-04-19
 
 ### Added

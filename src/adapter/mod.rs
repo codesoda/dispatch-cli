@@ -47,6 +47,10 @@ pub struct BuildContext<'a> {
     pub prompt_inline: Option<&'a str>,
     /// Full shell command — only used by the `command` adapter.
     pub command_string: Option<&'a str>,
+    /// Issue #43: when true, the claude adapter appends
+    /// `--output-format stream-json --verbose` so per-tool-use entries
+    /// appear in the agent log. Other adapters ignore this flag.
+    pub stream_json: bool,
 }
 
 /// The result of an adapter building a launch specification.

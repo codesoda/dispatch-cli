@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -15,6 +16,27 @@ use crate::protocol::{
     BrokerRequest, BrokerResponse, Message, ResponsePayload, StatusEntry, Worker,
     STATUS_HISTORY_MAX,
 };
+
+/// Errors returned by `BrokerState` mutations. Distinct from `DispatchError`
+/// because the broker is process-internal — these are translated at the IPC
+/// boundary into `BrokerResponse::Error { message }` (whose `message` is
+/// this enum's `Display`) and at the orchestrator boundary into
+/// `DispatchError::AgentLaunchFailed`. Keeping them typed lets call sites
+/// match on the variant (e.g. distinguish a collision from a future "not
+/// found" or "quota exceeded") instead of string-matching on `format!` output.
+#[derive(Debug, Error)]
+pub enum BrokerError {
+    #[error(
+        "worker_id {supplied} already registered as {existing_name}/{existing_role} -- supplied {requested_name}/{requested_role} does not match"
+    )]
+    WorkerIdCollision {
+        supplied: String,
+        existing_name: String,
+        existing_role: String,
+        requested_name: String,
+        requested_role: String,
+    },
+}
 
 /// Default worker TTL in seconds (1 hour).
 const DEFAULT_WORKER_TTL_SECS: u64 = 3600;
@@ -162,6 +184,11 @@ pub struct BrokerState {
     pub messages_delivered: u64,
     /// Total number of requests handled.
     pub requests_handled: u64,
+    /// Per-worker role-prompt body keyed by worker ID (issue #43). Populated
+    /// at orchestrator pre-register time; returned in the `WorkerRegistered`
+    /// response when the spawned agent calls `dispatch register` to claim
+    /// its session. Absent for workers registered the legacy way.
+    pub role_prompts: HashMap<String, String>,
 }
 
 impl Default for BrokerState {
@@ -189,6 +216,7 @@ impl BrokerState {
             messages_sent: 0,
             messages_delivered: 0,
             requests_handled: 0,
+            role_prompts: HashMap::new(),
         }
     }
 
@@ -197,6 +225,29 @@ impl BrokerState {
     /// If `evict` is true and a worker with the same name already exists, the
     /// old registration is removed (including its mailbox and notifier) before
     /// the new one is created.
+    ///
+    /// If `worker_id` is `Some(id)` (issue #43 pre-register flow):
+    /// - When the id already exists with the same name+role, this is treated
+    ///   as an idempotent claim — the existing id is returned and TTL is
+    ///   renewed. This lets dispatch pre-register a worker server-side and
+    ///   the spawned agent then call `dispatch register` to fetch its prompt
+    ///   without creating a duplicate worker record.
+    /// - When the id already exists with a different name or role, the call
+    ///   is rejected with an error (config drift / collision).
+    /// - Otherwise, the supplied id is used verbatim.
+    ///
+    /// If `worker_id` is `None`, a fresh UUID is generated (legacy behavior).
+    ///
+    /// `role_prompt` (issue #43) is the agent's role prompt body. Only the
+    /// orchestrator passes it — at pre-register time it loads the agent's
+    /// prompt file and ships the content here. The broker stores it under
+    /// the worker id so the spawned agent can fetch it back via the
+    /// `WorkerRegistered` response of its own `dispatch register` claim.
+    /// Agents themselves never pass `role_prompt`, so the claim path leaves
+    /// the stored value untouched when `role_prompt` is `None`.
+    // Splitting these into a struct buys nothing — every caller passes them
+    // positionally and clippy's 7-arg threshold is an arbitrary heuristic.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_worker(
         &mut self,
         name: String,
@@ -205,7 +256,62 @@ impl BrokerState {
         capabilities: Vec<String>,
         ttl_secs: Option<u64>,
         evict: bool,
-    ) -> String {
+        worker_id: Option<String>,
+        role_prompt: Option<String>,
+    ) -> Result<String, BrokerError> {
+        // Prune expired workers up front — every other broker entry point
+        // (`list_workers`, `heartbeat_worker`, message / team / mailbox
+        // handlers) does this, and skipping it here opens a race where the
+        // issue-#43 pre-register path stores a role_prompt, the pre-registered
+        // worker's TTL elapses before the agent claims, another broker
+        // request (e.g. `listen`) drops it via its own `evict_expired` AND
+        // its `role_prompts` entry, the agent's subsequent claim misses the
+        // idempotent short-circuit and falls through to the insert branch,
+        // and the response carries `role_prompt: None`. With the preamble
+        // the failure is deterministic regardless of interleaving, and the
+        // supervisor's respawn-time re-register (evict=true, role_prompt
+        // populated) restores the prompt on the next attempt.
+        self.evict_expired();
+
+        // Idempotent-claim short-circuit: if the supplied id already exists
+        // and matches name+role, return it (and renew TTL) without touching
+        // the rest of the state. This must run BEFORE the evict pass so that
+        // a pre-registered worker can be claimed by its agent without being
+        // wiped by a same-name evict.
+        if let Some(ref supplied) = worker_id {
+            if let Some(existing) = self.workers.get_mut(supplied) {
+                if existing.name == name && existing.role == role {
+                    let ttl = ttl_secs.unwrap_or(self.default_ttl);
+                    existing.ttl_secs = ttl;
+                    existing.expires_at = now_secs() + ttl;
+                    // Refresh mutable metadata so a re-register with updated
+                    // config values isn't silently dropped. `capabilities` is
+                    // only overwritten when non-empty — agent-side claims pass
+                    // an empty vec and must not erase what the orchestrator
+                    // registered.
+                    existing.description = description;
+                    if !capabilities.is_empty() {
+                        existing.capabilities = capabilities;
+                    }
+                    let id = supplied.clone();
+                    // Only overwrite the stored prompt if the caller supplied
+                    // one — agent claims pass `None` and must not erase what
+                    // the orchestrator stored at pre-register time.
+                    if let Some(prompt) = role_prompt {
+                        self.role_prompts.insert(id.clone(), prompt);
+                    }
+                    return Ok(id);
+                }
+                return Err(BrokerError::WorkerIdCollision {
+                    supplied: supplied.clone(),
+                    existing_name: existing.name.clone(),
+                    existing_role: existing.role.clone(),
+                    requested_name: name,
+                    requested_role: role,
+                });
+            }
+        }
+
         if evict {
             let old_ids: Vec<String> = self
                 .workers
@@ -214,13 +320,11 @@ impl BrokerState {
                 .map(|(id, _)| id.clone())
                 .collect();
             for old_id in &old_ids {
-                self.workers.remove(old_id);
-                self.mailboxes.remove(old_id);
-                self.notifiers.remove(old_id);
+                self.remove_worker(old_id);
             }
         }
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = worker_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_secs();
         let ttl = ttl_secs.unwrap_or(self.default_ttl);
         let worker = Worker {
@@ -236,7 +340,22 @@ impl BrokerState {
             status_history: VecDeque::new(),
         };
         self.workers.insert(id.clone(), worker);
-        id
+        if let Some(prompt) = role_prompt {
+            self.role_prompts.insert(id.clone(), prompt);
+        }
+        Ok(id)
+    }
+
+    /// Remove a worker and all per-worker state (mailbox, notifier, role
+    /// prompt). Callers should route every worker removal through this so
+    /// the broker never retains partial state for a worker that no longer
+    /// exists — an invariant the issue-#43 pre-register cleanup path relies
+    /// on.
+    pub fn remove_worker(&mut self, id: &str) {
+        self.workers.remove(id);
+        self.mailboxes.remove(id);
+        self.notifiers.remove(id);
+        self.role_prompts.remove(id);
     }
 
     /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
@@ -251,9 +370,7 @@ impl BrokerState {
             .map(|(id, w)| (id.clone(), w.name.clone()))
             .collect();
         for (id, _) in &expired {
-            self.workers.remove(id);
-            self.mailboxes.remove(id);
-            self.notifiers.remove(id);
+            self.remove_worker(id);
         }
         expired
     }
@@ -702,6 +819,7 @@ pub async fn serve(
         &config.agent_cwd,
         log_dir.clone(),
         config.agents.clone(),
+        Arc::clone(&state),
     )));
 
     // Optionally start the HTTP monitor dashboard.
@@ -891,16 +1009,27 @@ async fn handle_request(
             capabilities,
             ttl_secs,
             evict,
+            worker_id,
+            role_prompt,
         } => {
             let mut state = state.lock().await;
-            let worker_id = state.register_worker(
+            let worker_id = match state.register_worker(
                 name.clone(),
                 role.clone(),
                 description,
                 capabilities,
                 ttl_secs,
                 evict,
-            );
+                worker_id,
+                role_prompt,
+            ) {
+                Ok(id) => id,
+                Err(err) => {
+                    let message = err.to_string();
+                    tracing::warn!(%message, "register rejected");
+                    return BrokerResponse::Error { message };
+                }
+            };
             tracing::info!(worker_id = %worker_id, "worker registered");
             state.emit_and_record(
                 event_tx,
@@ -913,8 +1042,15 @@ async fn handle_request(
                     "role": role,
                 })),
             );
+            // Issue #43: include the stored role prompt (if any) so the
+            // spawned agent receives its first instructions as the response
+            // body of its own `dispatch register` claim.
+            let role_prompt = state.role_prompts.get(&worker_id).cloned();
             BrokerResponse::Ok {
-                payload: ResponsePayload::WorkerRegistered { worker_id },
+                payload: ResponsePayload::WorkerRegistered {
+                    worker_id,
+                    role_prompt,
+                },
             }
         }
         BrokerRequest::Team { from } => {
@@ -1078,14 +1214,18 @@ async fn handle_request(
                     // Spurious wake — treat as timeout.
                     tracing::debug!(worker_id = %worker_id, "listen: spurious wake, returning timeout");
                     BrokerResponse::Ok {
-                        payload: ResponsePayload::Timeout { worker_id },
+                        payload: ResponsePayload::Timeout(crate::protocol::TimeoutPayload {
+                            worker_id,
+                        }),
                     }
                 }
             } else {
                 // Timed out.
                 tracing::debug!(worker_id = %worker_id, timeout, "listen: timed out");
                 BrokerResponse::Ok {
-                    payload: ResponsePayload::Timeout { worker_id },
+                    payload: ResponsePayload::Timeout(crate::protocol::TimeoutPayload {
+                        worker_id,
+                    }),
                 }
             }
         }
@@ -1220,14 +1360,36 @@ async fn handle_request(
         }
         BrokerRequest::AgentStart { name } => {
             let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
-            let mut orch = orchestrator.lock().await;
-            match orch.start_by_name(&resolved).await {
-                Ok(()) => BrokerResponse::Ok {
-                    payload: ResponsePayload::Ack {},
-                },
-                Err(e) => BrokerResponse::Error {
-                    message: format!("agent start failed: {e}"),
-                },
+            // Three-phase pattern (PR #28 / #43): release the orchestrator
+            // mutex during the heavy spawn await so concurrent dashboard
+            // polls and other broker requests don't stall on file IO +
+            // pre-register + spawn_child_process.
+            let (config, ctx) = {
+                let mut orch = orchestrator.lock().await;
+                let config = match orch.check_can_start(&resolved) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return BrokerResponse::Error {
+                            message: format!("agent start failed: {e}"),
+                        };
+                    }
+                };
+                (config, orch.snapshot_spawn_context())
+            };
+            let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
+                Ok(p) => p,
+                Err(e) => {
+                    // Release the phase 1 reservation so future starts
+                    // of this name aren't blocked by a stale slot.
+                    orchestrator.lock().await.cancel_start(&resolved);
+                    return BrokerResponse::Error {
+                        message: format!("agent start failed: {e}"),
+                    };
+                }
+            };
+            orchestrator.lock().await.register_pending(pending);
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
             }
         }
         BrokerRequest::AgentStop { name } => {
@@ -1270,14 +1432,32 @@ async fn handle_request(
             if let Some(h) = handle {
                 let _ = h.await;
             }
-            let mut orch = orchestrator.lock().await;
-            match orch.start_by_name(&resolved).await {
-                Ok(()) => BrokerResponse::Ok {
-                    payload: ResponsePayload::Ack {},
-                },
-                Err(e) => BrokerResponse::Error {
-                    message: format!("agent restart failed: {e}"),
-                },
+            // Same three-phase pattern as AgentStart for the respawn.
+            let (config, ctx) = {
+                let mut orch = orchestrator.lock().await;
+                let config = match orch.check_can_start(&resolved) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return BrokerResponse::Error {
+                            message: format!("agent restart failed: {e}"),
+                        };
+                    }
+                };
+                (config, orch.snapshot_spawn_context())
+            };
+            let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
+                Ok(p) => p,
+                Err(e) => {
+                    // Release the phase 3 reservation on build failure.
+                    orchestrator.lock().await.cancel_start(&resolved);
+                    return BrokerResponse::Error {
+                        message: format!("agent restart failed: {e}"),
+                    };
+                }
+            };
+            orchestrator.lock().await.register_pending(pending);
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
             }
         }
     }
@@ -1572,25 +1752,324 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    /// Issue #43: when an id is supplied, the broker uses it verbatim.
+    #[test]
+    fn test_register_worker_uses_supplied_id() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("register");
+        assert_eq!(id, "w-fixed");
+        assert!(state.workers.contains_key("w-fixed"));
+    }
+
+    /// Issue #43: re-registering an existing id with the same name+role is an
+    /// idempotent claim — same id returned, no duplicate worker, TTL renewed.
+    #[test]
+    fn test_register_worker_idempotent_claim_renews_ttl() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                Some(60),
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("first register");
+        // Force the expiry into the past so we can detect the renewal.
+        state.workers.get_mut(&id).unwrap().expires_at = 0;
+
+        let id2 = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                Some(60),
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("idempotent claim");
+        assert_eq!(id, id2);
+        assert_eq!(state.workers.len(), 1, "no duplicate worker created");
+        assert!(
+            state.workers.get(&id).unwrap().expires_at > 0,
+            "claim should renew TTL",
+        );
+    }
+
+    /// Issue #43: an idempotent claim with updated `description` /
+    /// `capabilities` must refresh the stored worker record so `dispatch
+    /// team` reflects current config — stale metadata from the initial
+    /// pre-register otherwise lingers. Empty capabilities (agent-side
+    /// claim shape) must NOT clobber the stored list.
+    #[test]
+    fn test_register_worker_idempotent_claim_updates_metadata() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "original description".into(),
+                vec!["cap-a".into(), "cap-b".into()],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("first register");
+
+        // Re-register with a new description and fresh capabilities —
+        // both must flow through to the stored worker.
+        state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "updated description".into(),
+                vec!["cap-c".into()],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim with updated metadata");
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.description, "updated description");
+        assert_eq!(w.capabilities, vec!["cap-c".to_string()]);
+
+        // Agent-style claim with empty capabilities must preserve the
+        // existing list rather than blanking it.
+        state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "third description".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("agent-style claim");
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.description, "third description");
+        assert_eq!(
+            w.capabilities,
+            vec!["cap-c".to_string()],
+            "empty capabilities must not wipe stored list",
+        );
+    }
+
+    /// Issue #43: re-registering an existing id with a *different* name or
+    /// role is rejected — silent overwriting would mask config drift.
+    #[test]
+    fn test_register_worker_collision_rejected() {
+        let mut state = BrokerState::new();
+        state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("first register");
+        let err = state
+            .register_worker(
+                "bob".into(),
+                "reviewer".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect_err("collision must be rejected");
+        assert!(
+            matches!(
+                err,
+                BrokerError::WorkerIdCollision { ref supplied, ref existing_name, .. }
+                    if supplied == "w-fixed" && existing_name == "alice"
+            ),
+            "expected WorkerIdCollision for w-fixed/alice, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("w-fixed"),
+            "error display should name the colliding id: {msg}"
+        );
+        assert!(
+            msg.contains("alice"),
+            "error display should name the existing worker: {msg}"
+        );
+        // The original worker is still there, untouched.
+        assert_eq!(state.workers.len(), 1);
+        assert_eq!(state.workers.get("w-fixed").unwrap().name, "alice");
+    }
+
+    /// Issue #43: a fresh registration with `role_prompt` stores the prompt
+    /// keyed by worker id; subsequent claims with `role_prompt: None` see
+    /// the stored prompt back via `role_prompts`.
+    #[test]
+    fn test_register_worker_stores_and_returns_role_prompt() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                Some("Run: dispatch listen --timeout 270".into()),
+            )
+            .expect("pre-register");
+        assert_eq!(
+            state.role_prompts.get(&id).map(String::as_str),
+            Some("Run: dispatch listen --timeout 270"),
+        );
+
+        // Agent claim with role_prompt=None must NOT erase the stored prompt.
+        let claimed = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim");
+        assert_eq!(claimed, id);
+        assert_eq!(
+            state.role_prompts.get(&id).map(String::as_str),
+            Some("Run: dispatch listen --timeout 270"),
+            "claim must not erase the stored prompt",
+        );
+    }
+
+    /// Issue #43: evicting a worker (via `evict=true` or TTL expiry) drops
+    /// its stored prompt too — no stale prompts left behind.
+    #[test]
+    fn test_register_worker_evict_clears_role_prompt() {
+        let mut state = BrokerState::new();
+        let first = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                Some("first prompt".into()),
+            )
+            .expect("first");
+        // Evict and re-register with a different id. Old prompt must be gone.
+        let second = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                true,
+                None,
+                Some("second prompt".into()),
+            )
+            .expect("evict + re-register");
+        assert_ne!(first, second);
+        assert!(
+            !state.role_prompts.contains_key(&first),
+            "evicted worker's prompt must be cleared",
+        );
+        assert_eq!(
+            state.role_prompts.get(&second).map(String::as_str),
+            Some("second prompt"),
+        );
+    }
+
+    /// Idempotent claim runs BEFORE evict, so a same-name evict cannot wipe a
+    /// pre-registered worker that an agent is about to claim.
+    #[test]
+    fn test_register_worker_claim_beats_evict() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("pre-register");
+        let claimed = state
+            .register_worker(
+                "alice".into(),
+                "test-runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                true, // evict
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim should win over evict");
+        assert_eq!(id, claimed);
+        assert_eq!(state.workers.len(), 1);
+    }
+
     #[test]
     fn test_register_worker_returns_unique_ids() {
         let mut state = BrokerState::new();
-        let id1 = state.register_worker(
-            "worker-a".into(),
-            "planner".into(),
-            "Plans things".into(),
-            vec!["plan:create plans".into()],
-            None,
-            false,
-        );
-        let id2 = state.register_worker(
-            "worker-b".into(),
-            "coder".into(),
-            "Writes code".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id1 = state
+            .register_worker(
+                "worker-a".into(),
+                "planner".into(),
+                "Plans things".into(),
+                vec!["plan:create plans".into()],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
+        let id2 = state
+            .register_worker(
+                "worker-b".into(),
+                "coder".into(),
+                "Writes code".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         assert_ne!(id1, id2, "each registration must produce a unique ID");
         assert_eq!(state.workers.len(), 2);
     }
@@ -1598,14 +2077,18 @@ mod tests {
     #[test]
     fn test_register_worker_stores_fields() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "my-worker".into(),
-            "reviewer".into(),
-            "Reviews pull requests".into(),
-            vec!["review:code".into(), "review:docs".into()],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "my-worker".into(),
+                "reviewer".into(),
+                "Reviews pull requests".into(),
+                vec!["review:code".into(), "review:docs".into()],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let worker = state.workers.get(&id).unwrap();
         assert_eq!(worker.name, "my-worker");
         assert_eq!(worker.role, "reviewer");
@@ -1621,14 +2104,18 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let id = state.register_worker(
-            "ttl-worker".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "ttl-worker".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let worker = state.workers.get(&id).unwrap();
         // Should expire roughly DEFAULT_WORKER_TTL_SECS from now.
         assert!(worker.expires_at >= now + DEFAULT_WORKER_TTL_SECS - 1);
@@ -1638,14 +2125,18 @@ mod tests {
     #[test]
     fn test_evict_expired_workers() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "soon-expired".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "soon-expired".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         // Manually set expiry to the past.
         state.workers.get_mut(&id).unwrap().expires_at = 0;
         state.evict_expired();
@@ -1770,22 +2261,30 @@ mod tests {
     #[test]
     fn test_list_workers_excludes_expired() {
         let mut state = BrokerState::new();
-        let active_id = state.register_worker(
-            "active".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
-        let expired_id = state.register_worker(
-            "expired".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let active_id = state
+            .register_worker(
+                "active".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
+        let expired_id = state
+            .register_worker(
+                "expired".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         // Expire one worker.
         state.workers.get_mut(&expired_id).unwrap().expires_at = 0;
 
@@ -1797,14 +2296,18 @@ mod tests {
     #[test]
     fn test_heartbeat_worker_renews_ttl() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "hb-worker".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "hb-worker".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let original_expiry = state.workers.get(&id).unwrap().expires_at;
 
         // Manually lower the expiry to simulate time passing.
@@ -1826,14 +2329,18 @@ mod tests {
     #[test]
     fn test_heartbeat_worker_expired() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "exp-worker".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "exp-worker".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         state.workers.get_mut(&id).unwrap().expires_at = 0;
 
         assert!(
@@ -1848,14 +2355,18 @@ mod tests {
     #[test]
     fn test_status_history_caps_at_max() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "hist".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "hist".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         for s in ["A", "B", "C", "D", "E"] {
             state.heartbeat_worker(&id, Some(s.into())).unwrap();
         }
@@ -1872,14 +2383,18 @@ mod tests {
     #[test]
     fn test_status_history_dedupes_consecutive_repeats() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "dedup".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "dedup".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         state.heartbeat_worker(&id, Some("running".into())).unwrap();
         let first_at = state.workers.get(&id).unwrap().last_status_at;
         // Same status again — should not push, should not bump last_status_at.
@@ -1901,14 +2416,18 @@ mod tests {
     #[test]
     fn test_clear_status_preserves_history() {
         let mut state = BrokerState::new();
-        let id = state.register_worker(
-            "clr".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let id = state
+            .register_worker(
+                "clr".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         state.heartbeat_worker(&id, Some("phase 1".into())).unwrap();
         state.heartbeat_worker(&id, Some("phase 2".into())).unwrap();
         state.clear_status(&id).unwrap();
@@ -2024,14 +2543,18 @@ mod tests {
     #[test]
     fn test_send_message_queues_in_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
 
         let msg_id = state.send_message(worker_id.clone(), "hello".into(), Some("sender-1".into()));
         assert!(msg_id.is_some(), "send_message should return a message ID");
@@ -2055,14 +2578,18 @@ mod tests {
     #[test]
     fn test_send_message_expired_recipient() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "expiring".into(),
-            "role".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "expiring".into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         state.workers.get_mut(&worker_id).unwrap().expires_at = 0;
 
         let result = state.send_message(worker_id, "hello".into(), None);
@@ -2072,14 +2599,18 @@ mod tests {
     #[test]
     fn test_send_message_unique_ids() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
 
         let id1 = state
             .send_message(worker_id.clone(), "msg1".into(), None)
@@ -2094,14 +2625,18 @@ mod tests {
     #[test]
     fn test_send_message_without_from() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
 
         let msg_id = state
             .send_message(worker_id.clone(), "anon msg".into(), None)
@@ -2191,14 +2726,18 @@ mod tests {
     #[test]
     fn test_pop_message_returns_fifo_order() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         state.send_message(worker_id.clone(), "first".into(), None);
         state.send_message(worker_id.clone(), "second".into(), None);
 
@@ -2212,14 +2751,18 @@ mod tests {
     #[test]
     fn test_pop_message_empty_mailbox() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         assert!(state.pop_message(&worker_id).is_none());
     }
 
@@ -2232,14 +2775,18 @@ mod tests {
     #[test]
     fn test_get_notifier_returns_same_instance() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let n1 = state.get_notifier(&worker_id);
         let n2 = state.get_notifier(&worker_id);
         assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");
@@ -2257,14 +2804,18 @@ mod tests {
     #[test]
     fn test_ack_message_rejects_unknown_message() {
         let mut state = BrokerState::new();
-        let worker_id = state.register_worker(
-            "recv".into(),
-            "coder".into(),
-            "desc".into(),
-            vec![],
-            None,
-            false,
-        );
+        let worker_id = state
+            .register_worker(
+                "recv".into(),
+                "coder".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let err = state
             .ack_message(&worker_id, "nonexistent-message", None)
             .unwrap_err();
@@ -2274,9 +2825,30 @@ mod tests {
     #[test]
     fn test_ack_message_rejects_wrong_recipient() {
         let mut state = BrokerState::new();
-        let alice =
-            state.register_worker("alice".into(), "r".into(), "d".into(), vec![], None, false);
-        let bob = state.register_worker("bob".into(), "r".into(), "d".into(), vec![], None, false);
+        let alice = state
+            .register_worker(
+                "alice".into(),
+                "r".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
+        let bob = state
+            .register_worker(
+                "bob".into(),
+                "r".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let message_id = state
             .send_message(alice.clone(), "for alice".into(), None)
             .expect("send");
@@ -2290,8 +2862,18 @@ mod tests {
     #[test]
     fn test_ack_message_success_updates_history() {
         let mut state = BrokerState::new();
-        let alice =
-            state.register_worker("alice".into(), "r".into(), "d".into(), vec![], None, false);
+        let alice = state
+            .register_worker(
+                "alice".into(),
+                "r".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register");
         let message_id = state
             .send_message(alice.clone(), "hello".into(), None)
             .expect("send");
