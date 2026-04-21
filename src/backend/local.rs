@@ -833,7 +833,6 @@ pub async fn serve(
             cell_id: cell_id.clone(),
             started_at: now_secs(),
             agents: config.agents.clone(),
-            main_agent: config.main_agent.clone(),
             heartbeats: config.heartbeats.clone(),
             log_dir: log_dir.clone(),
             monitor_url: Some(url.clone()),
@@ -867,6 +866,15 @@ pub async fn serve(
     // Print copy-paste launch commands for agents that were not auto-launched.
     // That means: every agent when `--launch` is not set, plus `launch = false`
     // agents when `--launch` is set.
+    //
+    // For every unmanaged agent with a `prompt_file`, pre-register a worker
+    // server-side and wire the printed command to the issue-#43 boot-prompt
+    // bootstrap: `DISPATCH_WORKER_ID=<uuid>` in the env + `< <name>.boot.prompt`
+    // on stdin. When the user pastes + runs, the agent's first tool call
+    // (`dispatch register --for-agent`) idempotently claims the pre-registered
+    // worker and retrieves the role prompt — same mechanism as supervised
+    // agents, just with the user launching the process instead of the
+    // orchestrator.
     let manual: Vec<&crate::config::ResolvedAgentConfig> = config
         .agents
         .iter()
@@ -874,23 +882,40 @@ pub async fn serve(
         .collect();
     if !manual.is_empty() {
         eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
+        let ctx = orchestrator.lock().await.snapshot_spawn_context();
         for agent in &manual {
-            let cmd =
-                super::orchestrator::build_agent_command(agent, cell_id, monitor_url.as_deref());
+            // Agents with a prompt_file get the boot-prompt bootstrap; the
+            // legacy bare-register path is reserved for configs with no prompt.
+            // Pre-register failures log + fall back to the legacy path so one
+            // misconfigured agent doesn't block the serve banner.
+            let (worker_id, render_config): (Option<String>, crate::config::ResolvedAgentConfig) =
+                if agent.prompt_file_path.is_some() {
+                    match super::orchestrator::pre_register_unmanaged(&ctx, agent).await {
+                        Ok((id, boot_path)) => {
+                            let mut cloned = (*agent).clone();
+                            cloned.prompt_file_path = Some(boot_path);
+                            (Some(id), cloned)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  # warning: pre-register failed for '{}': {e} — falling back to legacy copy-paste",
+                                agent.name
+                            );
+                            (None, (*agent).clone())
+                        }
+                    }
+                } else {
+                    (None, (*agent).clone())
+                };
+            let cmd = super::orchestrator::build_agent_command(
+                &render_config,
+                cell_id,
+                monitor_url.as_deref(),
+                worker_id.as_deref(),
+            );
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
         }
-    }
-
-    // Print the main agent launch command.
-    if let Some(ref main_agent) = config.main_agent {
-        let cmd = super::orchestrator::build_main_agent_command(
-            main_agent,
-            cell_id,
-            monitor_url.as_deref(),
-        );
-        eprintln!("dispatch serve: main session:\n");
-        eprintln!("  {cmd}\n");
     }
 
     // Run until shutdown signal (OS signal or monitor UI).
@@ -1524,7 +1549,6 @@ mod tests {
             monitor_open: false,
             default_ttl: None,
             agents: vec![],
-            main_agent: None,
             heartbeats: vec![],
         }
     }

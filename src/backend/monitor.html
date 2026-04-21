@@ -321,9 +321,6 @@ async function fetchAgentConfigs() {
     const resp = await fetch('/api/agents');
     const data = await resp.json();
     agentConfigs = data.agents || [];
-    if (data.main_agent) {
-      agentConfigs.unshift({ ...data.main_agent, name: 'main', role: 'main-agent', description: 'Main interactive agent', _isMain: true });
-    }
   } catch(e) {}
 }
 
@@ -403,7 +400,6 @@ function renderSidebar() {
   // and are read back from `dataset` by the delegated click handler — never
   // interpolated into a JS string.
   for (const cfg of agentConfigs) {
-    if (cfg._isMain) continue; // main agent shown separately
     seen.add(cfg.name);
     const worker = teamWorkers.find(w => w.name === cfg.name);
     const isLive = !!worker;
@@ -428,19 +424,6 @@ function renderSidebar() {
     html += `</div></div>`;
   }
 
-  // Main agent
-  const mainCfg = agentConfigs.find(a => a._isMain);
-  if (mainCfg) {
-    const mainWorker = teamWorkers.find(w => w.role === 'main-agent' || w.name === 'main');
-    const isLive = !!mainWorker;
-    const isActive = selectedAgent === 'main' && currentView === 'agent';
-    html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="main">`;
-    html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
-    html += `<span class="name">main</span>`;
-    html += `<span class="role-tag">coordinator</span>`;
-    html += `</div>`;
-  }
-
   list.innerHTML = html || '<div class="nav-item empty" style="cursor:default">No agents configured</div>';
 }
 
@@ -451,7 +434,7 @@ function renderSidebar() {
 function renderAgentCards() {
   const grid = document.getElementById('agents-grid');
   if (!grid) return;
-  const managed = (agentConfigs || []).filter(a => !a._isMain);
+  const managed = agentConfigs || [];
   if (managed.length === 0) {
     grid.innerHTML = '<div class="empty">No agents configured</div>';
     return;

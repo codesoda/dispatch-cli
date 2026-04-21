@@ -28,8 +28,6 @@ pub struct ResolvedConfig {
     pub default_ttl: Option<u64>,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
-    /// Main interactive agent (printed as a command, not auto-launched).
-    pub main_agent: Option<MainAgentConfig>,
     /// Scheduled heartbeat commands.
     pub heartbeats: Vec<HeartbeatConfig>,
 }
@@ -80,8 +78,6 @@ pub struct ConfigFile {
     /// Agent definitions to launch on serve.
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
-    /// Main interactive agent configuration.
-    pub main_agent: Option<MainAgentConfig>,
     /// Scheduled heartbeat commands.
     #[serde(default)]
     pub heartbeats: Vec<HeartbeatConfig>,
@@ -139,16 +135,6 @@ pub struct AgentConfig {
     /// in the log. Default off so logs stay quiet for normal use.
     #[serde(default)]
     pub stream_json: bool,
-}
-
-/// On-disk main agent definition.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MainAgentConfig {
-    pub command: String,
-    pub model: Option<String>,
-    pub prompt: Option<String>,
-    pub prompt_file: Option<String>,
 }
 
 /// Resolve an agent config by reading prompt_file if specified and validating
@@ -327,11 +313,22 @@ const CONFIG_TEMPLATE: &str = "\
 # command = \"scripts/worker.sh --verbose\"
 # launch = true
 
-# Main interactive agent — printed as a ready-to-paste command
-# [main_agent]
-# command = \"claude\"
-# model = \"opus\"
-# prompt = \"You are the lead agent for this project...\"
+# Interactive coordinator agent — printed as a ready-to-paste command at
+# serve startup. `launch = false` (the default) keeps the orchestrator out
+# of its lifecycle; you run it yourself in a terminal. If a `prompt_file`
+# is set, dispatch pre-registers a worker server-side and the printed
+# command uses the issue-#43 boot-prompt bootstrap — the agent's first
+# tool call is `dispatch register --for-agent`, which returns the prompt
+# body from the broker rather than embedding it in a multi-kB shell string.
+# [[agents]]
+# name = \"coordinator\"
+# role = \"coordinator\"
+# description = \"Coordinates chat between the user and other agents\"
+# adapter = \"claude\"
+# extra_args = [\"--dangerously-skip-permissions\", \"--model\", \"sonnet\"]
+# prompt_file = \"prompts/coordinator.md\"
+# launch = false
+# ttl = 7200
 
 # Scheduled heartbeats — commands run on a timer while the broker is running
 # [[heartbeats]]
@@ -406,28 +403,19 @@ fn resolve_config_inner(
     };
 
     // Extract fields from config file
-    let (
-        name,
-        backend,
-        default_ttl,
-        config_cwd,
-        monitor_config,
-        raw_agents,
-        main_agent_config,
-        heartbeats,
-    ) = match config_file {
-        Some(c) => (
-            c.name,
-            c.backend,
-            c.default_ttl,
-            c.cwd,
-            c.monitor,
-            c.agents,
-            c.main_agent,
-            c.heartbeats,
-        ),
-        None => (None, None, None, None, None, vec![], None, vec![]),
-    };
+    let (name, backend, default_ttl, config_cwd, monitor_config, raw_agents, heartbeats) =
+        match config_file {
+            Some(c) => (
+                c.name,
+                c.backend,
+                c.default_ttl,
+                c.cwd,
+                c.monitor,
+                c.agents,
+                c.heartbeats,
+            ),
+            None => (None, None, None, None, None, vec![], vec![]),
+        };
 
     // Resolve agent working directory: config cwd (relative to project_root) or project_root
     let agent_cwd = if let Some(ref cwd_path) = config_cwd {
@@ -445,28 +433,6 @@ fn resolve_config_inner(
         .map(|a| resolve_agent_config(a, &project_root))
         .collect::<Result<_, _>>()?;
 
-    // Validate main agent config (check prompt_file exists if specified, but don't read it).
-    let main_agent = if let Some(ref ma) = main_agent_config {
-        if ma.prompt.is_some() && ma.prompt_file.is_some() {
-            return Err(DispatchError::AgentConfigError {
-                name: "main_agent".into(),
-                reason: "cannot specify both 'prompt' and 'prompt_file'".into(),
-            });
-        }
-        if let Some(ref path) = ma.prompt_file {
-            let full_path = project_root.join(path);
-            if !full_path.exists() {
-                return Err(DispatchError::PromptFileNotFound {
-                    name: "main_agent".into(),
-                    path: full_path,
-                });
-            }
-        }
-        Some(ma.clone())
-    } else {
-        None
-    };
-
     Ok(ResolvedConfig {
         name,
         cell_id,
@@ -477,7 +443,6 @@ fn resolve_config_inner(
         monitor_open,
         default_ttl,
         agents,
-        main_agent,
         heartbeats,
     })
 }
@@ -886,6 +851,33 @@ command = "./run.sh"
         assert!(
             msg.contains("alice/foo") && msg.contains("ASCII"),
             "expected safe-name rejection for 'alice/foo', got: {msg}"
+        );
+    }
+
+    /// Issue #45: `[main_agent]` has been removed in favor of a regular
+    /// `[[agents]] launch = false + prompt_file` entry. `ConfigFile`'s
+    /// `deny_unknown_fields` means a legacy config with `[main_agent]`
+    /// fails parse with a clear pointer rather than silently ignoring
+    /// the section.
+    #[test]
+    fn config_rejects_legacy_main_agent_table() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[main_agent]
+command = "claude"
+model = "opus"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("main_agent"),
+            "expected error to reference main_agent, got: {msg}"
         );
     }
 }

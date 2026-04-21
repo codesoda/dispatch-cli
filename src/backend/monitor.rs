@@ -24,7 +24,6 @@ pub struct MonitorState {
     /// Unix timestamp (seconds) when the server started.
     pub started_at: u64,
     pub agents: Vec<crate::config::ResolvedAgentConfig>,
-    pub main_agent: Option<crate::config::MainAgentConfig>,
     pub heartbeats: Vec<crate::config::HeartbeatConfig>,
     pub log_dir: PathBuf,
     pub monitor_url: Option<String>,
@@ -140,6 +139,11 @@ async fn api_health(State(state): State<MonitorState>) -> axum::Json<serde_json:
 }
 
 /// Return configured agent definitions (for the sidebar agent detail view).
+///
+/// The dashboard surface for an unmanaged agent (`launch = false`) doesn't
+/// need the boot-prompt worker_id here — that bootstrap is only printed
+/// at serve startup where the pre-register lives. This view is purely
+/// informational, so we pass `worker_id = None` regardless of `launch`.
 async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json::Value> {
     let agents: Vec<serde_json::Value> = state
         .agents
@@ -149,6 +153,7 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
                 a,
                 &state.cell_id,
                 state.monitor_url.as_deref(),
+                None,
             );
             serde_json::json!({
                 "name": a.name,
@@ -164,19 +169,6 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
             })
         })
         .collect();
-    let main_agent = state.main_agent.as_ref().map(|m| {
-        let launch_cmd = super::orchestrator::build_main_agent_command(
-            m,
-            &state.cell_id,
-            state.monitor_url.as_deref(),
-        );
-        serde_json::json!({
-            "command": m.command,
-            "model": m.model,
-            "prompt": m.prompt,
-            "launch_command": launch_cmd,
-        })
-    });
     let heartbeats: Vec<serde_json::Value> = state
         .heartbeats
         .iter()
@@ -190,7 +182,6 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
         .collect();
     axum::Json(serde_json::json!({
         "agents": agents,
-        "main_agent": main_agent,
         "heartbeats": heartbeats,
     }))
 }
@@ -543,7 +534,6 @@ mod tests {
             cell_id: "test-cell".into(),
             started_at: 0,
             agents: vec![],
-            main_agent: None,
             heartbeats: vec![],
             log_dir: tmp.join("logs"),
             monitor_url: None,
