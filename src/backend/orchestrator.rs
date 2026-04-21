@@ -91,6 +91,48 @@ struct RunningHeartbeat {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Snapshot of the orchestrator's immutable spawn-side state. Created by
+/// `AgentOrchestrator::snapshot_spawn_context` so the heavy spawn work can
+/// run with the orchestrator mutex released. See `monitor::api_agent_start`
+/// for the canonical three-phase usage (check → build → register).
+pub struct SpawnContext {
+    broker: Arc<Mutex<super::local::BrokerState>>,
+    cell_id: String,
+    socket_path: PathBuf,
+    monitor_url: Option<String>,
+    agent_cwd: PathBuf,
+    log_dir: PathBuf,
+}
+
+impl SpawnContext {
+    fn env_vars(&self, name: &str, role: &str, worker_id: Option<&str>) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        vars.insert("DISPATCH_CELL_ID".into(), self.cell_id.clone());
+        vars.insert(
+            "DISPATCH_SOCKET_PATH".into(),
+            self.socket_path.display().to_string(),
+        );
+        if let Some(ref url) = self.monitor_url {
+            vars.insert("DISPATCH_MONITOR_URL".into(), url.clone());
+        }
+        vars.insert("DISPATCH_AGENT_NAME".into(), name.into());
+        vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
+        if let Some(id) = worker_id {
+            vars.insert("DISPATCH_WORKER_ID".into(), id.into());
+        }
+        vars
+    }
+}
+
+/// Opaque handle to an agent that has been spawned but not yet registered
+/// with the orchestrator. Returned by `build_pending_agent`; consumed by
+/// `AgentOrchestrator::register_pending`. Wraps the private `ManagedAgent`
+/// so callers outside this module can move spawn results across the lock
+/// boundary without touching internals.
+pub struct PendingAgent {
+    inner: ManagedAgent,
+}
+
 /// Manages the lifecycle of agent subprocesses and heartbeat timers.
 pub struct AgentOrchestrator {
     agents: Vec<ManagedAgent>,
@@ -137,29 +179,6 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Build the environment variables injected into every agent subprocess.
-    ///
-    /// `worker_id` is `Some` once dispatch pre-registers the worker server-side
-    /// at spawn time (see issue #43). When `None`, the var is omitted and the
-    /// agent must fall back to the legacy "register myself" flow.
-    fn env_vars(&self, name: &str, role: &str, worker_id: Option<&str>) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-        vars.insert("DISPATCH_CELL_ID".into(), self.cell_id.clone());
-        vars.insert(
-            "DISPATCH_SOCKET_PATH".into(),
-            self.socket_path.display().to_string(),
-        );
-        if let Some(ref url) = self.monitor_url {
-            vars.insert("DISPATCH_MONITOR_URL".into(), url.clone());
-        }
-        vars.insert("DISPATCH_AGENT_NAME".into(), name.into());
-        vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
-        if let Some(id) = worker_id {
-            vars.insert("DISPATCH_WORKER_ID".into(), id.into());
-        }
-        vars
-    }
-
     /// Build the adapter's Launch spec for this agent.
     ///
     /// The Launch describes the program, argv, shell-wrap hint, and optional
@@ -192,12 +211,14 @@ impl AgentOrchestrator {
     /// **Issue #43 — managed-agent pre-register flow.** When the agent has
     /// `launch = true` AND a `prompt_file`, dispatch:
     /// 1. Reads the prompt file content into memory.
-    /// 2. Generates a fresh worker id and registers the worker server-side
-    ///    (eviction on, so a stale same-name worker from a crashed prior
-    ///    session is replaced).
-    /// 3. Writes a one-line boot prompt that forces the model's first
+    /// 2. Writes a one-line boot prompt that forces the model's first
     ///    observable action to be `dispatch register --for-agent ...` —
     ///    the broker returns the role prompt body in that response.
+    ///    Done BEFORE step 3 so a write failure can't leave a zombie
+    ///    worker in the broker.
+    /// 3. Generates a fresh worker id and registers the worker server-side
+    ///    (eviction on, so a stale same-name worker from a crashed prior
+    ///    session is replaced).
     /// 4. Injects `DISPATCH_WORKER_ID` so the boot command can name the id.
     /// 5. Hands the supervisor a re-register hook so the worker record +
     ///    role prompt stay alive across respawns.
@@ -205,124 +226,67 @@ impl AgentOrchestrator {
     /// Agents with `launch = false` are external (user copy-pastes the
     /// command into a separate terminal) and stay on the legacy path:
     /// no pre-register, full prompt piped to stdin as before.
+    ///
+    /// **Mutex contention warning.** This holds `&mut self` for the entire
+    /// duration, including the prompt file read, boot prompt write, broker
+    /// `register_worker` call, and `spawn_child_process` await. HTTP / IPC
+    /// handlers wrapping the orchestrator in `Arc<Mutex<…>>` should
+    /// instead use the three-phase pattern: `check_can_start` (locked) →
+    /// `build_pending_agent` (unlocked) → `register_pending` (locked).
+    /// See `monitor::api_agent_start` for the canonical example.
     pub async fn spawn_agent(&mut self, config: &ResolvedAgentConfig) -> Result<(), DispatchError> {
-        let pre_register = config.launch && config.prompt_file_path.is_some();
-
-        let (env_vars, worker_id, role_prompt, spawn_config) = if pre_register {
-            let prompt_path = config.prompt_file_path.as_ref().ok_or_else(|| {
-                DispatchError::AgentLaunchFailed {
-                    name: config.name.clone(),
-                    reason: "pre_register set but prompt_file_path is None".into(),
-                }
-            })?;
-            let prompt_content = tokio::fs::read_to_string(prompt_path).await.map_err(|_| {
-                DispatchError::PromptFileNotFound {
-                    name: config.name.clone(),
-                    path: prompt_path.clone(),
-                }
-            })?;
-
-            // Write the boot prompt BEFORE pre-registering so a write failure
-            // (disk full, log_dir not writable, etc.) can't leave an orphan
-            // worker in the broker. After register_worker runs, any subsequent
-            // failure has to route through the cleanup guard below to maintain
-            // the "no zombie state" invariant.
-            let boot_path = write_boot_prompt(&self.log_dir, config)
-                .await
-                .map_err(|e| DispatchError::AgentLaunchFailed {
-                    name: config.name.clone(),
-                    reason: format!("write boot prompt: {e}"),
-                })?;
-
-            let id = uuid::Uuid::new_v4().to_string();
-            {
-                let mut broker = self.broker.lock().await;
-                broker
-                    .register_worker(
-                        config.name.clone(),
-                        config.role.clone(),
-                        config.description.clone(),
-                        Vec::new(),
-                        config.ttl,
-                        true, // evict any stale same-name worker from a prior session
-                        Some(id.clone()),
-                        Some(prompt_content.clone()),
-                    )
-                    .map_err(|e| DispatchError::AgentLaunchFailed {
-                        name: config.name.clone(),
-                        reason: format!("pre-register failed: {e}"),
-                    })?;
-            }
-
-            let mut sc = config.clone();
-            sc.prompt_file_path = Some(boot_path);
-
-            let env = self.env_vars(&config.name, &config.role, Some(&id));
-            (env, Some(id), Some(prompt_content), sc)
-        } else {
-            // Legacy unmanaged path (launch=false, or no prompt_file).
-            let env = self.env_vars(&config.name, &config.role, None);
-            (env, None, None, config.clone())
-        };
-
-        // Initial spawn is synchronous so the caller sees config errors
-        // (bad prompt file, missing binary) as a proper Err instead of
-        // discovering them later via AgentState::Crashed.
-        let child =
-            match spawn_child_process(&spawn_config, &env_vars, &self.agent_cwd, &self.log_dir)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    // Clean up the pre-registered worker so we don't leave an
-                    // orphan in the broker that will never check in. Routes
-                    // through remove_worker so mailboxes/notifiers go with it.
-                    if let Some(ref id) = worker_id {
-                        let mut b = self.broker.lock().await;
-                        b.remove_worker(id);
-                    }
-                    return Err(e);
-                }
-            };
-        let pid = child.id().unwrap_or(0);
-        eprintln!(
-            "dispatch serve: launched agent '{}' (role={}, pid={})",
-            config.name, config.role, pid
-        );
-
-        let state = Arc::new(Mutex::new(AgentState::Running {
-            pid,
-            started_at: super::local::now_secs(),
-        }));
-        let shutdown = Arc::new(Notify::new());
-
-        // Re-register hook: passed to the supervisor so it can refresh the
-        // worker record (and re-store the role prompt) on every respawn.
-        // None for unmanaged agents — the supervisor stays on legacy behavior.
-        let re_register = worker_id
-            .zip(role_prompt)
-            .map(|(id, prompt)| (Arc::clone(&self.broker), id, prompt));
-
-        let supervisor = tokio::spawn(supervise_agent(
-            spawn_config,
-            env_vars,
-            self.agent_cwd.clone(),
-            self.log_dir.clone(),
-            child,
-            Arc::clone(&state),
-            Arc::clone(&shutdown),
-            re_register,
-        ));
-
-        self.agents.push(ManagedAgent {
-            name: config.name.clone(),
-            role: config.role.clone(),
-            state,
-            shutdown,
-            supervisor,
-        });
-
+        let snapshot = self.snapshot_spawn_context();
+        let pending = build_pending_agent(snapshot, config).await?;
+        self.register_pending(pending);
         Ok(())
+    }
+
+    /// Validate that an agent named `name` can be started right now: reap
+    /// any finished supervisors, reject if an instance is already running,
+    /// and look up the config. Pure synchronous validation — no IO, no
+    /// broker calls — so callers can release the orchestrator mutex
+    /// immediately after and run the heavy spawn work unlocked.
+    ///
+    /// Companion to `build_pending_agent` + `register_pending` for the
+    /// three-phase start pattern used by HTTP / IPC handlers.
+    pub fn check_can_start(&mut self, name: &str) -> Result<ResolvedAgentConfig, DispatchError> {
+        self.agents.retain(|a| !a.supervisor.is_finished());
+
+        if self.agents.iter().any(|a| a.name == name) {
+            return Err(DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "already running".into(),
+            });
+        }
+        self.configs
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "no such agent in config".into(),
+            })
+    }
+
+    /// Snapshot the immutable orchestrator state needed to spawn an agent.
+    /// Cheap clones (PathBuf / String / Arc) so the caller can release the
+    /// orchestrator mutex before running the heavyweight async spawn.
+    pub fn snapshot_spawn_context(&self) -> SpawnContext {
+        SpawnContext {
+            broker: Arc::clone(&self.broker),
+            cell_id: self.cell_id.clone(),
+            socket_path: self.socket_path.clone(),
+            monitor_url: self.monitor_url.clone(),
+            agent_cwd: self.agent_cwd.clone(),
+            log_dir: self.log_dir.clone(),
+        }
+    }
+
+    /// Commit a freshly-spawned agent to the orchestrator's tracked set.
+    /// Phase 3 of the unlocked-spawn pattern — caller has already done
+    /// `check_can_start` (phase 1) and `build_pending_agent` (phase 2).
+    pub fn register_pending(&mut self, pending: PendingAgent) {
+        self.agents.push(pending.inner);
     }
 
     /// Snapshot of all managed agents' current runtime state.
@@ -353,23 +317,7 @@ impl AgentOrchestrator {
     /// whose supervisor task has already finished (Crashed or Stopped), so a
     /// previously-failed agent can be started again without needing `restart`.
     pub async fn start_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
-        self.agents.retain(|a| !a.supervisor.is_finished());
-
-        if self.agents.iter().any(|a| a.name == name) {
-            return Err(DispatchError::AgentLaunchFailed {
-                name: name.to_string(),
-                reason: "already running".into(),
-            });
-        }
-        let config = self
-            .configs
-            .iter()
-            .find(|a| a.name == name)
-            .cloned()
-            .ok_or_else(|| DispatchError::AgentLaunchFailed {
-                name: name.to_string(),
-                reason: "no such agent in config".into(),
-            })?;
+        let config = self.check_can_start(name)?;
         self.spawn_agent(&config).await
     }
 
@@ -525,6 +473,138 @@ impl AgentOrchestrator {
             None => false,
         }
     }
+}
+
+/// Spawn an agent process and assemble the supervisor task **without**
+/// touching the orchestrator. Phase 2 of the unlocked-spawn pattern:
+/// `AgentOrchestrator::check_can_start` (locked) → this (unlocked) →
+/// `AgentOrchestrator::register_pending` (locked).
+///
+/// All the heavy waits live here: prompt file read, boot prompt write,
+/// broker pre-register, and `spawn_child_process`. Running this with the
+/// orchestrator mutex released keeps the dashboard's 2 s
+/// `/api/agents/state` poll from stalling on a slow start. The caller is
+/// responsible for calling `check_can_start` first to validate the name.
+pub async fn build_pending_agent(
+    ctx: SpawnContext,
+    config: &ResolvedAgentConfig,
+) -> Result<PendingAgent, DispatchError> {
+    let pre_register = config.launch && config.prompt_file_path.is_some();
+
+    let (env_vars, worker_id, role_prompt, spawn_config) =
+        if pre_register {
+            let prompt_path = config.prompt_file_path.as_ref().ok_or_else(|| {
+                DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: "pre_register set but prompt_file_path is None".into(),
+                }
+            })?;
+            let prompt_content = tokio::fs::read_to_string(prompt_path).await.map_err(|_| {
+                DispatchError::PromptFileNotFound {
+                    name: config.name.clone(),
+                    path: prompt_path.clone(),
+                }
+            })?;
+
+            // Write the boot prompt BEFORE pre-registering so a write failure
+            // (disk full, log_dir not writable, etc.) can't leave an orphan
+            // worker in the broker. After register_worker runs, any subsequent
+            // failure has to route through the cleanup guard below to maintain
+            // the "no zombie state" invariant.
+            let boot_path = write_boot_prompt(&ctx.log_dir, config).await.map_err(|e| {
+                DispatchError::AgentLaunchFailed {
+                    name: config.name.clone(),
+                    reason: format!("write boot prompt: {e}"),
+                }
+            })?;
+
+            let id = uuid::Uuid::new_v4().to_string();
+            {
+                let mut broker = ctx.broker.lock().await;
+                broker
+                    .register_worker(
+                        config.name.clone(),
+                        config.role.clone(),
+                        config.description.clone(),
+                        Vec::new(),
+                        config.ttl,
+                        true, // evict any stale same-name worker from a prior session
+                        Some(id.clone()),
+                        Some(prompt_content.clone()),
+                    )
+                    .map_err(|e| DispatchError::AgentLaunchFailed {
+                        name: config.name.clone(),
+                        reason: format!("pre-register failed: {e}"),
+                    })?;
+            }
+
+            let mut sc = config.clone();
+            sc.prompt_file_path = Some(boot_path);
+
+            let env = ctx.env_vars(&config.name, &config.role, Some(&id));
+            (env, Some(id), Some(prompt_content), sc)
+        } else {
+            // Legacy unmanaged path (launch=false, or no prompt_file).
+            let env = ctx.env_vars(&config.name, &config.role, None);
+            (env, None, None, config.clone())
+        };
+
+    // Initial spawn is synchronous so the caller sees config errors
+    // (bad prompt file, missing binary) as a proper Err instead of
+    // discovering them later via AgentState::Crashed.
+    let child =
+        match spawn_child_process(&spawn_config, &env_vars, &ctx.agent_cwd, &ctx.log_dir).await {
+            Ok(c) => c,
+            Err(e) => {
+                // Clean up the pre-registered worker so we don't leave an
+                // orphan in the broker that will never check in. Routes
+                // through remove_worker so mailboxes/notifiers go with it.
+                if let Some(ref id) = worker_id {
+                    let mut b = ctx.broker.lock().await;
+                    b.remove_worker(id);
+                }
+                return Err(e);
+            }
+        };
+    let pid = child.id().unwrap_or(0);
+    eprintln!(
+        "dispatch serve: launched agent '{}' (role={}, pid={})",
+        config.name, config.role, pid
+    );
+
+    let state = Arc::new(Mutex::new(AgentState::Running {
+        pid,
+        started_at: super::local::now_secs(),
+    }));
+    let shutdown = Arc::new(Notify::new());
+
+    // Re-register hook: passed to the supervisor so it can refresh the
+    // worker record (and re-store the role prompt) on every respawn.
+    // None for unmanaged agents — the supervisor stays on legacy behavior.
+    let re_register = worker_id
+        .zip(role_prompt)
+        .map(|(id, prompt)| (Arc::clone(&ctx.broker), id, prompt));
+
+    let supervisor = tokio::spawn(supervise_agent(
+        spawn_config,
+        env_vars,
+        ctx.agent_cwd.clone(),
+        ctx.log_dir.clone(),
+        child,
+        Arc::clone(&state),
+        Arc::clone(&shutdown),
+        re_register,
+    ));
+
+    Ok(PendingAgent {
+        inner: ManagedAgent {
+            name: config.name.clone(),
+            role: config.role.clone(),
+            state,
+            shutdown,
+            supervisor,
+        },
+    })
 }
 
 /// Write the issue-#43 one-line boot prompt to a stable per-agent file
@@ -729,7 +809,11 @@ async fn supervise_agent(
                 // prompt before the respawn so the agent's claim call can
                 // get its prompt back even if TTL expired during downtime.
                 // Idempotent on alive workers (no-op claim renewing TTL),
-                // fresh-creates if the record was GC'd.
+                // fresh-creates if the record was GC'd. evict=true so any
+                // stale same-name worker with a different id (e.g. from a
+                // manual `dispatch register` that raced during downtime)
+                // is cleaned up — the supervisor's id should be the only
+                // record bearing this name.
                 //
                 // Treat failure as terminal: if we can't restore the broker
                 // state, the respawned child will fail its `--for-agent`
@@ -737,17 +821,22 @@ async fn supervise_agent(
                 // a generic "exited with ..." reason. Surface the real cause
                 // immediately instead.
                 if let Some((broker, worker_id, role_prompt)) = &re_register {
-                    let mut b = broker.lock().await;
-                    if let Err(err) = b.register_worker(
-                        config.name.clone(),
-                        config.role.clone(),
-                        config.description.clone(),
-                        Vec::new(),
-                        config.ttl,
-                        false,
-                        Some(worker_id.clone()),
-                        Some(role_prompt.clone()),
-                    ) {
+                    let register_result = {
+                        let mut b = broker.lock().await;
+                        b.register_worker(
+                            config.name.clone(),
+                            config.role.clone(),
+                            config.description.clone(),
+                            Vec::new(),
+                            config.ttl,
+                            true,
+                            Some(worker_id.clone()),
+                            Some(role_prompt.clone()),
+                        )
+                        // `b` drops here so `state.lock().await` below
+                        // doesn't pin the broker mutex across the await.
+                    };
+                    if let Err(err) = register_result {
                         tracing::error!(
                             agent = %config.name,
                             %err,
@@ -773,6 +862,16 @@ async fn supervise_agent(
                     }
                     Err(e) => {
                         tracing::warn!(agent = %config.name, error = %e, "respawn failed");
+                        // Symmetric with the initial-spawn cleanup guard:
+                        // the re-register above restored the worker record,
+                        // but spawn_child_process failed (log dir gone,
+                        // prompt file deleted, binary missing, ...). Drop
+                        // the broker entry so it doesn't linger as a zombie
+                        // for a process that will never run.
+                        if let Some((broker, worker_id, _)) = &re_register {
+                            let mut b = broker.lock().await;
+                            b.remove_worker(worker_id);
+                        }
                         *state.lock().await = AgentState::Crashed {
                             reason: format!("respawn failed: {e}"),
                             attempts: attempt,
@@ -905,9 +1004,9 @@ mod tests {
     use super::*;
     use crate::adapter::Adapter;
 
-    /// Constructing `env_vars(_, _, Some(id))` injects `DISPATCH_WORKER_ID`;
-    /// `None` omits the key entirely so legacy register-yourself agents see
-    /// exactly the previous environment.
+    /// Constructing `SpawnContext::env_vars(_, _, Some(id))` injects
+    /// `DISPATCH_WORKER_ID`; `None` omits the key entirely so legacy
+    /// register-yourself agents see exactly the previous environment.
     #[test]
     fn env_vars_includes_worker_id_when_some() {
         let tmp = tempfile::tempdir().unwrap();
@@ -920,8 +1019,9 @@ mod tests {
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
         );
+        let ctx = orch.snapshot_spawn_context();
 
-        let with_id = orch.env_vars("alice", "test-runner", Some("w-123"));
+        let with_id = ctx.env_vars("alice", "test-runner", Some("w-123"));
         assert_eq!(
             with_id.get("DISPATCH_WORKER_ID").map(String::as_str),
             Some("w-123")
@@ -935,7 +1035,7 @@ mod tests {
             Some("test-runner")
         );
 
-        let without_id = orch.env_vars("alice", "test-runner", None);
+        let without_id = ctx.env_vars("alice", "test-runner", None);
         assert!(!without_id.contains_key("DISPATCH_WORKER_ID"));
         // The other vars must match exactly so the legacy code path is bit-for-bit unchanged.
         assert_eq!(
@@ -1147,11 +1247,10 @@ mod tests {
             Arc::clone(&broker),
         );
 
-        // Seed a dummy mailbox + notifier under a placeholder id so we can
-        // confirm the cleanup guard also wipes those alongside `workers` /
-        // `role_prompts`. Any worker id the orchestrator later assigns
-        // won't collide with this placeholder — we're just asserting that
-        // `remove_worker` is what the cleanup path calls.
+        // Force `spawn_agent` to fail and verify the broker is left with no
+        // residual state. This covers cleanup of any entries created during
+        // the failed spawn attempt across `workers`, `role_prompts`,
+        // `mailboxes`, and `notifiers`.
         let cfg = managed_test_config("alice", "true", prompt_path);
         let err = orch.spawn_agent(&cfg).await.expect_err("must fail");
         assert!(

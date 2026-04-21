@@ -219,37 +219,49 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 // broker has no prompt stored for this worker, exit nonzero
                 // — the agent has nothing to do and the supervisor should
                 // restart rather than have the model see empty stdout.
-                if let BrokerResponse::Ok {
-                    payload:
-                        ResponsePayload::WorkerRegistered {
-                            worker_id,
-                            role_prompt: Some(prompt),
-                        },
-                } = &response
-                {
-                    // Write the prompt body verbatim (no trailing newline
-                    // added) so the agent receives byte-for-byte what the
-                    // orchestrator stored.
-                    use std::io::Write as _;
-                    let mut stdout = std::io::stdout().lock();
-                    stdout.write_all(prompt.as_bytes())?;
-                    stdout.flush()?;
+                match &response {
+                    BrokerResponse::Ok {
+                        payload:
+                            ResponsePayload::WorkerRegistered {
+                                worker_id,
+                                role_prompt: Some(prompt),
+                            },
+                    } => {
+                        // Write the prompt body verbatim (no trailing newline
+                        // added) so the agent receives byte-for-byte what the
+                        // orchestrator stored.
+                        use std::io::Write as _;
+                        let mut stdout = std::io::stdout().lock();
+                        stdout.write_all(prompt.as_bytes())?;
+                        stdout.flush()?;
 
-                    // Strip `role_prompt` from the stderr envelope so the
-                    // prompt body isn't duplicated into agent logs.
-                    let stripped = BrokerResponse::Ok {
-                        payload: ResponsePayload::WorkerRegistered {
-                            worker_id: worker_id.clone(),
-                            role_prompt: None,
-                        },
-                    };
-                    let json = serde_json::to_string(&stripped)?;
-                    eprintln!("{json}");
-                } else {
-                    let json = serde_json::to_string(&response)?;
-                    eprintln!("{json}");
-                    eprintln!("dispatch: --for-agent set but response carries no role prompt");
-                    process::exit(1);
+                        // Strip `role_prompt` from the stderr envelope so the
+                        // prompt body isn't duplicated into agent logs.
+                        let stripped = BrokerResponse::Ok {
+                            payload: ResponsePayload::WorkerRegistered {
+                                worker_id: worker_id.clone(),
+                                role_prompt: None,
+                            },
+                        };
+                        let json = serde_json::to_string(&stripped)?;
+                        eprintln!("{json}");
+                    }
+                    // `send_request` returns `Ok(BrokerResponse::Error { .. })`
+                    // for broker-side errors (e.g. worker_id collision when
+                    // DISPATCH_AGENT_NAME drifted from what was pre-registered).
+                    // Forward `message` verbatim so the supervisor's logs
+                    // surface the real cause instead of the generic
+                    // "no role prompt" line below.
+                    BrokerResponse::Error { message } => {
+                        eprintln!("dispatch: register --for-agent failed: {message}");
+                        process::exit(1);
+                    }
+                    _ => {
+                        let json = serde_json::to_string(&response)?;
+                        eprintln!("{json}");
+                        eprintln!("dispatch: --for-agent set but response carries no role prompt");
+                        process::exit(1);
+                    }
                 }
             } else {
                 let json = serde_json::to_string(&response)?;

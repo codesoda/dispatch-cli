@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -15,6 +16,27 @@ use crate::protocol::{
     BrokerRequest, BrokerResponse, Message, ResponsePayload, StatusEntry, Worker,
     STATUS_HISTORY_MAX,
 };
+
+/// Errors returned by `BrokerState` mutations. Distinct from `DispatchError`
+/// because the broker is process-internal — these are translated at the IPC
+/// boundary into `BrokerResponse::Error { message }` (whose `message` is
+/// this enum's `Display`) and at the orchestrator boundary into
+/// `DispatchError::AgentLaunchFailed`. Keeping them typed lets call sites
+/// match on the variant (e.g. distinguish a collision from a future "not
+/// found" or "quota exceeded") instead of string-matching on `format!` output.
+#[derive(Debug, Error)]
+pub enum BrokerError {
+    #[error(
+        "worker_id {supplied} already registered as {existing_name}/{existing_role} -- supplied {requested_name}/{requested_role} does not match"
+    )]
+    WorkerIdCollision {
+        supplied: String,
+        existing_name: String,
+        existing_role: String,
+        requested_name: String,
+        requested_role: String,
+    },
+}
 
 /// Default worker TTL in seconds (1 hour).
 const DEFAULT_WORKER_TTL_SECS: u64 = 3600;
@@ -236,7 +258,7 @@ impl BrokerState {
         evict: bool,
         worker_id: Option<String>,
         role_prompt: Option<String>,
-    ) -> Result<String, String> {
+    ) -> Result<String, BrokerError> {
         // Idempotent-claim short-circuit: if the supplied id already exists
         // and matches name+role, return it (and renew TTL) without touching
         // the rest of the state. This must run BEFORE the evict pass so that
@@ -266,10 +288,13 @@ impl BrokerState {
                     }
                     return Ok(id);
                 }
-                return Err(format!(
-                    "worker_id {supplied} already registered as {}/{} -- supplied {name}/{role} does not match",
-                    existing.name, existing.role,
-                ));
+                return Err(BrokerError::WorkerIdCollision {
+                    supplied: supplied.clone(),
+                    existing_name: existing.name.clone(),
+                    existing_role: existing.role.clone(),
+                    requested_name: name,
+                    requested_role: role,
+                });
             }
         }
 
@@ -989,7 +1014,8 @@ async fn handle_request(
                 role_prompt,
             ) {
                 Ok(id) => id,
-                Err(message) => {
+                Err(err) => {
+                    let message = err.to_string();
                     tracing::warn!(%message, "register rejected");
                     return BrokerResponse::Error { message };
                 }
@@ -1178,14 +1204,18 @@ async fn handle_request(
                     // Spurious wake — treat as timeout.
                     tracing::debug!(worker_id = %worker_id, "listen: spurious wake, returning timeout");
                     BrokerResponse::Ok {
-                        payload: ResponsePayload::Timeout { worker_id },
+                        payload: ResponsePayload::Timeout(crate::protocol::TimeoutPayload {
+                            worker_id,
+                        }),
                     }
                 }
             } else {
                 // Timed out.
                 tracing::debug!(worker_id = %worker_id, timeout, "listen: timed out");
                 BrokerResponse::Ok {
-                    payload: ResponsePayload::Timeout { worker_id },
+                    payload: ResponsePayload::Timeout(crate::protocol::TimeoutPayload {
+                        worker_id,
+                    }),
                 }
             }
         }
@@ -1320,14 +1350,33 @@ async fn handle_request(
         }
         BrokerRequest::AgentStart { name } => {
             let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
-            let mut orch = orchestrator.lock().await;
-            match orch.start_by_name(&resolved).await {
-                Ok(()) => BrokerResponse::Ok {
-                    payload: ResponsePayload::Ack {},
-                },
-                Err(e) => BrokerResponse::Error {
-                    message: format!("agent start failed: {e}"),
-                },
+            // Three-phase pattern (PR #28 / #43): release the orchestrator
+            // mutex during the heavy spawn await so concurrent dashboard
+            // polls and other broker requests don't stall on file IO +
+            // pre-register + spawn_child_process.
+            let (config, ctx) = {
+                let mut orch = orchestrator.lock().await;
+                let config = match orch.check_can_start(&resolved) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return BrokerResponse::Error {
+                            message: format!("agent start failed: {e}"),
+                        };
+                    }
+                };
+                (config, orch.snapshot_spawn_context())
+            };
+            let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return BrokerResponse::Error {
+                        message: format!("agent start failed: {e}"),
+                    };
+                }
+            };
+            orchestrator.lock().await.register_pending(pending);
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
             }
         }
         BrokerRequest::AgentStop { name } => {
@@ -1370,14 +1419,30 @@ async fn handle_request(
             if let Some(h) = handle {
                 let _ = h.await;
             }
-            let mut orch = orchestrator.lock().await;
-            match orch.start_by_name(&resolved).await {
-                Ok(()) => BrokerResponse::Ok {
-                    payload: ResponsePayload::Ack {},
-                },
-                Err(e) => BrokerResponse::Error {
-                    message: format!("agent restart failed: {e}"),
-                },
+            // Same three-phase pattern as AgentStart for the respawn.
+            let (config, ctx) = {
+                let mut orch = orchestrator.lock().await;
+                let config = match orch.check_can_start(&resolved) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return BrokerResponse::Error {
+                            message: format!("agent restart failed: {e}"),
+                        };
+                    }
+                };
+                (config, orch.snapshot_spawn_context())
+            };
+            let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
+                Ok(p) => p,
+                Err(e) => {
+                    return BrokerResponse::Error {
+                        message: format!("agent restart failed: {e}"),
+                    };
+                }
+            };
+            orchestrator.lock().await.register_pending(pending);
+            BrokerResponse::Ok {
+                payload: ResponsePayload::Ack {},
             }
         }
     }
@@ -1824,12 +1889,21 @@ mod tests {
             )
             .expect_err("collision must be rejected");
         assert!(
-            err.contains("w-fixed"),
-            "error should name the colliding id: {err}"
+            matches!(
+                err,
+                BrokerError::WorkerIdCollision { ref supplied, ref existing_name, .. }
+                    if supplied == "w-fixed" && existing_name == "alice"
+            ),
+            "expected WorkerIdCollision for w-fixed/alice, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("w-fixed"),
+            "error display should name the colliding id: {msg}"
         );
         assert!(
-            err.contains("alice"),
-            "error should name the existing worker: {err}"
+            msg.contains("alice"),
+            "error display should name the existing worker: {msg}"
         );
         // The original worker is still there, untouched.
         assert_eq!(state.workers.len(), 1);

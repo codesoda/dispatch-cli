@@ -88,12 +88,14 @@ pub enum Commands {
         #[arg(long = "role-prompt")]
         role_prompt: Option<String>,
 
-        /// Output the role prompt body to stdout instead of the JSON
-        /// envelope (issue #43). Intentional CLI wart whose only purpose
-        /// is to be friendly to a downstream LLM tool result: the spawned
-        /// agent's first tool call is `dispatch register --for-agent`,
-        /// and the prompt body landing on stdout becomes its next
-        /// instruction. Without the flag, behavior is unchanged.
+        /// Route the role prompt body to stdout (for downstream LLM tool
+        /// result consumption); the JSON envelope is redirected to stderr
+        /// with `role_prompt` stripped (issue #43). Intentional CLI wart
+        /// whose only purpose is to be friendly to a downstream LLM tool
+        /// result: the spawned agent's first tool call is `dispatch
+        /// register --for-agent`, and the prompt body landing on stdout
+        /// becomes its next instruction. Without the flag, behavior is
+        /// unchanged.
         #[arg(long = "for-agent")]
         for_agent: bool,
     },

@@ -340,6 +340,13 @@ async fn api_shutdown(State(state): State<MonitorState>) -> StatusCode {
 
 /// Start a configured agent by name. Same authz posture as `/api/shutdown`:
 /// unauthenticated, intended for local-loopback use only.
+///
+/// Three-phase pattern (PR #28 / #43): hold the orchestrator mutex only
+/// for cheap synchronous validation + snapshot in phase 1, run the heavy
+/// `build_pending_agent` await in phase 2 unlocked, and re-lock in phase
+/// 3 just to push the result. Without this, a slow start (boot prompt
+/// write + broker pre-register + `spawn_child_process`) would stall the
+/// dashboard's 2 s `/api/agents/state` poll on the same mutex.
 async fn api_agent_start(
     State(state): State<MonitorState>,
     Path(name): Path<String>,
@@ -347,11 +354,27 @@ async fn api_agent_start(
     if !super::orchestrator::is_safe_name(&name) {
         return error_response(StatusCode::BAD_REQUEST, "invalid agent name");
     }
-    let mut orch = state.orchestrator.lock().await;
-    match orch.start_by_name(&name).await {
-        Ok(()) => ok_response(),
-        Err(e) => error_response(classify_agent_error(&e), &e.to_string()),
-    }
+
+    // Phase 1 (locked): validate name + snapshot spawn context.
+    let (config, ctx) = {
+        let mut orch = state.orchestrator.lock().await;
+        let config = match orch.check_can_start(&name) {
+            Ok(c) => c,
+            Err(e) => return error_response(classify_agent_error(&e), &e.to_string()),
+        };
+        (config, orch.snapshot_spawn_context())
+    };
+
+    // Phase 2 (unlocked): heavy spawn — file IO, broker pre-register,
+    // process launch — without pinning the orchestrator mutex.
+    let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
+        Ok(p) => p,
+        Err(e) => return error_response(classify_agent_error(&e), &e.to_string()),
+    };
+
+    // Phase 3 (locked): commit the spawned agent into the tracked set.
+    state.orchestrator.lock().await.register_pending(pending);
+    ok_response()
 }
 
 /// Stop a running managed agent by name. Releases the orchestrator mutex
@@ -409,13 +432,27 @@ async fn api_agent_restart(
         let _ = h.await;
     }
 
-    // Phase 3 (locked): respawn. `start_by_name` reaps any finished
-    // supervisor entry in case one slipped through between phases.
-    let mut orch = state.orchestrator.lock().await;
-    match orch.start_by_name(&name).await {
-        Ok(()) => ok_response(),
-        Err(e) => error_response(classify_agent_error(&e), &e.to_string()),
-    }
+    // Phase 3 (locked): validate + snapshot for the respawn.
+    // `check_can_start` reaps any finished supervisor entry in case one
+    // slipped through between phases.
+    let (config, ctx) = {
+        let mut orch = state.orchestrator.lock().await;
+        let config = match orch.check_can_start(&name) {
+            Ok(c) => c,
+            Err(e) => return error_response(classify_agent_error(&e), &e.to_string()),
+        };
+        (config, orch.snapshot_spawn_context())
+    };
+
+    // Phase 4 (unlocked): heavy spawn — same rationale as api_agent_start.
+    let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
+        Ok(p) => p,
+        Err(e) => return error_response(classify_agent_error(&e), &e.to_string()),
+    };
+
+    // Phase 5 (locked): commit.
+    state.orchestrator.lock().await.register_pending(pending);
+    ok_response()
 }
 
 /// Map orchestrator launch errors to HTTP statuses. "No such agent" is 404,

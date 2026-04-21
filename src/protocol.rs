@@ -133,6 +133,17 @@ pub enum BrokerRequest {
     AgentRestart { name: String },
 }
 
+/// Payload for a `ResponsePayload::Timeout`. Wrapped in its own struct so
+/// `deny_unknown_fields` can apply (variant-level attribute isn't supported
+/// in this serde version) — see the doc comment on the variant for why
+/// rejecting unknown fields is what makes `Timeout` and `WorkerRegistered`
+/// distinguishable in the untagged enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeoutPayload {
+    pub worker_id: String,
+}
+
 /// Summary of a worker's status for the status query response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStatus {
@@ -205,13 +216,25 @@ pub enum ResponsePayload {
     HeartbeatAck { worker_id: String, expires_at: u64 },
     /// List of active workers.
     WorkerList { workers: Vec<Worker> },
+    /// Listen timed out with no messages. MUST appear before
+    /// `WorkerRegistered`: serde's untagged dispatcher treats `Option`
+    /// fields as defaultable, so a payload `{"worker_id":"x"}` would
+    /// otherwise silently deserialize as
+    /// `WorkerRegistered { role_prompt: None }` (declared further down)
+    /// and the timeout signal would be lost. The `deny_unknown_fields`
+    /// on `TimeoutPayload` stops Timeout from swallowing payloads that
+    /// DO carry `role_prompt` — those fall through to `WorkerRegistered`
+    /// as intended. (Variant-level `deny_unknown_fields` is not supported
+    /// in this serde version, hence the wrapper struct.)
+    Timeout(TimeoutPayload),
     /// A worker was registered; returns the assigned worker ID. When the
     /// broker has a role prompt stored for this worker (issue #43), it is
     /// returned here so the spawned agent receives its first instructions
-    /// as the response body of its own `dispatch register` call.
+    /// as the response body of its own `dispatch register` call. The
+    /// `role_prompt` field is always serialized (even when `None`) so the
+    /// wire shape is unambiguously distinct from `Timeout` above.
     WorkerRegistered {
         worker_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         role_prompt: Option<String>,
     },
     /// Message acknowledgement confirmed. MUST appear before `MessageAck`:
@@ -230,8 +253,6 @@ pub enum ResponsePayload {
     EventList { events: Vec<serde_json::Value> },
     /// Message history query result.
     MessageList { messages: Vec<Message> },
-    /// Listen timed out with no messages.
-    Timeout { worker_id: String },
     /// Map of arbitrary key-value data (used as a flexible response shape).
     Data {
         data: HashMap<String, serde_json::Value>,
@@ -369,9 +390,9 @@ mod tests {
                 to: "w1".into(),
                 body: "payload".into(),
             },
-            ResponsePayload::Timeout {
+            ResponsePayload::Timeout(TimeoutPayload {
                 worker_id: "w1".into(),
-            },
+            }),
             ResponsePayload::AckConfirm {
                 message_id: "msg-2".into(),
                 ack_confirmed: true,
@@ -455,6 +476,62 @@ mod tests {
             } => assert!(ack_confirmed),
             other => panic!("expected AckConfirm, got {other:?}"),
         }
+    }
+
+    /// Regression: `WorkerRegistered { role_prompt: None }` and `Timeout`
+    /// would both serialize to `{"worker_id":"..."}` if `role_prompt` were
+    /// skipped on `None`, and the untagged deserializer would always pick
+    /// the first matching variant — silently swapping `Timeout` into
+    /// `WorkerRegistered` or vice versa. Match-arm on the variant (not on
+    /// JSON equality, which is unable to detect this) so any future change
+    /// that reintroduces field-skipping or drops `deny_unknown_fields` on
+    /// `TimeoutPayload` fails this test.
+    #[test]
+    fn timeout_does_not_degrade_to_worker_registered() {
+        let payload = ResponsePayload::Timeout(TimeoutPayload {
+            worker_id: "w1".into(),
+        });
+        let resp = BrokerResponse::Ok { payload };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: BrokerResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                back,
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::Timeout(_)
+                }
+            ),
+            "Timeout round-tripped as the wrong variant: {json}"
+        );
+
+        // Symmetric: the no-prompt WorkerRegistered case must NOT degrade to
+        // Timeout either. With `role_prompt` always serialized, both forms
+        // (Some and None) carry the field. `TimeoutPayload`'s
+        // `deny_unknown_fields` rejects the `role_prompt` key, so untagged
+        // dispatch falls through to `WorkerRegistered`.
+        let payload = ResponsePayload::WorkerRegistered {
+            worker_id: "w1".into(),
+            role_prompt: None,
+        };
+        let resp = BrokerResponse::Ok { payload };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"role_prompt\":null"),
+            "role_prompt must be serialized even when None to keep Timeout/WorkerRegistered distinguishable: {json}"
+        );
+        let back: BrokerResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                back,
+                BrokerResponse::Ok {
+                    payload: ResponsePayload::WorkerRegistered {
+                        role_prompt: None,
+                        ..
+                    }
+                }
+            ),
+            "WorkerRegistered with None prompt round-tripped as the wrong variant: {json}"
+        );
     }
 
     /// BrokerResponse::Error round-trips correctly.

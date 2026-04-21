@@ -331,9 +331,8 @@ fn register_claim_returns_originally_stored_prompt() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert_eq!(
-        stdout.trim(),
-        prompt,
-        "claim must return the prompt the orchestrator originally stored",
+        stdout, prompt,
+        "claim must return exactly the prompt the orchestrator originally stored",
     );
 }
 
