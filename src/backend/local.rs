@@ -1369,6 +1369,9 @@ async fn handle_request(
             let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
                 Ok(p) => p,
                 Err(e) => {
+                    // Release the phase 1 reservation so future starts
+                    // of this name aren't blocked by a stale slot.
+                    orchestrator.lock().await.cancel_start(&resolved);
                     return BrokerResponse::Error {
                         message: format!("agent start failed: {e}"),
                     };
@@ -1435,6 +1438,8 @@ async fn handle_request(
             let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
                 Ok(p) => p,
                 Err(e) => {
+                    // Release the phase 3 reservation on build failure.
+                    orchestrator.lock().await.cancel_start(&resolved);
                     return BrokerResponse::Error {
                         message: format!("agent restart failed: {e}"),
                     };

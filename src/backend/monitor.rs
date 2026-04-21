@@ -355,7 +355,8 @@ async fn api_agent_start(
         return error_response(StatusCode::BAD_REQUEST, "invalid agent name");
     }
 
-    // Phase 1 (locked): validate name + snapshot spawn context.
+    // Phase 1 (locked): validate name + claim the `starting` reservation
+    // + snapshot spawn context.
     let (config, ctx) = {
         let mut orch = state.orchestrator.lock().await;
         let config = match orch.check_can_start(&name) {
@@ -369,10 +370,17 @@ async fn api_agent_start(
     // process launch — without pinning the orchestrator mutex.
     let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
         Ok(p) => p,
-        Err(e) => return error_response(classify_agent_error(&e), &e.to_string()),
+        Err(e) => {
+            // Build failed — release the phase 1 reservation so future
+            // starts of this name aren't blocked by a stale "already
+            // starting" slot.
+            state.orchestrator.lock().await.cancel_start(&name);
+            return error_response(classify_agent_error(&e), &e.to_string());
+        }
     };
 
-    // Phase 3 (locked): commit the spawned agent into the tracked set.
+    // Phase 3 (locked): commit the spawned agent into the tracked set
+    // (also clears the `starting` reservation).
     state.orchestrator.lock().await.register_pending(pending);
     ok_response()
 }
@@ -432,9 +440,9 @@ async fn api_agent_restart(
         let _ = h.await;
     }
 
-    // Phase 3 (locked): validate + snapshot for the respawn.
-    // `check_can_start` reaps any finished supervisor entry in case one
-    // slipped through between phases.
+    // Phase 3 (locked): validate + claim `starting` + snapshot for the
+    // respawn. `check_can_start` reaps any finished supervisor entry in
+    // case one slipped through between phases.
     let (config, ctx) = {
         let mut orch = state.orchestrator.lock().await;
         let config = match orch.check_can_start(&name) {
@@ -447,10 +455,14 @@ async fn api_agent_restart(
     // Phase 4 (unlocked): heavy spawn — same rationale as api_agent_start.
     let pending = match super::orchestrator::build_pending_agent(ctx, &config).await {
         Ok(p) => p,
-        Err(e) => return error_response(classify_agent_error(&e), &e.to_string()),
+        Err(e) => {
+            // Release the phase 3 reservation on build failure.
+            state.orchestrator.lock().await.cancel_start(&name);
+            return error_response(classify_agent_error(&e), &e.to_string());
+        }
     };
 
-    // Phase 5 (locked): commit.
+    // Phase 5 (locked): commit (also clears the `starting` reservation).
     state.orchestrator.lock().await.register_pending(pending);
     ok_response()
 }

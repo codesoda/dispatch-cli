@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -136,6 +136,14 @@ pub struct PendingAgent {
 /// Manages the lifecycle of agent subprocesses and heartbeat timers.
 pub struct AgentOrchestrator {
     agents: Vec<ManagedAgent>,
+    /// Names that have passed `check_can_start` but haven't yet reached
+    /// `register_pending`. The 3-phase pattern releases the orchestrator
+    /// mutex during `build_pending_agent`; without this reservation, two
+    /// concurrent `AgentStart` calls for the same name would both pass
+    /// phase 1's "not in agents" check and both push duplicate entries
+    /// in phase 3. Phase 1 atomically inserts here; phase 3 (success) or
+    /// `cancel_start` (build failure) removes.
+    starting: HashSet<String>,
     heartbeats: Vec<RunningHeartbeat>,
     cell_id: String,
     socket_path: PathBuf,
@@ -168,6 +176,7 @@ impl AgentOrchestrator {
     ) -> Self {
         Self {
             agents: Vec::new(),
+            starting: HashSet::new(),
             heartbeats: Vec::new(),
             cell_id: cell_id.to_string(),
             socket_path: socket_path.to_path_buf(),
@@ -241,11 +250,18 @@ impl AgentOrchestrator {
         Ok(())
     }
 
-    /// Validate that an agent named `name` can be started right now: reap
-    /// any finished supervisors, reject if an instance is already running,
-    /// and look up the config. Pure synchronous validation — no IO, no
-    /// broker calls — so callers can release the orchestrator mutex
-    /// immediately after and run the heavy spawn work unlocked.
+    /// Validate that an agent named `name` can be started right now and
+    /// reserve the slot. Reaps any finished supervisors, rejects if an
+    /// instance is already running OR another concurrent caller is
+    /// already in the middle of starting one, looks up the config, and
+    /// inserts `name` into `starting`. Pure synchronous validation —
+    /// no IO, no broker calls — so callers can release the orchestrator
+    /// mutex immediately after and run the heavy spawn work unlocked.
+    ///
+    /// On success the caller MUST eventually call either `register_pending`
+    /// (build succeeded) or `cancel_start` (build failed). Otherwise the
+    /// `starting` reservation lingers and future starts of the same name
+    /// will be rejected with "already starting" forever.
     ///
     /// Companion to `build_pending_agent` + `register_pending` for the
     /// three-phase start pattern used by HTTP / IPC handlers.
@@ -258,14 +274,31 @@ impl AgentOrchestrator {
                 reason: "already running".into(),
             });
         }
-        self.configs
+        if self.starting.contains(name) {
+            return Err(DispatchError::AgentLaunchFailed {
+                name: name.to_string(),
+                reason: "already starting from a concurrent request".into(),
+            });
+        }
+        let config = self
+            .configs
             .iter()
             .find(|a| a.name == name)
             .cloned()
             .ok_or_else(|| DispatchError::AgentLaunchFailed {
                 name: name.to_string(),
                 reason: "no such agent in config".into(),
-            })
+            })?;
+        self.starting.insert(name.to_string());
+        Ok(config)
+    }
+
+    /// Release a `starting` reservation that was claimed by
+    /// `check_can_start` but won't be completed. Call from the build
+    /// error path of the three-phase pattern; without it the slot is
+    /// permanently reserved and future starts of the same name fail.
+    pub fn cancel_start(&mut self, name: &str) {
+        self.starting.remove(name);
     }
 
     /// Snapshot the immutable orchestrator state needed to spawn an agent.
@@ -284,8 +317,17 @@ impl AgentOrchestrator {
 
     /// Commit a freshly-spawned agent to the orchestrator's tracked set.
     /// Phase 3 of the unlocked-spawn pattern — caller has already done
-    /// `check_can_start` (phase 1) and `build_pending_agent` (phase 2).
+    /// `check_can_start` (phase 1, claimed the `starting` reservation)
+    /// and `build_pending_agent` (phase 2, did the heavy IO work).
+    /// Removes the reservation and pushes onto `agents`. No race-recheck
+    /// needed: the phase 1 reservation guaranteed mutual exclusion against
+    /// other concurrent starts of this name.
+    ///
+    /// Tolerant of being called without a prior reservation (e.g. via
+    /// `spawn_agent`'s always-locked path) — the remove is a no-op when
+    /// the name isn't present.
     pub fn register_pending(&mut self, pending: PendingAgent) {
+        self.starting.remove(&pending.inner.name);
         self.agents.push(pending.inner);
     }
 
@@ -808,18 +850,27 @@ async fn supervise_agent(
                 // Issue #43: refresh the broker's worker record + role
                 // prompt before the respawn so the agent's claim call can
                 // get its prompt back even if TTL expired during downtime.
-                // Idempotent on alive workers (no-op claim renewing TTL),
-                // fresh-creates if the record was GC'd. evict=true so any
-                // stale same-name worker with a different id (e.g. from a
-                // manual `dispatch register` that raced during downtime)
-                // is cleaned up — the supervisor's id should be the only
-                // record bearing this name.
+                // Three branches in `BrokerState::register_worker`:
+                // - Supervisor's worker still alive (TTL not expired):
+                //   idempotent-claim short-circuit matches name+role,
+                //   renews TTL, refreshes description (and capabilities
+                //   if non-empty). evict pass is BYPASSED — a same-name
+                //   worker with a different id from a racing manual
+                //   `dispatch register` would persist alongside us.
+                // - Supervisor's worker GC'd: idempotent-claim misses,
+                //   evict=true wipes any same-name worker with a
+                //   different id, then a fresh entry is created using
+                //   the supervisor's id.
+                // - worker_id collision (different name+role under our
+                //   id — essentially impossible with UUIDs but defended
+                //   against): register_worker returns Err, handled below
+                //   as terminal Crashed.
                 //
-                // Treat failure as terminal: if we can't restore the broker
-                // state, the respawned child will fail its `--for-agent`
-                // lookup and crash-loop until MAX_RESTART_ATTEMPTS with only
-                // a generic "exited with ..." reason. Surface the real cause
-                // immediately instead.
+                // Treat the Err case as terminal: if we can't restore
+                // the broker state, the respawned child will fail its
+                // `--for-agent` lookup and crash-loop until
+                // MAX_RESTART_ATTEMPTS with only a generic "exited with
+                // ..." reason. Surface the real cause immediately instead.
                 if let Some((broker, worker_id, role_prompt)) = &re_register {
                     let register_result = {
                         let mut b = broker.lock().await;
@@ -1277,6 +1328,71 @@ mod tests {
             b.notifiers.is_empty(),
             "spawn failure must not leave an orphan notifier",
         );
+    }
+
+    /// `check_can_start` reserves the agent name in `starting` so a
+    /// concurrent caller in the unlocked-spawn pattern can't pass phase
+    /// 1 for the same name. `register_pending` and `cancel_start` both
+    /// release the reservation. Without this, two parallel
+    /// `BrokerRequest::AgentStart` calls would race past `check_can_start`
+    /// and push duplicate `ManagedAgent` entries.
+    #[tokio::test]
+    async fn check_can_start_reserves_name_until_register_or_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config("alice", "sleep 30");
+        let mut orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            vec![cfg.clone()],
+            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+        );
+
+        // First reservation succeeds.
+        orch.check_can_start("alice").expect("first reservation");
+
+        // Second reservation while the first is still pending must fail
+        // with "already starting" — this is the race-defense that makes
+        // the 3-phase pattern safe.
+        let err = orch
+            .check_can_start("alice")
+            .expect_err("second reservation must be rejected");
+        match err {
+            DispatchError::AgentLaunchFailed { name, reason } => {
+                assert_eq!(name, "alice");
+                assert!(
+                    reason.contains("already starting"),
+                    "expected 'already starting' rejection, got: {reason}"
+                );
+            }
+            other => panic!("expected AgentLaunchFailed, got: {other:?}"),
+        }
+
+        // cancel_start releases the slot — a fresh check_can_start succeeds.
+        orch.cancel_start("alice");
+        orch.check_can_start("alice")
+            .expect("post-cancel reservation");
+
+        // Now exercise the success path via a real spawn. spawn_agent is
+        // tolerant of the lingering reservation (register_pending removes
+        // it) so the agent ends up in `agents` with no leftover slot.
+        orch.spawn_agent(&cfg).await.expect("spawn");
+        // After register_pending, "alice" is in agents and NOT in starting.
+        // Starting a fresh "alice" now hits the "already running" guard,
+        // not "already starting".
+        let err = orch.check_can_start("alice").expect_err("alice is running");
+        match err {
+            DispatchError::AgentLaunchFailed { reason, .. } => {
+                assert!(
+                    reason.contains("already running"),
+                    "expected 'already running', got: {reason}"
+                );
+            }
+            other => panic!("expected AgentLaunchFailed, got: {other:?}"),
+        }
+        orch.shutdown_all().await;
     }
 
     /// Supervisor reports Running while a long-lived child is alive, and
