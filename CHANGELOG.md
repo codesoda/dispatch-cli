@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-22
+
+### Added
+- `launch = false` agents with a `prompt_file` now use the same register-prompt-bootstrap as supervised agents. At serve startup dispatch pre-registers a worker server-side and prints a pasteable command that includes `DISPATCH_WORKER_ID=<uuid>` and redirects stdin from a one-line boot prompt (`Run: dispatch register --worker-id "$DISPATCH_WORKER_ID" ... --for-agent`). The agent's first tool call idempotently claims the pre-registered worker and retrieves the role prompt — same mechanism as supervised agents, just with the user launching the process.
+- `AgentOrchestrator::pre_register_unmanaged(ctx, config)` — factored from the managed-spawn pre-register flow; returns `(worker_id, boot_prompt_path)` for the serve-time banner to render.
+- `build_agent_command` accepts a `worker_id: Option<&str>` parameter; when `Some`, emits `DISPATCH_WORKER_ID=<id>` so the bootstrap works on paste.
+
+### Changed
+- **Breaking:** dropped the `--launch` flag on `dispatch serve`. `launch = true` in the agent config is now the single source of truth: those agents auto-spawn under the supervisor; `launch = false` agents are printed for copy-paste. Removes a redundant CLI-vs-config toggle.
+- **Breaking:** removed `[main_agent]` / `MainAgentConfig`. The main-agent concept collapses into a regular `[[agents]]` entry with `launch = false` (plus a `prompt_file` if you want the bootstrap). Configs with `[main_agent]` now fail parse with `unknown field 'main_agent'` — migrate by renaming the table to `[[agents]]` and adding `launch = false`. The previous schema didn't support `adapter`, `extra_args`, `role`, `description`, or `ttl`, so the unified shape is strictly more expressive.
+- Monitor dashboard: the pinned "main agent" slot is gone. All agents render uniformly; the hardcoded `role = "coordinator"` label for the main slot no longer exists (agents now show their configured role).
+- `dispatch init` template updated to show a commented `[[agents]] launch = false + prompt_file` example for the coordinator-style use case.
+
 ## [0.5.0] - 2026-04-21
 
 ### Added
