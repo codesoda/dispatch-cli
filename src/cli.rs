@@ -41,10 +41,6 @@ pub enum Commands {
         /// Start an HTTP monitor dashboard on this port
         #[arg(long)]
         monitor: Option<u16>,
-
-        /// Auto-launch configured agents (default: print commands only)
-        #[arg(long)]
-        launch: bool,
     },
 
     /// Register a worker with the broker

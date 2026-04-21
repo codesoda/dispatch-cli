@@ -70,19 +70,13 @@ pub struct BrokerEvent {
 pub struct LocalBackend {
     config: crate::config::ResolvedConfig,
     monitor_port: Option<u16>,
-    launch_agents: bool,
 }
 
 impl LocalBackend {
-    pub fn new(
-        config: &crate::config::ResolvedConfig,
-        monitor_port: Option<u16>,
-        launch_agents: bool,
-    ) -> Self {
+    pub fn new(config: &crate::config::ResolvedConfig, monitor_port: Option<u16>) -> Self {
         Self {
             config: config.clone(),
             monitor_port,
-            launch_agents,
         }
     }
 }
@@ -92,7 +86,7 @@ impl super::Backend for LocalBackend {
     /// Start the broker server on a Unix domain socket, blocking until
     /// a shutdown signal (SIGINT/SIGTERM) is received.
     async fn serve(&self) -> Result<(), DispatchError> {
-        serve(&self.config, self.monitor_port, self.launch_agents).await
+        serve(&self.config, self.monitor_port).await
     }
 
     /// Send a request to the broker over a Unix domain socket and
@@ -768,7 +762,6 @@ async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<(), Di
 pub async fn serve(
     config: &crate::config::ResolvedConfig,
     monitor_port: Option<u16>,
-    launch_agents: bool,
 ) -> Result<(), DispatchError> {
     let cell_id = &config.cell_id;
     let project_root = &config.project_root;
@@ -851,10 +844,11 @@ pub async fn serve(
         }
     }
 
-    if launch_agents {
-        // Auto-launch only agents explicitly marked `launch = true`. Agents
-        // with `launch = false` (the default) stay unmanaged and their
-        // copy-paste launch commands are printed below instead.
+    // Auto-launch agents marked `launch = true`. Agents with `launch = false`
+    // (the default) stay unmanaged and their copy-paste launch commands are
+    // printed below instead. `launch_all` already filters by `launch = true`,
+    // so it's safe to always call.
+    {
         let mut orch = orchestrator.lock().await;
         orch.launch_all().await?;
         // Start configured heartbeat timers.
@@ -863,9 +857,7 @@ pub async fn serve(
         }
     }
 
-    // Print copy-paste launch commands for agents that were not auto-launched.
-    // That means: every agent when `--launch` is not set, plus `launch = false`
-    // agents when `--launch` is set.
+    // Print copy-paste launch commands for every `launch = false` agent.
     //
     // For every unmanaged agent with a `prompt_file`, pre-register a worker
     // server-side and wire the printed command to the issue-#43 boot-prompt
@@ -875,11 +867,8 @@ pub async fn serve(
     // worker and retrieves the role prompt — same mechanism as supervised
     // agents, just with the user launching the process instead of the
     // orchestrator.
-    let manual: Vec<&crate::config::ResolvedAgentConfig> = config
-        .agents
-        .iter()
-        .filter(|a| !launch_agents || !a.launch)
-        .collect();
+    let manual: Vec<&crate::config::ResolvedAgentConfig> =
+        config.agents.iter().filter(|a| !a.launch).collect();
     if !manual.is_empty() {
         eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
         let ctx = orchestrator.lock().await.snapshot_spawn_context();
@@ -1559,7 +1548,7 @@ mod tests {
     async fn test_client_broker_not_running() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path(), "nonexistent-cell");
-        let backend = LocalBackend::new(&config, None, false);
+        let backend = LocalBackend::new(&config, None);
 
         let result = backend
             .send_request(&BrokerRequest::Team { from: None })
@@ -1583,13 +1572,13 @@ mod tests {
         // Start broker in background.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait for broker to start.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let cfg = test_config(&project_root, cell_id);
-        let backend = LocalBackend::new(&cfg, None, false);
+        let backend = LocalBackend::new(&cfg, None);
         let response = backend
             .send_request(&BrokerRequest::Team { from: None })
             .await;
@@ -1679,7 +1668,7 @@ mod tests {
         // Start broker in background.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait briefly for the server to bind.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1725,7 +1714,7 @@ mod tests {
         });
 
         // Try to start second broker — should fail.
-        let result = serve(&test_config(&project_root, cell_id), None, false).await;
+        let result = serve(&test_config(&project_root, cell_id), None).await;
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -1760,7 +1749,7 @@ mod tests {
         // Starting serve should clean up the stale socket and bind fresh.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait briefly for the server to bind.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2176,7 +2165,7 @@ mod tests {
         // Start broker.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Send register request via raw socket.
@@ -2224,7 +2213,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, "cap-test");
@@ -2470,7 +2459,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2510,7 +2499,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2543,7 +2532,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2678,7 +2667,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2720,7 +2709,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2921,7 +2910,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2968,7 +2957,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3008,7 +2997,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3061,7 +3050,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3110,7 +3099,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3139,7 +3128,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3185,7 +3174,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);

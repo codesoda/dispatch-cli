@@ -125,7 +125,9 @@ pub struct AgentConfig {
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     pub ttl: Option<u64>,
-    /// Whether `dispatch serve --launch` should auto-start this agent.
+    /// Whether `dispatch serve` should auto-start this agent under the
+    /// supervisor. `false` (the default) prints a copy-paste command at
+    /// startup instead so you can run the agent yourself.
     #[serde(default)]
     pub launch: bool,
     /// Issue #43: when true, the claude adapter is launched with
@@ -276,7 +278,7 @@ const CONFIG_TEMPLATE: &str = "\
 # port = 8384
 # open = true  # open the dashboard in your default browser
 
-# Agent definitions — auto-started by `dispatch serve --launch` when launch = true.
+# Agent definitions — auto-started by `dispatch serve` when launch = true.
 #
 # When `launch = true` AND `prompt_file` is set (the managed-agent flow),
 # dispatch pre-registers the worker server-side at spawn time, injects
@@ -828,7 +830,7 @@ adapter = "gpt"
 
     /// Agent names must pass `is_safe_name` at resolve time so the
     /// boot-prompt filename (derived via lossy `sanitize_name`) cannot
-    /// collide across distinct raw names under `dispatch serve --launch`.
+    /// collide across distinct raw names under `dispatch serve`.
     #[test]
     fn agent_config_rejects_name_with_unsafe_characters() {
         let tmp = TempDir::new().unwrap();
