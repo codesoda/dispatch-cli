@@ -149,7 +149,6 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
                 a,
                 &state.cell_id,
                 state.monitor_url.as_deref(),
-                None,
             );
             serde_json::json!({
                 "name": a.name,

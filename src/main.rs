@@ -249,18 +249,20 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     // `send_request` returns `Ok(BrokerResponse::Error { .. })`
                     // for broker-side errors (e.g. worker_id collision when
                     // DISPATCH_AGENT_NAME drifted from what was pre-registered).
-                    // Forward `message` verbatim so the supervisor's logs
-                    // surface the real cause instead of the generic
-                    // "no role prompt" line below.
+                    // Forward `message` verbatim via a typed error so the
+                    // exit-code classifier in `main` stays authoritative.
                     BrokerResponse::Error { message } => {
-                        eprintln!("dispatch: register --for-agent failed: {message}");
-                        process::exit(1);
+                        return Err(dispatch::errors::DispatchError::RegisterForAgentFailed {
+                            message: message.clone(),
+                        });
                     }
                     _ => {
+                        // Log the unexpected JSON envelope to stderr before
+                        // bubbling the typed error — useful for debugging a
+                        // response shape that shouldn't happen in practice.
                         let json = serde_json::to_string(&response)?;
                         eprintln!("{json}");
-                        eprintln!("dispatch: --for-agent set but response carries no role prompt");
-                        process::exit(1);
+                        return Err(dispatch::errors::DispatchError::NoRolePromptReturned);
                     }
                 }
             } else {

@@ -259,6 +259,20 @@ impl BrokerState {
         worker_id: Option<String>,
         role_prompt: Option<String>,
     ) -> Result<String, BrokerError> {
+        // Prune expired workers up front — every other broker entry point
+        // (`list_workers`, `heartbeat_worker`, message / team / mailbox
+        // handlers) does this, and skipping it here opens a race where the
+        // issue-#43 pre-register path stores a role_prompt, the pre-registered
+        // worker's TTL elapses before the agent claims, another broker
+        // request (e.g. `listen`) drops it via its own `evict_expired` AND
+        // its `role_prompts` entry, the agent's subsequent claim misses the
+        // idempotent short-circuit and falls through to the insert branch,
+        // and the response carries `role_prompt: None`. With the preamble
+        // the failure is deterministic regardless of interleaving, and the
+        // supervisor's respawn-time re-register (evict=true, role_prompt
+        // populated) restores the prompt on the next attempt.
+        self.evict_expired();
+
         // Idempotent-claim short-circuit: if the supplied id already exists
         // and matches name+role, return it (and renew TTL) without touching
         // the rest of the state. This must run BEFORE the evict pass so that
@@ -861,12 +875,8 @@ pub async fn serve(
     if !manual.is_empty() {
         eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
         for agent in &manual {
-            let cmd = super::orchestrator::build_agent_command(
-                agent,
-                cell_id,
-                monitor_url.as_deref(),
-                None,
-            );
+            let cmd =
+                super::orchestrator::build_agent_command(agent, cell_id, monitor_url.as_deref());
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
         }

@@ -159,6 +159,23 @@ fn resolve_agent_config(
 ) -> Result<ResolvedAgentConfig, DispatchError> {
     use crate::adapter::Adapter;
 
+    // Reject names that can't be used as a single on-disk filename
+    // component. The HTTP boundaries (`api_agent_start/stop/restart`) already
+    // gate on `is_safe_name`, but the `launch_all` / `spawn_agent` path
+    // derives the issue-#43 boot-prompt filename from `sanitize_name`, which
+    // lossily collapses non-`[A-Za-z0-9_-]` characters to `_`. Two configs
+    // like `alice/foo` and `alice_foo` would both map to
+    // `alice_foo.boot.prompt`, silently overwriting each other. Enforce the
+    // same rule at config time so both paths use the identical gate.
+    if !crate::backend::orchestrator::is_safe_name(&agent.name) {
+        return Err(DispatchError::AgentConfigError {
+            name: agent.name.clone(),
+            reason:
+                "agent name must be non-empty and contain only ASCII alphanumerics, '-', or '_'"
+                    .into(),
+        });
+    }
+
     if agent.adapter == Adapter::Command && agent.command.is_none() {
         return Err(DispatchError::AgentConfigError {
             name: agent.name.clone(),
@@ -842,5 +859,33 @@ adapter = "gpt"
         .unwrap();
 
         assert!(resolve_config_inner(None, None, None, tmp.path()).is_err());
+    }
+
+    /// Agent names must pass `is_safe_name` at resolve time so the
+    /// boot-prompt filename (derived via lossy `sanitize_name`) cannot
+    /// collide across distinct raw names under `dispatch serve --launch`.
+    #[test]
+    fn agent_config_rejects_name_with_unsafe_characters() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "alice/foo"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alice/foo") && msg.contains("ASCII"),
+            "expected safe-name rejection for 'alice/foo', got: {msg}"
+        );
     }
 }

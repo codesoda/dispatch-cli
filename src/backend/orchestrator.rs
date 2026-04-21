@@ -358,9 +358,24 @@ impl AgentOrchestrator {
     /// Before rejecting on `already running`, this reaps any ManagedAgent
     /// whose supervisor task has already finished (Crashed or Stopped), so a
     /// previously-failed agent can be started again without needing `restart`.
+    ///
+    /// Uses the explicit three-phase pattern (`check_can_start` →
+    /// `build_pending_agent` → `register_pending` / `cancel_start`) so a
+    /// build failure after `check_can_start` reserved the slot releases
+    /// the reservation instead of leaving it stuck as "already starting".
     pub async fn start_by_name(&mut self, name: &str) -> Result<(), DispatchError> {
         let config = self.check_can_start(name)?;
-        self.spawn_agent(&config).await
+        let snapshot = self.snapshot_spawn_context();
+        match build_pending_agent(snapshot, &config).await {
+            Ok(pending) => {
+                self.register_pending(pending);
+                Ok(())
+            }
+            Err(e) => {
+                self.cancel_start(name);
+                Err(e)
+            }
+        }
     }
 
     /// Restart a running agent: stop it (if running) then spawn it again.
@@ -938,14 +953,17 @@ async fn supervise_agent(
 /// Build an agent command string for the user to paste.
 ///
 /// Includes the dispatch env vars (shell-escaped) and the adapter-assembled
-/// launch string. `worker_id` is `Some` only for the managed-spawn print path
-/// (issue #43); the unmanaged copy-paste path leaves it `None` so the agent
-/// receives a broker-assigned id from its own `dispatch register` call.
+/// launch string. Used by the monitor dashboard's sidebar and by the
+/// serve-time "Unmanaged agents" banner — both are copy-paste paths where
+/// the agent runs its own `dispatch register` and receives a broker-assigned
+/// id. The managed-spawn flow (issue #43, `launch = true` + `prompt_file`)
+/// goes through `build_pending_agent` / `spawn_child_process`, which assembles
+/// the command via `build_launch` directly and injects `DISPATCH_WORKER_ID`
+/// via the env snapshot rather than the command string.
 pub fn build_agent_command(
     config: &ResolvedAgentConfig,
     cell_id: &str,
     monitor_url: Option<&str>,
-    worker_id: Option<&str>,
 ) -> String {
     let mut parts = vec![
         format!("DISPATCH_CELL_ID={}", shell_escape(cell_id)),
@@ -955,10 +973,6 @@ pub fn build_agent_command(
 
     if let Some(url) = monitor_url {
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
-    }
-
-    if let Some(id) = worker_id {
-        parts.push(format!("DISPATCH_WORKER_ID={}", shell_escape(id)));
     }
 
     let cmd_str = AgentOrchestrator::build_launch(config)
@@ -1025,7 +1039,7 @@ pub fn build_main_agent_command(
 /// Whether `s` is safe to use as a single filename component on disk and as
 /// a path segment in a URL (no separators, no `..`, ASCII alphanumerics plus
 /// `-` and `_`).
-pub(super) fn is_safe_name(s: &str) -> bool {
+pub fn is_safe_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -1096,26 +1110,6 @@ mod tests {
         assert_eq!(
             without_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
             Some("test-runner")
-        );
-    }
-
-    /// `build_agent_command` emits `DISPATCH_WORKER_ID=<id>` only when the id
-    /// is supplied — the unmanaged copy-paste path keeps its previous output.
-    #[test]
-    fn build_agent_command_includes_worker_id_when_some() {
-        let cfg = test_config("alice", "echo hi");
-        let with_id = build_agent_command(&cfg, "cell-x", None, Some("w-123"));
-        // shell_escape wraps the value in single quotes; assert on the
-        // assignment as it would appear after escaping.
-        assert!(
-            with_id.contains("DISPATCH_WORKER_ID='w-123'"),
-            "expected worker id in: {with_id}",
-        );
-
-        let without_id = build_agent_command(&cfg, "cell-x", None, None);
-        assert!(
-            !without_id.contains("DISPATCH_WORKER_ID"),
-            "did not expect worker id in: {without_id}",
         );
     }
 
@@ -1328,6 +1322,39 @@ mod tests {
             b.notifiers.is_empty(),
             "spawn failure must not leave an orphan notifier",
         );
+    }
+
+    /// `start_by_name` must release the `starting` reservation when
+    /// `build_pending_agent` fails — otherwise a bad prompt_file (or any
+    /// other build error) permanently blocks the name from ever being
+    /// started. Uses a managed config pointing at a nonexistent prompt
+    /// file to force `build_pending_agent` to error after the reservation
+    /// is claimed.
+    #[tokio::test]
+    async fn start_by_name_releases_reservation_on_build_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_cfg = managed_test_config("alice", "true", tmp.path().join("nope.md"));
+        let mut orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            vec![bad_cfg],
+            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+        );
+
+        // Build fails because the prompt file doesn't exist.
+        let err = orch.start_by_name("alice").await.expect_err("must fail");
+        assert!(
+            matches!(err, DispatchError::PromptFileNotFound { .. }),
+            "expected PromptFileNotFound, got: {err:?}",
+        );
+
+        // Reservation must have been released — a fresh `check_can_start`
+        // for the same name succeeds rather than hitting "already starting".
+        orch.check_can_start("alice")
+            .expect("reservation must be released after build failure");
     }
 
     /// `check_can_start` reserves the agent name in `starting` so a
