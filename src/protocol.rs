@@ -195,6 +195,17 @@ pub struct Worker {
     /// own field. Skipped when empty so older clients see the same shape.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub status_history: VecDeque<StatusEntry>,
+    /// True once the worker has been "claimed" by an actual process:
+    /// either the agent ran `dispatch register` with the supplied id
+    /// (idempotent-claim path), sent a heartbeat, or reported a status.
+    /// False for freshly-inserted records — including the issue-#43
+    /// pre-register path where the orchestrator creates the worker
+    /// server-side before the agent starts. The monitor uses this to
+    /// distinguish "reserved, waiting for the agent to attach" from
+    /// "alive and reporting in." `#[serde(default)]` so responses from
+    /// older brokers (no field present) decode as `false`.
+    #[serde(default)]
+    pub claimed: bool,
 }
 
 /// The payload inside a successful response, varies by request type.
@@ -378,6 +389,7 @@ mod tests {
                     last_status: None,
                     last_status_at: None,
                     status_history: VecDeque::new(),
+                    claimed: false,
                 }],
             },
             ResponsePayload::HeartbeatAck {
@@ -436,6 +448,7 @@ mod tests {
             last_status: Some("waiting on review".into()),
             last_status_at: Some(110),
             status_history: history.clone(),
+            claimed: true,
         };
         let json = serde_json::to_string(&worker).unwrap();
         assert!(json.contains("status_history"));

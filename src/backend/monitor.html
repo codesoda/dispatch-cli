@@ -29,6 +29,11 @@
   .sidebar .nav-item.active { background: #161b22; color: #c9d1d9; border-left-color: #58a6ff; }
   .sidebar .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
   .sidebar .nav-item .dot.live { background: #3fb950; }
+  /* `reserved` = orchestrator has pre-registered the worker server-side
+     (issue #43 bootstrap) but no agent process has claimed it yet. Amber
+     pulse disambiguates it from the dim-gray `pending` ("nothing there
+     at all") and the solid green `live` ("attached and heartbeating"). */
+  .sidebar .nav-item .dot.reserved { background: #d29922; animation: pulse 2s ease-in-out infinite; }
   .sidebar .nav-item .dot.pending { background: #484f58; animation: pulse 2s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
   .sidebar .nav-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -140,6 +145,7 @@
   .copy-cmd .copy-btn:hover { color: #c9d1d9; border-color: #484f58; }
   .status-badge { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
   .status-badge.registered { background: #3fb95020; color: #3fb950; }
+  .status-badge.reserved { background: #d2992220; color: #d29922; }
   .status-badge.pending { background: #484f5820; color: #484f58; }
 
   /* Log output */
@@ -402,23 +408,35 @@ function renderSidebar() {
   for (const cfg of agentConfigs) {
     seen.add(cfg.name);
     const worker = teamWorkers.find(w => w.name === cfg.name);
-    const isLive = !!worker;
+    // Three-state dot:
+    //   no worker record at all        → pending (dim gray, pulsing)
+    //   worker present, not claimed    → reserved (amber, pulsing)
+    //   worker present + claimed       → live (solid green)
+    // `claimed` defaults to false on responses from older brokers, which
+    // would leave the old behavior downgraded to reserved. That's fine:
+    // if a user runs a newer client against an older broker, every
+    // worker looks "reserved" but the data still flows.
+    const dotClass = !worker ? 'pending' : (worker.claimed ? 'live' : 'reserved');
     const statusText = worker?.last_status || '';
     const isActive = selectedAgent === cfg.name && currentView === 'agent';
     html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(cfg.name)}">`;
-    html += `<span class="dot${isLive ? ' live' : ' pending'}"></span>`;
+    html += `<span class="dot ${dotClass}"></span>`;
     html += `<div style="flex:1;overflow:hidden"><span class="name">${esc(cfg.name)}</span><span class="role-tag">${esc(cfg.role)}</span>`;
     if (statusText) html += `<span class="status-tag">${esc(statusText)}</span>`;
     html += `</div></div>`;
   }
 
-  // Show any registered workers not in config (e.g. manually registered)
+  // Show any registered workers not in config (e.g. manually registered).
+  // These reached the broker via an agent's own `dispatch register` call,
+  // so they're `claimed = true` by construction — but honor the field
+  // anyway in case a future path creates non-config records server-side.
   for (const w of teamWorkers) {
     if (seen.has(w.name)) continue;
+    const dotClass = w.claimed ? 'live' : 'reserved';
     const statusText = w.last_status || '';
     const isActive = selectedAgent === w.name && currentView === 'agent';
     html += `<div class="nav-item${isActive ? ' active' : ''}" data-agent-name="${esc(w.name)}">`;
-    html += `<span class="dot live"></span>`;
+    html += `<span class="dot ${dotClass}"></span>`;
     html += `<div style="flex:1;overflow:hidden"><span class="name">${esc(w.name)}</span><span class="role-tag">${esc(w.role)}</span>`;
     if (statusText) html += `<span class="status-tag">${esc(statusText)}</span>`;
     html += `</div></div>`;
@@ -752,9 +770,22 @@ function renderAgentDetail() {
   const configPanel = document.getElementById('agent-config-panel');
   let cfgHtml = '';
 
-  // Status badge
-  const isRegistered = !!worker;
-  cfgHtml += `<div class="config-section"><div class="config-label">Status</div><div class="config-value"><span class="status-badge ${isRegistered ? 'registered' : 'pending'}">${isRegistered ? 'Registered' : 'Waiting to register'}</span></div></div>`;
+  // Status badge — "Registered" means an agent process has actually
+  // claimed the slot (register-with-worker-id or heartbeat). A worker
+  // record exists pre-claim too (issue #43 pre-register flow), shown as
+  // "Reserved" so it's obvious the agent hasn't attached yet.
+  let statusClass, statusLabel;
+  if (!worker) {
+    statusClass = 'pending';
+    statusLabel = 'Waiting to register';
+  } else if (worker.claimed) {
+    statusClass = 'registered';
+    statusLabel = 'Registered';
+  } else {
+    statusClass = 'reserved';
+    statusLabel = 'Reserved (waiting for agent)';
+  }
+  cfgHtml += `<div class="config-section"><div class="config-label">Status</div><div class="config-value"><span class="status-badge ${statusClass}">${statusLabel}</span></div></div>`;
 
   cfgHtml += configBlock('Name', agentCfg?.name || worker?.name || agentName);
   cfgHtml += configBlock('Role', agentCfg?.role || worker?.role || '--');

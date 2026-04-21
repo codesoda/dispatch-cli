@@ -287,6 +287,13 @@ impl BrokerState {
                     if !capabilities.is_empty() {
                         existing.capabilities = capabilities;
                     }
+                    // Flip `claimed` on the idempotent-claim path so the
+                    // monitor can distinguish "pre-registered, waiting" from
+                    // "agent attached." The orchestrator passes `role_prompt =
+                    // Some(_)` when re-registering on respawn; agent claims
+                    // pass `None`. Either way, reaching this branch means an
+                    // actual process called register with our id, so mark it.
+                    existing.claimed = true;
                     let id = supplied.clone();
                     // Only overwrite the stored prompt if the caller supplied
                     // one — agent claims pass `None` and must not erase what
@@ -318,6 +325,14 @@ impl BrokerState {
             }
         }
 
+        // `claimed = false` only when a caller pre-registers with a supplied
+        // id (issue #43 bootstrap flow — orchestrator creates the record
+        // server-side before the agent process starts). A fresh register
+        // without a supplied id is always an agent registering itself, so
+        // mark it claimed immediately. Distinguishing these keeps the
+        // "reserved, waiting" state precise rather than bleeding into the
+        // legacy self-register path.
+        let claimed = worker_id.is_none();
         let id = worker_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_secs();
         let ttl = ttl_secs.unwrap_or(self.default_ttl);
@@ -332,6 +347,7 @@ impl BrokerState {
             last_status: None,
             last_status_at: None,
             status_history: VecDeque::new(),
+            claimed,
         };
         self.workers.insert(id.clone(), worker);
         if let Some(prompt) = role_prompt {
@@ -392,6 +408,12 @@ impl BrokerState {
         if let Some(worker) = self.workers.get_mut(worker_id) {
             let now = now_secs();
             worker.expires_at = now + worker.ttl_secs;
+            // Any heartbeat from the agent is proof of life — flip claimed
+            // so the monitor shows it as attached rather than "reserved,
+            // waiting" (relevant when the orchestrator pre-registers and
+            // the agent starts up by heartbeat-without-register, though
+            // the issue-#43 bootstrap always registers first).
+            worker.claimed = true;
             if let Some(s) = status {
                 let unchanged = worker.last_status.as_deref() == Some(s.as_str());
                 if !unchanged {
@@ -1979,6 +2001,96 @@ mod tests {
             state.role_prompts.get(&id).map(String::as_str),
             Some("Run: dispatch listen --timeout 270"),
             "claim must not erase the stored prompt",
+        );
+    }
+
+    /// A pre-registered worker (caller supplied `worker_id`) is born with
+    /// `claimed = false` so the monitor can show it as "reserved, waiting
+    /// for the agent" rather than solid green. When the agent then
+    /// registers with the same id (idempotent-claim path) OR sends a
+    /// heartbeat, `claimed` flips to true. Self-registered workers
+    /// (no supplied id) skip the reserved state entirely — they're
+    /// always a real process registering itself.
+    #[test]
+    fn test_register_worker_claimed_flips_on_attach() {
+        let mut state = BrokerState::new();
+
+        // Pre-register via supplied id — should start unclaimed.
+        let pre = state
+            .register_worker(
+                "alice".into(),
+                "runner".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                Some("prompt".into()),
+            )
+            .expect("pre-register");
+        assert!(
+            !state.workers.get(&pre).unwrap().claimed,
+            "pre-register must leave worker unclaimed",
+        );
+
+        // Agent-side claim (supplied id matches existing record).
+        let claimed = state
+            .register_worker(
+                "alice".into(),
+                "runner".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim");
+        assert_eq!(claimed, pre);
+        assert!(
+            state.workers.get(&pre).unwrap().claimed,
+            "idempotent claim must flip claimed = true",
+        );
+
+        // Self-register (no supplied id) should be claimed immediately.
+        let self_reg = state
+            .register_worker(
+                "bob".into(),
+                "worker".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("self-register");
+        assert!(
+            state.workers.get(&self_reg).unwrap().claimed,
+            "self-register (no supplied id) must be claimed immediately",
+        );
+
+        // Heartbeat alone is also proof of life — flips claimed on a
+        // pre-registered worker even without a register-claim step.
+        let hb_pre = state
+            .register_worker(
+                "carol".into(),
+                "worker".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                Some("w-carol".into()),
+                None,
+            )
+            .expect("pre-register carol");
+        assert!(!state.workers.get(&hb_pre).unwrap().claimed);
+        state
+            .heartbeat_worker(&hb_pre, None)
+            .expect("heartbeat on pre-registered worker");
+        assert!(
+            state.workers.get(&hb_pre).unwrap().claimed,
+            "heartbeat must flip claimed = true",
         );
     }
 
