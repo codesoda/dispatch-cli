@@ -55,6 +55,11 @@ pub struct ResolvedAgentConfig {
     pub stream_json: bool,
     /// Whether `dispatch serve` should auto-launch and supervise this agent.
     pub launch: bool,
+    /// When true, the adapter omits its headless flag (`-p` for claude,
+    /// `exec` for codex) so the agent opens in REPL / interactive mode.
+    /// Mutually exclusive with `launch = true` (an interactive REPL can't
+    /// be supervised); when both are set, `launch` wins with a warning.
+    pub interactive: bool,
 }
 
 /// On-disk config file shape.
@@ -137,6 +142,12 @@ pub struct AgentConfig {
     /// in the log. Default off so logs stay quiet for normal use.
     #[serde(default)]
     pub stream_json: bool,
+    /// When true, the adapter omits its headless flag (`-p` for claude,
+    /// `exec` for codex) so the agent opens in REPL / interactive mode.
+    /// Mutually exclusive with `launch = true`; resolution emits a warning
+    /// and falls back to non-interactive + launch when both are set.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 /// Resolve an agent config by reading prompt_file if specified and validating
@@ -209,6 +220,23 @@ fn resolve_agent_config(
         (None, None) => (None, None),
     };
 
+    // An interactive REPL can't run under the supervisor — the supervisor
+    // owns stdin/stdout and the whole point of interactive mode is a TTY.
+    // Rather than fail the whole config, warn loudly and keep `launch = true`
+    // (the more useful default for an auto-start workflow). The user's
+    // original intent — "run this agent interactively" — would have
+    // required them to drop `launch = true` anyway.
+    let interactive = if agent.interactive && agent.launch {
+        eprintln!(
+            "dispatch: warning: agent '{}' has both `interactive = true` and `launch = true`; \
+             these are mutually exclusive — keeping `launch = true` (headless) and ignoring `interactive`.",
+            agent.name
+        );
+        false
+    } else {
+        agent.interactive
+    };
+
     Ok(ResolvedAgentConfig {
         name: agent.name.clone(),
         role: agent.role.clone(),
@@ -221,6 +249,7 @@ fn resolve_agent_config(
         ttl: agent.ttl,
         stream_json: agent.stream_json,
         launch: agent.launch,
+        interactive,
     })
 }
 
@@ -330,6 +359,12 @@ const CONFIG_TEMPLATE: &str = "\
 # extra_args = [\"--dangerously-skip-permissions\", \"--model\", \"sonnet\"]
 # prompt_file = \"prompts/coordinator.md\"
 # launch = false
+# interactive = true                            # drops the headless flag
+#                                                # (`-p` for claude, `exec` for
+#                                                # codex) so the printed
+#                                                # copy-paste command opens the
+#                                                # vendor CLI's REPL. Mutually
+#                                                # exclusive with launch = true.
 # ttl = 7200
 
 # Scheduled heartbeats — commands run on a timer while the broker is running
@@ -854,6 +889,96 @@ command = "./run.sh"
             msg.contains("alice/foo") && msg.contains("ASCII"),
             "expected safe-name rejection for 'alice/foo', got: {msg}"
         );
+    }
+
+    /// `interactive = true` on a `launch = false` agent round-trips
+    /// through TOML unchanged. The adapter uses this to drop `-p` (claude)
+    /// / `exec` (codex) so the printed copy-paste command opens the vendor
+    /// CLI in its REPL instead of headless mode.
+    #[test]
+    fn agent_config_parses_interactive_flag() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("coord.md");
+        fs::write(&prompt_path, "you are the coordinator").unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "coordinator"
+role = "coordinator"
+description = "the human-run coordinator"
+adapter = "claude"
+prompt_file = "coord.md"
+launch = false
+interactive = true
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert_eq!(resolved.agents.len(), 1);
+        let a = &resolved.agents[0];
+        assert!(a.interactive, "interactive = true must round-trip");
+        assert!(!a.launch);
+    }
+
+    /// `interactive = true + launch = true` is contradictory (the
+    /// supervisor owns stdin/stdout, so there's no TTY for a REPL). We
+    /// warn and prefer `launch = true` (headless), keeping the config
+    /// loadable rather than forcing a hard failure that would strand a
+    /// user who typed the wrong combo.
+    #[test]
+    fn agent_config_warns_and_prefers_launch_when_both_set() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("r.md");
+        fs::write(&prompt_path, "role").unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "reviewer"
+role = "reviewer"
+description = "reviews"
+adapter = "claude"
+prompt_file = "r.md"
+launch = true
+interactive = true
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let a = &resolved.agents[0];
+        assert!(a.launch, "launch must win when both are set");
+        assert!(
+            !a.interactive,
+            "interactive must be forced off when launch is on",
+        );
+    }
+
+    /// `interactive` defaults to false so existing configs see no
+    /// behavior change after the new field is introduced.
+    #[test]
+    fn agent_config_interactive_defaults_false() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "worker"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert!(!resolved.agents[0].interactive);
     }
 
     /// Issue #45: `[main_agent]` has been removed in favor of a regular
