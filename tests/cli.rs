@@ -946,3 +946,64 @@ fn stdout_is_json_stderr_is_empty_on_success() {
         "stderr should be empty on success, got: {stderr}"
     );
 }
+
+// ── Spawned-agent env propagation ─────────────────────────────────────
+
+/// Regression guard for the `DISPATCH_CONFIG_PATH` injection wire: a
+/// `launch = true` command-adapter agent must receive the env var pointing
+/// at the canonicalized config file path, so child `dispatch` calls from
+/// any cwd in the agent tree resolve the orchestrator's config rather than
+/// falling back to a cwd-derived `cell-<hash>`.
+#[test]
+fn serve_spawns_agent_with_dispatch_config_path_in_env() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-dispatch-config-path-env";
+
+    // Dump the DISPATCH_* env seen by the spawned agent to a sibling file,
+    // then sleep so the supervisor doesn't enter its restart loop and
+    // stomp on the file before we can read it.
+    let envfile = dir.path().join("agent.env");
+    let command = format!("env | grep ^DISPATCH_ > {} && sleep 60", envfile.display());
+    let config_path = dir.path().join("dispatch.config.toml");
+    let config = format!(
+        r#"
+[[agents]]
+name = "dumper"
+role = "worker"
+description = "dumps env"
+adapter = "command"
+command = {command:?}
+launch = true
+"#
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let _broker = start_broker(&dir, cell_id);
+
+    // Poll up to ~5s for the env dump. The supervisor launches agents
+    // sequentially with a 500ms pause, so even on a cold machine the dump
+    // should land well under the budget.
+    let mut contents = String::new();
+    for _ in 0..100 {
+        if envfile.exists() {
+            contents = std::fs::read_to_string(&envfile).unwrap_or_default();
+            if !contents.is_empty() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !contents.is_empty(),
+        "agent env dump did not appear within 5s; file: {}",
+        envfile.display()
+    );
+
+    let expected = config_path.canonicalize().unwrap();
+    let needle = format!("DISPATCH_CONFIG_PATH={}", expected.display());
+    assert!(
+        contents.contains(&needle),
+        "env dump missing {needle:?}; got:\n{contents}"
+    );
+}

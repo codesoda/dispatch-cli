@@ -18,6 +18,11 @@ pub struct ResolvedConfig {
     pub backend: Option<String>,
     /// The project root (directory containing dispatch.config.toml, or cwd).
     pub project_root: PathBuf,
+    /// Absolute path of the `dispatch.config.toml` that produced this
+    /// resolution, or `None` when no config file was found. Propagated to
+    /// spawned agents via `DISPATCH_CONFIG_PATH` so child `dispatch` calls
+    /// resolve the same config even when their cwd doesn't contain it.
+    pub config_file_path: Option<PathBuf>,
     /// Working directory for agents. Defaults to project_root, overridden by `cwd` in config.
     pub agent_cwd: PathBuf,
     /// Monitor dashboard port (from config or CLI flag).
@@ -403,7 +408,44 @@ pub fn resolve_config(
     cwd: &Path,
 ) -> Result<ResolvedConfig, DispatchError> {
     let env_cell_id = env::var("DISPATCH_CELL_ID").ok();
-    resolve_config_inner(cli_cell_id, env_cell_id.as_deref(), cli_config_path, cwd)
+    let env_config_path = env::var("DISPATCH_CONFIG_PATH").ok();
+    resolve_config_with_env(
+        cli_cell_id,
+        env_cell_id.as_deref(),
+        cli_config_path,
+        env_config_path.as_deref(),
+        cwd,
+    )
+}
+
+/// Env-parameterized entry point. Keeps `std::env::set_var` out of tests —
+/// see `hooks::resolve_socket_path_with_env` (src/hooks/mod.rs) for the
+/// same pattern.
+fn resolve_config_with_env(
+    cli_cell_id: Option<&str>,
+    env_cell_id: Option<&str>,
+    cli_config_path: Option<&Path>,
+    env_config_path: Option<&str>,
+    cwd: &Path,
+) -> Result<ResolvedConfig, DispatchError> {
+    // Treat an empty env value the same as unset (matches
+    // resolve_socket_path_with_env).  `cell_id` handling below does NOT
+    // currently filter empty; leaving that unchanged in this change to
+    // keep scope tight.
+    let env_config_path = env_config_path.filter(|s| !s.is_empty()).map(Path::new);
+    let effective_config_path = cli_config_path.or(env_config_path);
+    resolve_config_inner(cli_cell_id, env_cell_id, effective_config_path, cwd)
+}
+
+/// Absolutize `path` against `cwd` without touching the filesystem. Used as
+/// a fallback when `canonicalize()` fails on a path that nonetheless loaded
+/// successfully (rare — permissions on an ancestor dir).
+fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn resolve_config_inner(
@@ -413,15 +455,24 @@ fn resolve_config_inner(
     cwd: &Path,
 ) -> Result<ResolvedConfig, DispatchError> {
     // Locate config: explicit --config path, or dispatch.config.toml in cwd.
-    let (config_file, project_root) = if let Some(path) = cli_config_path {
+    // Canonicalize only AFTER load succeeds so we never propagate a garbage
+    // relative path via DISPATCH_CONFIG_PATH. `project_root` stays derived
+    // from the raw (non-canonicalized) path so downstream path-joins match
+    // the pre-change behavior bit-for-bit (canonicalize resolves symlinks
+    // like `/var` → `/private/var` on macOS and would surprise callers).
+    let (config_file, project_root, config_file_path) = if let Some(path) = cli_config_path {
         let config = load_config_file(path)?;
+        let abs = path
+            .canonicalize()
+            .unwrap_or_else(|_| absolutize(cwd, path));
         let root = path.parent().unwrap_or(cwd).to_path_buf();
-        (Some(config), root)
+        (Some(config), root, Some(abs))
     } else if let Some((config_path, root)) = find_config_file(cwd) {
         let config = load_config_file(&config_path)?;
-        (Some(config), root)
+        let abs = config_path.canonicalize().unwrap_or(config_path);
+        (Some(config), root, Some(abs))
     } else {
-        (None, cwd.to_path_buf())
+        (None, cwd.to_path_buf(), None)
     };
 
     // Resolve cell_id with precedence: CLI > env > config > derived
@@ -475,6 +526,7 @@ fn resolve_config_inner(
         cell_id,
         backend,
         project_root,
+        config_file_path,
         agent_cwd,
         monitor_port,
         monitor_open,
@@ -1005,6 +1057,175 @@ model = "opus"
         assert!(
             msg.contains("main_agent"),
             "expected error to reference main_agent, got: {msg}"
+        );
+    }
+
+    /// `config_file_path` carries the discovered file path as an absolute
+    /// canonical path, so agents spawned by `dispatch serve` can propagate
+    /// it via `DISPATCH_CONFIG_PATH` regardless of their working directory.
+    #[test]
+    fn resolved_config_carries_path_when_discovered() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(&config_path, "").unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let expected = config_path.canonicalize().unwrap();
+        assert_eq!(
+            resolved.config_file_path.as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    /// Explicit `--config <path>` flow: the absolute path threads through
+    /// to `ResolvedConfig` so the injected env var points at the right file.
+    #[test]
+    fn resolved_config_carries_path_when_flag_given() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("other");
+        fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("dispatch.config.toml");
+        fs::write(&config_path, "").unwrap();
+
+        let resolved = resolve_config_inner(None, None, Some(&config_path), tmp.path()).unwrap();
+        let expected = config_path.canonicalize().unwrap();
+        assert_eq!(
+            resolved.config_file_path.as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    /// Cwd without a config file: `config_file_path` stays `None` so the
+    /// orchestrator emits no `DISPATCH_CONFIG_PATH` env var (regression
+    /// guard — existing configs see byte-identical env).
+    #[test]
+    fn resolved_config_none_when_no_config_file() {
+        let tmp = TempDir::new().unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert!(resolved.config_file_path.is_none());
+    }
+
+    /// `DISPATCH_CONFIG_PATH` acts as a fallback to `--config`, mirroring how
+    /// `DISPATCH_SOCKET_PATH` already works for the broker socket.
+    #[test]
+    fn resolve_config_with_env_honors_dispatch_config_path() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("elsewhere");
+        fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("dispatch.config.toml");
+        fs::write(&config_path, r#"cell_id = "from-env-path""#).unwrap();
+
+        let resolved = resolve_config_with_env(
+            None,
+            None,
+            None,
+            Some(config_path.to_str().unwrap()),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(resolved.cell_id, "from-env-path");
+    }
+
+    /// CLI flag beats env var — matches the stated precedence order
+    /// (CLI > env > discovery) from the config docs.
+    #[test]
+    fn resolve_config_with_env_prefers_cli_flag_over_env() {
+        let tmp = TempDir::new().unwrap();
+        let cli_dir = tmp.path().join("cli");
+        fs::create_dir(&cli_dir).unwrap();
+        let cli_config = cli_dir.join("dispatch.config.toml");
+        fs::write(&cli_config, r#"cell_id = "from-cli""#).unwrap();
+
+        let env_dir = tmp.path().join("env");
+        fs::create_dir(&env_dir).unwrap();
+        let env_config = env_dir.join("dispatch.config.toml");
+        fs::write(&env_config, r#"cell_id = "from-env""#).unwrap();
+
+        let resolved = resolve_config_with_env(
+            None,
+            None,
+            Some(&cli_config),
+            Some(env_config.to_str().unwrap()),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(resolved.cell_id, "from-cli");
+    }
+
+    /// Empty `DISPATCH_CONFIG_PATH` is treated as unset — matches the
+    /// `resolve_socket_path_with_env` idiom and avoids a hard error when
+    /// a parent shell exports the var blank.
+    #[test]
+    fn resolve_config_with_env_treats_empty_string_as_unset() {
+        let tmp = TempDir::new().unwrap();
+
+        let resolved = resolve_config_with_env(None, None, None, Some(""), tmp.path()).unwrap();
+        assert!(resolved.config_file_path.is_none());
+    }
+
+    /// `DISPATCH_CONFIG_PATH` pointing at a missing file errors out — same
+    /// failure mode as `--config nonexistent.toml`, documented as a
+    /// breaking-change surface.
+    #[test]
+    fn resolve_config_with_env_hard_errors_on_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist.toml");
+
+        let err = resolve_config_with_env(
+            None,
+            None,
+            None,
+            Some(missing.to_str().unwrap()),
+            tmp.path(),
+        )
+        .unwrap_err();
+        // ConfigNotFound — exactly what `--config <missing>` emits today.
+        assert!(
+            err.to_string().to_lowercase().contains("not found")
+                || err.to_string().to_lowercase().contains("no such"),
+            "expected not-found error, got: {err}"
+        );
+    }
+
+    /// Regression guard for the `absolutize` fallback: when canonicalize
+    /// fails (e.g. permission denied on an ancestor dir), we must still
+    /// produce an absolute path, not echo the raw relative input. The
+    /// fallback is what stands between `DISPATCH_CONFIG_PATH` and a
+    /// worthless value in rare failure modes.
+    #[test]
+    fn absolutize_joins_relative_paths_against_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let relative = Path::new("foo/bar.toml");
+        let joined = absolutize(tmp.path(), relative);
+        assert!(joined.is_absolute());
+        assert_eq!(joined, tmp.path().join("foo/bar.toml"));
+    }
+
+    /// `absolutize` leaves already-absolute paths untouched.
+    #[test]
+    fn absolutize_passes_absolute_paths_through() {
+        let tmp = TempDir::new().unwrap();
+        let already_abs = tmp.path().join("x.toml");
+        assert_eq!(absolutize(tmp.path(), &already_abs), already_abs);
+    }
+
+    /// Discovered path is always absolute — even a `TempDir` root (already
+    /// absolute) gets canonicalized to resolve `/tmp` → `/private/tmp` on
+    /// macOS, guaranteeing the stored path is what downstream code can
+    /// stat regardless of how the test env was configured.
+    #[test]
+    fn discovered_config_path_is_absolute() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(&config_path, "").unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let stored = resolved.config_file_path.expect("path must be set");
+        assert!(
+            stored.is_absolute(),
+            "discovered path must be absolute, got: {}",
+            stored.display()
         );
     }
 }

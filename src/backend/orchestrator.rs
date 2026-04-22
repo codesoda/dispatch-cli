@@ -102,6 +102,11 @@ pub struct SpawnContext {
     monitor_url: Option<String>,
     agent_cwd: PathBuf,
     log_dir: PathBuf,
+    /// Absolute path of the `dispatch.config.toml` that produced this
+    /// resolution, if one exists. Propagated to spawned agents via
+    /// `DISPATCH_CONFIG_PATH` so child `dispatch` calls resolve the same
+    /// config even when their cwd doesn't contain it.
+    config_file_path: Option<PathBuf>,
 }
 
 impl SpawnContext {
@@ -112,6 +117,9 @@ impl SpawnContext {
             "DISPATCH_SOCKET_PATH".into(),
             self.socket_path.display().to_string(),
         );
+        if let Some(ref path) = self.config_file_path {
+            vars.insert("DISPATCH_CONFIG_PATH".into(), path.display().to_string());
+        }
         if let Some(ref url) = self.monitor_url {
             vars.insert("DISPATCH_MONITOR_URL".into(), url.clone());
         }
@@ -161,6 +169,10 @@ pub struct AgentOrchestrator {
     /// to re-register them on restart so the worker record + role prompt
     /// stay alive across respawns.
     broker: Arc<Mutex<super::local::BrokerState>>,
+    /// Propagated to spawned agents via `DISPATCH_CONFIG_PATH` so child
+    /// `dispatch` calls from any cwd in the agent tree resolve the same
+    /// config the orchestrator loaded.
+    config_file_path: Option<PathBuf>,
 }
 
 impl AgentOrchestrator {
@@ -173,6 +185,7 @@ impl AgentOrchestrator {
         log_dir: PathBuf,
         configs: Vec<ResolvedAgentConfig>,
         broker: Arc<Mutex<super::local::BrokerState>>,
+        config_file_path: Option<PathBuf>,
     ) -> Self {
         Self {
             agents: Vec::new(),
@@ -185,6 +198,7 @@ impl AgentOrchestrator {
             log_dir,
             configs,
             broker,
+            config_file_path,
         }
     }
 
@@ -313,6 +327,7 @@ impl AgentOrchestrator {
             monitor_url: self.monitor_url.clone(),
             agent_cwd: self.agent_cwd.clone(),
             log_dir: self.log_dir.clone(),
+            config_file_path: self.config_file_path.clone(),
         }
     }
 
@@ -1041,12 +1056,25 @@ pub fn build_agent_command(
     cell_id: &str,
     monitor_url: Option<&str>,
     worker_id: Option<&str>,
+    config_file_path: Option<&Path>,
 ) -> String {
-    let mut parts = vec![
-        format!("DISPATCH_CELL_ID={}", shell_escape(cell_id)),
-        format!("DISPATCH_AGENT_NAME={}", shell_escape(&config.name)),
-        format!("DISPATCH_AGENT_ROLE={}", shell_escape(&config.role)),
-    ];
+    let mut parts = vec![format!("DISPATCH_CELL_ID={}", shell_escape(cell_id))];
+
+    if let Some(path) = config_file_path {
+        parts.push(format!(
+            "DISPATCH_CONFIG_PATH={}",
+            shell_escape(&path.display().to_string())
+        ));
+    }
+
+    parts.push(format!(
+        "DISPATCH_AGENT_NAME={}",
+        shell_escape(&config.name)
+    ));
+    parts.push(format!(
+        "DISPATCH_AGENT_ROLE={}",
+        shell_escape(&config.role)
+    ));
 
     if let Some(url) = monitor_url {
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
@@ -1134,6 +1162,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
         let ctx = orch.snapshot_spawn_context();
 
@@ -1162,6 +1191,54 @@ mod tests {
             without_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
             Some("test-runner")
         );
+    }
+
+    /// `DISPATCH_CONFIG_PATH` is injected when the orchestrator carries a
+    /// config file path, so child `dispatch` calls from any cwd in the
+    /// agent tree resolve the same config.
+    #[test]
+    fn env_vars_includes_config_path_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        let orch = AgentOrchestrator::new(
+            "cell-x",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            Some(config_path.clone()),
+        );
+        let ctx = orch.snapshot_spawn_context();
+
+        let vars = ctx.env_vars("alice", "test-runner", None);
+        assert_eq!(
+            vars.get("DISPATCH_CONFIG_PATH").map(String::as_str),
+            Some(config_path.display().to_string().as_str())
+        );
+    }
+
+    /// When the orchestrator has no config file path (e.g. serve launched
+    /// outside a project), no `DISPATCH_CONFIG_PATH` env var is emitted
+    /// — regression guard for configs that don't opt into the feature.
+    #[test]
+    fn env_vars_absent_when_config_path_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orch = AgentOrchestrator::new(
+            "cell-x",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
+        );
+        let ctx = orch.snapshot_spawn_context();
+
+        let vars = ctx.env_vars("alice", "test-runner", None);
+        assert!(!vars.contains_key("DISPATCH_CONFIG_PATH"));
     }
 
     /// Exponential doubling capped at 30s — table-driven so the intent is
@@ -1239,6 +1316,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let cfg = managed_test_config("alice", "sleep 30", prompt_path);
         orch.spawn_agent(&cfg).await.expect("spawn");
@@ -1274,6 +1352,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let mut cfg = test_config("bob", "sleep 30");
         cfg.launch = false; // explicitly unmanaged
@@ -1305,6 +1384,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let cfg = managed_test_config("alice", "sleep 30", tmp.path().join("does-not-exist.md"));
         let err = orch.spawn_agent(&cfg).await.expect_err("must fail");
@@ -1343,6 +1423,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
 
         // Force `spawn_agent` to fail and verify the broker is left with no
@@ -1398,6 +1479,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let mut cfg = managed_test_config("coordinator", "true", prompt_path);
         cfg.launch = false;
@@ -1441,6 +1523,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let mut cfg = test_config("bare", "true");
         cfg.launch = false;
@@ -1465,7 +1548,7 @@ mod tests {
     #[test]
     fn build_agent_command_includes_worker_id_when_some() {
         let cfg = test_config("alice", "echo hi");
-        let with_id = build_agent_command(&cfg, "cell-x", None, Some("w-123"));
+        let with_id = build_agent_command(&cfg, "cell-x", None, Some("w-123"), None);
         // shell_escape wraps the value in single quotes; assert on the
         // escaped form we'll actually see in the printed banner.
         assert!(
@@ -1473,10 +1556,31 @@ mod tests {
             "expected worker id in: {with_id}",
         );
 
-        let without_id = build_agent_command(&cfg, "cell-x", None, None);
+        let without_id = build_agent_command(&cfg, "cell-x", None, None, None);
         assert!(
             !without_id.contains("DISPATCH_WORKER_ID"),
             "legacy path must not emit worker id: {without_id}",
+        );
+    }
+
+    /// `build_agent_command` emits `DISPATCH_CONFIG_PATH=<shell-escaped>`
+    /// when a path is supplied, right alongside `DISPATCH_CELL_ID` so the
+    /// printed banner lets the pasted command resolve the same config from
+    /// any cwd. Unset → omitted, byte-identical to the previous banner.
+    #[test]
+    fn build_agent_command_includes_config_path_when_some() {
+        let cfg = test_config("alice", "echo hi");
+        let cfg_path = std::path::PathBuf::from("/tmp/ex/dispatch.config.toml");
+        let with_path = build_agent_command(&cfg, "cell-x", None, None, Some(cfg_path.as_path()));
+        assert!(
+            with_path.contains("DISPATCH_CONFIG_PATH='/tmp/ex/dispatch.config.toml'"),
+            "expected config path in: {with_path}"
+        );
+
+        let without = build_agent_command(&cfg, "cell-x", None, None, None);
+        assert!(
+            !without.contains("DISPATCH_CONFIG_PATH"),
+            "unset path must not appear: {without}"
         );
     }
 
@@ -1498,6 +1602,7 @@ mod tests {
             tmp.path().join("logs"),
             vec![bad_cfg],
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
 
         // Build fails because the prompt file doesn't exist.
@@ -1531,6 +1636,7 @@ mod tests {
             tmp.path().join("logs"),
             vec![cfg.clone()],
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
 
         // First reservation succeeds.
@@ -1591,6 +1697,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
         let cfg = test_config("alice", "sleep 30");
         orch.spawn_agent(&cfg).await.expect("spawn");
@@ -1619,6 +1726,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
         let cfg = test_config("flaky", "exit 1");
         orch.spawn_agent(&cfg).await.expect("spawn");

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Spawned agents now receive `DISPATCH_CONFIG_PATH` in env — lets hooks and `dispatch` subcommands run from any cwd inside the agent tree while still resolving the orchestrator's config. Previously, when an agent was launched with `cwd = ".."` (or any cwd that lacks `dispatch.config.toml`), child `dispatch` calls fell back to a derived `cell-<hash>` and resolved the wrong socket/config.
+- `dispatch` CLI honors `DISPATCH_CONFIG_PATH` as a fallback to `--config`. Precedence is `--config` flag > `DISPATCH_CONFIG_PATH` env > cwd discovery.
+- `ResolvedConfig.config_file_path` — the absolute, canonicalized config path, threaded through `AgentOrchestrator` and `SpawnContext` to the env-vars emit site.
+- `build_agent_command` accepts a `config_file_path: Option<&Path>` parameter; emits `DISPATCH_CONFIG_PATH=<abs>` in the printed copy-paste command when set.
+
+### Changed
+- **Breaking:** `DISPATCH_CONFIG_PATH` pointing at a missing or unreadable file is now a hard error (same failure mode as `--config nonexistent.toml`). Users with stale env values will see a clear error instead of a silent fallback.
+
 ## [0.5.1] - 2026-04-22
 
 ### Added

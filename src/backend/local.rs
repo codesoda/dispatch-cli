@@ -835,6 +835,7 @@ pub async fn serve(
         log_dir.clone(),
         config.agents.clone(),
         Arc::clone(&state),
+        config.config_file_path.clone(),
     )));
 
     // Optionally start the HTTP monitor dashboard.
@@ -923,6 +924,7 @@ pub async fn serve(
                 cell_id,
                 monitor_url.as_deref(),
                 worker_id.as_deref(),
+                config.config_file_path.as_deref(),
             );
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
@@ -1555,6 +1557,7 @@ mod tests {
             cell_id: cell_id.to_string(),
             backend: None,
             project_root: project_root.to_path_buf(),
+            config_file_path: None,
             agent_cwd: project_root.to_path_buf(),
             monitor_port: None,
             monitor_open: false,

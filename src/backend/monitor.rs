@@ -154,6 +154,7 @@ async fn api_agents(State(state): State<MonitorState>) -> axum::Json<serde_json:
                 &state.cell_id,
                 state.monitor_url.as_deref(),
                 None,
+                None,
             );
             serde_json::json!({
                 "name": a.name,
@@ -526,6 +527,7 @@ mod tests {
             tmp.join("logs"),
             configs,
             Arc::clone(&broker),
+            None,
         )));
         MonitorState {
             broker,
