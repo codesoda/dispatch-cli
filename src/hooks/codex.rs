@@ -4,6 +4,22 @@
 //! is set in `<repo>/.codex/config.toml`. The Stop hook we register runs
 //! `dispatch codex-hook stop` which prints a block decision — keeping the
 //! agent alive for the next dispatch message.
+//!
+//! # Schema
+//!
+//! Codex (and claude) expects hooks wrapped in a top-level `"hooks"` object
+//! with categories as keys. Each category is an array of matcher blocks, and
+//! each matcher has an inner `"hooks"` array of actual command entries:
+//!
+//! ```json
+//! {"hooks": {"Stop": [{"hooks": [{"type":"command","command":"…","timeout":10}]}]}}
+//! ```
+//!
+//! We originally emitted a flatter `{"Stop":[{"command":["dispatch","codex-hook","stop"]}]}`
+//! which codex silently dropped — the `install` path below writes the nested
+//! shape matching what claude's vendor config uses, and `uninstall` /
+//! idempotency checks tolerate the legacy shape so an upgrade cleanup step
+//! (or re-running `install`) rewrites old files in place.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +27,11 @@ use serde_json::{Map, Value};
 
 use crate::errors::DispatchError;
 
-const HOOK_COMMAND: [&str; 3] = ["dispatch", "codex-hook", "stop"];
+const HOOK_COMMAND: &str = "dispatch codex-hook stop";
+/// Stop hook timeout in seconds. The hook probes the broker socket
+/// (`PROBE_TIMEOUT = 250ms` in `hooks::mod`) so 10s is comfortably more
+/// headroom than we need.
+const HOOK_TIMEOUT_SECS: u64 = 10;
 
 /// Location of the hooks manifest relative to the project root.
 fn hooks_path(cwd: &Path) -> PathBuf {
@@ -24,12 +44,15 @@ fn config_path(cwd: &Path) -> PathBuf {
 }
 
 /// Merge the dispatch Stop hook into `.codex/hooks.json` (preserving any
-/// other Stop entries and any other top-level hook categories the user has
-/// registered) and enable `features.codex_hooks = true` in
-/// `.codex/config.toml`. Creates `.codex/` if it doesn't exist.
+/// other Stop entries and any other hook categories the user has registered)
+/// and enable `features.codex_hooks = true` in `.codex/config.toml`. Creates
+/// `.codex/` if it doesn't exist.
 ///
-/// Idempotent: re-running does not duplicate our Stop entry and does not
-/// duplicate the `codex_hooks = true` line.
+/// Idempotent: re-running does not duplicate our Stop entry. If a legacy
+/// flat-schema entry from an older dispatch install is present
+/// (`{"Stop":[{"command":["dispatch","codex-hook","stop"]}]}` written without
+/// the `hooks` wrapper), it's removed and replaced with the nested form so
+/// codex actually loads it.
 pub async fn install(cwd: &Path) -> Result<PathBuf, DispatchError> {
     let codex_dir = cwd.join(".codex");
     tokio::fs::create_dir_all(&codex_dir).await?;
@@ -43,18 +66,42 @@ pub async fn install(cwd: &Path) -> Result<PathBuf, DispatchError> {
             reason: "expected a JSON object at the top level".into(),
         })?;
 
-    let stop = obj
+    // Legacy cleanup: a pre-0.5.2 install wrote Stop entries at the top level
+    // (no `hooks` wrapper). Those are dead weight under the real codex
+    // schema, so strip them before we insert the correct shape.
+    if let Some(legacy_stop) = obj.get_mut("Stop").and_then(Value::as_array_mut) {
+        legacy_stop.retain(|e| !entry_is_legacy_dispatch_hook(e));
+        if legacy_stop.is_empty() {
+            obj.remove("Stop");
+        }
+    }
+
+    let hooks_obj = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| DispatchError::ConfigInvalid {
+            path: hooks_path.clone(),
+            reason: "expected \"hooks\" to be a JSON object".into(),
+        })?;
+
+    let stop_arr = hooks_obj
         .entry("Stop".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let stop_arr = stop
+        .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| DispatchError::ConfigInvalid {
             path: hooks_path.clone(),
-            reason: "expected \"Stop\" to be an array".into(),
+            reason: "expected \"hooks.Stop\" to be an array".into(),
         })?;
 
-    if !stop_arr.iter().any(entry_is_dispatch_hook) {
-        stop_arr.push(serde_json::json!({ "command": HOOK_COMMAND }));
+    if !stop_arr.iter().any(entry_has_dispatch_hook) {
+        stop_arr.push(serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": HOOK_COMMAND,
+                "timeout": HOOK_TIMEOUT_SECS,
+            }],
+        }));
     }
 
     tokio::fs::write(&hooks_path, serde_json::to_string_pretty(&root)? + "\n").await?;
@@ -73,11 +120,13 @@ pub async fn install(cwd: &Path) -> Result<PathBuf, DispatchError> {
     Ok(hooks_path)
 }
 
-/// Remove the dispatch Stop entry from `.codex/hooks.json`. If that leaves
-/// the Stop array empty, drop the key; if the file is empty afterwards,
-/// delete it. Leaves `config.toml` alone so the user can keep the feature
-/// flag enabled for their own hooks. Returns `Ok(None)` when nothing
-/// dispatch-owned was present.
+/// Remove the dispatch Stop entry from `.codex/hooks.json` — both from the
+/// real nested-schema location (`hooks.Stop[].hooks[]`) and from any legacy
+/// flat-schema location (`Stop[]`) left by a pre-0.5.2 install that codex
+/// couldn't load. If that leaves containers empty, collapse them on the way
+/// out; if the file is empty afterwards, delete it. Leaves `config.toml`
+/// alone so the user can keep the feature flag enabled for their own hooks.
+/// Returns `Ok(None)` when nothing dispatch-owned was present.
 pub async fn uninstall(cwd: &Path) -> Result<Option<PathBuf>, DispatchError> {
     let path = hooks_path(cwd);
     if !tokio_file_exists(&path).await {
@@ -88,16 +137,36 @@ pub async fn uninstall(cwd: &Path) -> Result<Option<PathBuf>, DispatchError> {
     let Some(obj) = root.as_object_mut() else {
         return Ok(None);
     };
-    let Some(stop) = obj.get_mut("Stop").and_then(Value::as_array_mut) else {
-        return Ok(None);
-    };
 
-    let before = stop.len();
-    stop.retain(|entry| !entry_is_dispatch_hook(entry));
-    let removed = stop.len() != before;
+    let mut removed = false;
 
-    if stop.is_empty() {
-        obj.remove("Stop");
+    // Nested-schema path (the one codex actually reads).
+    if let Some(hooks_obj) = obj.get_mut("hooks").and_then(Value::as_object_mut) {
+        if let Some(stop) = hooks_obj.get_mut("Stop").and_then(Value::as_array_mut) {
+            let before = stop.len();
+            stop.retain(|entry| !entry_has_dispatch_hook(entry));
+            if stop.len() != before {
+                removed = true;
+            }
+            if stop.is_empty() {
+                hooks_obj.remove("Stop");
+            }
+        }
+        if hooks_obj.is_empty() {
+            obj.remove("hooks");
+        }
+    }
+
+    // Legacy flat-schema path.
+    if let Some(stop) = obj.get_mut("Stop").and_then(Value::as_array_mut) {
+        let before = stop.len();
+        stop.retain(|entry| !entry_is_legacy_dispatch_hook(entry));
+        if stop.len() != before {
+            removed = true;
+        }
+        if stop.is_empty() {
+            obj.remove("Stop");
+        }
     }
 
     if !removed {
@@ -112,24 +181,32 @@ pub async fn uninstall(cwd: &Path) -> Result<Option<PathBuf>, DispatchError> {
     Ok(Some(path))
 }
 
-/// Whether a hook entry is the one dispatch owns. Tolerates alternate
-/// representations: `command` as an array (the shape we write) or as the
-/// single-string form some examples in codex docs use.
-fn entry_is_dispatch_hook(entry: &Value) -> bool {
+/// Whether a matcher block at `hooks.Stop[]` carries our inner command —
+/// `{"hooks": [{"type":"command","command":"dispatch codex-hook stop", ...}]}`.
+fn entry_has_dispatch_hook(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|h| h.get("command").and_then(Value::as_str) == Some(HOOK_COMMAND))
+        })
+}
+
+/// Whether a top-level `Stop[]` entry is a legacy pre-0.5.2 dispatch entry:
+/// `{"command": ["dispatch","codex-hook","stop"]}` (or the string form
+/// `"dispatch codex-hook stop"`). Used by `install` to sweep old entries out
+/// before writing the nested form, and by `uninstall` for idempotent removal.
+fn entry_is_legacy_dispatch_hook(entry: &Value) -> bool {
     let Some(cmd) = entry.get("command") else {
         return false;
     };
     if let Some(arr) = cmd.as_array() {
-        if arr.len() != HOOK_COMMAND.len() {
-            return false;
-        }
-        return arr
-            .iter()
-            .zip(HOOK_COMMAND.iter())
-            .all(|(a, b)| a.as_str() == Some(*b));
+        let parts: Vec<_> = arr.iter().filter_map(Value::as_str).collect();
+        return parts.join(" ") == HOOK_COMMAND;
     }
     if let Some(s) = cmd.as_str() {
-        return s == HOOK_COMMAND.join(" ");
+        return s == HOOK_COMMAND;
     }
     false
 }
@@ -314,8 +391,29 @@ mod tests {
         assert_eq!(cfg.matches("codex_hooks").count(), 1);
     }
 
-    /// Pre-existing Stop entries (different command) and other top-level
-    /// hook categories must survive a dispatch install.
+    /// Fresh install writes the nested schema codex actually loads —
+    /// top-level `"hooks"` object, Stop matcher with inner `"hooks"` array
+    /// containing `type:"command"` and our command string.
+    #[tokio::test]
+    async fn install_writes_nested_schema() {
+        let dir = tempdir().unwrap();
+        install(dir.path()).await.unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join(".codex/hooks.json"))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&content).unwrap();
+
+        let stops = value["hooks"]["Stop"].as_array().expect("hooks.Stop array");
+        assert_eq!(stops.len(), 1);
+        let inner = stops[0]["hooks"].as_array().expect("inner hooks array");
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0]["type"], "command");
+        assert_eq!(inner[0]["command"], HOOK_COMMAND);
+        assert_eq!(inner[0]["timeout"], HOOK_TIMEOUT_SECS);
+    }
+
+    /// Pre-existing hooks in other categories and other Stop matchers must
+    /// survive a dispatch install.
     #[tokio::test]
     async fn install_preserves_unrelated_hook_entries() {
         let dir = tempdir().unwrap();
@@ -323,12 +421,14 @@ mod tests {
             .await
             .unwrap();
         let pre = serde_json::json!({
-            "PreCompact": [
-                { "command": ["echo", "user-hook"] }
-            ],
-            "Stop": [
-                { "command": ["echo", "existing-stop"] }
-            ]
+            "hooks": {
+                "PreToolUse": [
+                    { "hooks": [{ "type": "command", "command": "echo user-pre" }] }
+                ],
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": "echo existing-stop" }] }
+                ]
+            }
         });
         tokio::fs::write(
             dir.path().join(".codex/hooks.json"),
@@ -342,12 +442,15 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
-        // User's PreCompact hook intact.
-        assert_eq!(value["PreCompact"][0]["command"][0], "echo");
+        // User's PreToolUse hook intact.
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo user-pre"
+        );
         // User's existing Stop entry still present, ours appended.
-        let stops = value["Stop"].as_array().unwrap();
+        let stops = value["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stops.len(), 2);
-        assert!(stops.iter().any(entry_is_dispatch_hook));
+        assert!(stops.iter().any(entry_has_dispatch_hook));
     }
 
     #[tokio::test]
@@ -359,7 +462,78 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(value["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    /// A legacy flat-schema entry left by pre-0.5.2 install should be
+    /// rewritten in place when `install` runs again: legacy entry removed,
+    /// nested entry added under `hooks.Stop`.
+    #[tokio::test]
+    async fn install_migrates_legacy_flat_schema() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".codex"))
+            .await
+            .unwrap();
+        let legacy = serde_json::json!({
+            "Stop": [
+                { "command": ["dispatch", "codex-hook", "stop"] }
+            ]
+        });
+        tokio::fs::write(
+            dir.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        install(dir.path()).await.unwrap();
+
+        let content = tokio::fs::read_to_string(dir.path().join(".codex/hooks.json"))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&content).unwrap();
+        // Legacy flat Stop removed (it was the only entry, so the key is gone).
+        assert!(value.get("Stop").is_none(), "legacy Stop should be gone");
+        // Nested shape present with our command.
+        let stops = value["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0]["hooks"][0]["command"].as_str(), Some(HOOK_COMMAND));
+    }
+
+    /// A legacy flat Stop entry from a different command (user-owned, not
+    /// dispatch) must be preserved through `install` — we only strip our
+    /// own legacy records.
+    #[tokio::test]
+    async fn install_keeps_legacy_stop_entries_from_other_owners() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".codex"))
+            .await
+            .unwrap();
+        let pre = serde_json::json!({
+            "Stop": [
+                { "command": ["echo", "user-legacy-stop"] }
+            ]
+        });
+        tokio::fs::write(
+            dir.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&pre).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        install(dir.path()).await.unwrap();
+
+        let content = tokio::fs::read_to_string(dir.path().join(".codex/hooks.json"))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&content).unwrap();
+        // User's legacy entry still there.
+        let legacy = value["Stop"].as_array().expect("user legacy Stop survives");
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0]["command"][0], "echo");
+        // Ours is in the nested location.
+        let nested = value["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(nested.len(), 1);
     }
 
     #[tokio::test]
@@ -369,9 +543,11 @@ mod tests {
             .await
             .unwrap();
         let pre = serde_json::json!({
-            "Stop": [
-                { "command": ["echo", "user-stop"] }
-            ]
+            "hooks": {
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": "echo user-stop" }] }
+                ]
+            }
         });
         tokio::fs::write(
             dir.path().join(".codex/hooks.json"),
@@ -387,9 +563,37 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
-        let stops = value["Stop"].as_array().unwrap();
+        let stops = value["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stops.len(), 1);
-        assert_eq!(stops[0]["command"][0], "echo");
+        assert_eq!(stops[0]["hooks"][0]["command"], "echo user-stop");
+    }
+
+    /// Uninstall removes legacy flat-schema entries too, so a user upgrading
+    /// from pre-0.5.2 gets a clean file without having to hand-edit.
+    #[tokio::test]
+    async fn uninstall_removes_legacy_flat_entry() {
+        let dir = tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".codex"))
+            .await
+            .unwrap();
+        let legacy = serde_json::json!({
+            "Stop": [
+                { "command": ["dispatch", "codex-hook", "stop"] }
+            ]
+        });
+        tokio::fs::write(
+            dir.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let removed = uninstall(dir.path()).await.unwrap();
+        assert!(removed.is_some(), "uninstall should report removal");
+        assert!(
+            !dir.path().join(".codex/hooks.json").exists(),
+            "file should be gone when nothing else is left",
+        );
     }
 
     #[tokio::test]
