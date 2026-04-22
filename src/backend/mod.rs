@@ -31,14 +31,9 @@ pub trait Backend: Send + Sync {
 pub fn create_backend(
     config: &ResolvedConfig,
     monitor_port: Option<u16>,
-    launch_agents: bool,
 ) -> Result<Box<dyn Backend>, DispatchError> {
     match config.backend.as_deref().unwrap_or("local") {
-        "local" => Ok(Box::new(local::LocalBackend::new(
-            config,
-            monitor_port,
-            launch_agents,
-        ))),
+        "local" => Ok(Box::new(local::LocalBackend::new(config, monitor_port))),
         other => Err(DispatchError::UnknownBackend {
             name: other.to_string(),
         }),

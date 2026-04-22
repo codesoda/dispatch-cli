@@ -70,19 +70,13 @@ pub struct BrokerEvent {
 pub struct LocalBackend {
     config: crate::config::ResolvedConfig,
     monitor_port: Option<u16>,
-    launch_agents: bool,
 }
 
 impl LocalBackend {
-    pub fn new(
-        config: &crate::config::ResolvedConfig,
-        monitor_port: Option<u16>,
-        launch_agents: bool,
-    ) -> Self {
+    pub fn new(config: &crate::config::ResolvedConfig, monitor_port: Option<u16>) -> Self {
         Self {
             config: config.clone(),
             monitor_port,
-            launch_agents,
         }
     }
 }
@@ -92,7 +86,7 @@ impl super::Backend for LocalBackend {
     /// Start the broker server on a Unix domain socket, blocking until
     /// a shutdown signal (SIGINT/SIGTERM) is received.
     async fn serve(&self) -> Result<(), DispatchError> {
-        serve(&self.config, self.monitor_port, self.launch_agents).await
+        serve(&self.config, self.monitor_port).await
     }
 
     /// Send a request to the broker over a Unix domain socket and
@@ -293,6 +287,13 @@ impl BrokerState {
                     if !capabilities.is_empty() {
                         existing.capabilities = capabilities;
                     }
+                    // Flip `claimed` on the idempotent-claim path so the
+                    // monitor can distinguish "pre-registered, waiting" from
+                    // "agent attached." The orchestrator passes `role_prompt =
+                    // Some(_)` when re-registering on respawn; agent claims
+                    // pass `None`. Either way, reaching this branch means an
+                    // actual process called register with our id, so mark it.
+                    existing.claimed = true;
                     let id = supplied.clone();
                     // Only overwrite the stored prompt if the caller supplied
                     // one — agent claims pass `None` and must not erase what
@@ -324,6 +325,14 @@ impl BrokerState {
             }
         }
 
+        // `claimed = false` only when a caller pre-registers with a supplied
+        // id (issue #43 bootstrap flow — orchestrator creates the record
+        // server-side before the agent process starts). A fresh register
+        // without a supplied id is always an agent registering itself, so
+        // mark it claimed immediately. Distinguishing these keeps the
+        // "reserved, waiting" state precise rather than bleeding into the
+        // legacy self-register path.
+        let claimed = worker_id.is_none();
         let id = worker_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = now_secs();
         let ttl = ttl_secs.unwrap_or(self.default_ttl);
@@ -338,6 +347,7 @@ impl BrokerState {
             last_status: None,
             last_status_at: None,
             status_history: VecDeque::new(),
+            claimed,
         };
         self.workers.insert(id.clone(), worker);
         if let Some(prompt) = role_prompt {
@@ -398,6 +408,12 @@ impl BrokerState {
         if let Some(worker) = self.workers.get_mut(worker_id) {
             let now = now_secs();
             worker.expires_at = now + worker.ttl_secs;
+            // Any heartbeat from the agent is proof of life — flip claimed
+            // so the monitor shows it as attached rather than "reserved,
+            // waiting" (relevant when the orchestrator pre-registers and
+            // the agent starts up by heartbeat-without-register, though
+            // the issue-#43 bootstrap always registers first).
+            worker.claimed = true;
             if let Some(s) = status {
                 let unchanged = worker.last_status.as_deref() == Some(s.as_str());
                 if !unchanged {
@@ -768,7 +784,6 @@ async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<(), Di
 pub async fn serve(
     config: &crate::config::ResolvedConfig,
     monitor_port: Option<u16>,
-    launch_agents: bool,
 ) -> Result<(), DispatchError> {
     let cell_id = &config.cell_id;
     let project_root = &config.project_root;
@@ -820,6 +835,7 @@ pub async fn serve(
         log_dir.clone(),
         config.agents.clone(),
         Arc::clone(&state),
+        config.config_file_path.clone(),
     )));
 
     // Optionally start the HTTP monitor dashboard.
@@ -833,7 +849,6 @@ pub async fn serve(
             cell_id: cell_id.clone(),
             started_at: now_secs(),
             agents: config.agents.clone(),
-            main_agent: config.main_agent.clone(),
             heartbeats: config.heartbeats.clone(),
             log_dir: log_dir.clone(),
             monitor_url: Some(url.clone()),
@@ -852,10 +867,11 @@ pub async fn serve(
         }
     }
 
-    if launch_agents {
-        // Auto-launch only agents explicitly marked `launch = true`. Agents
-        // with `launch = false` (the default) stay unmanaged and their
-        // copy-paste launch commands are printed below instead.
+    // Auto-launch agents marked `launch = true`. Agents with `launch = false`
+    // (the default) stay unmanaged and their copy-paste launch commands are
+    // printed below instead. `launch_all` already filters by `launch = true`,
+    // so it's safe to always call.
+    {
         let mut orch = orchestrator.lock().await;
         orch.launch_all().await?;
         // Start configured heartbeat timers.
@@ -864,33 +880,55 @@ pub async fn serve(
         }
     }
 
-    // Print copy-paste launch commands for agents that were not auto-launched.
-    // That means: every agent when `--launch` is not set, plus `launch = false`
-    // agents when `--launch` is set.
-    let manual: Vec<&crate::config::ResolvedAgentConfig> = config
-        .agents
-        .iter()
-        .filter(|a| !launch_agents || !a.launch)
-        .collect();
+    // Print copy-paste launch commands for every `launch = false` agent.
+    //
+    // For every unmanaged agent with a `prompt_file`, pre-register a worker
+    // server-side and wire the printed command to the issue-#43 boot-prompt
+    // bootstrap: `DISPATCH_WORKER_ID=<uuid>` in the env + `< <name>.boot.prompt`
+    // on stdin. When the user pastes + runs, the agent's first tool call
+    // (`dispatch register --for-agent`) idempotently claims the pre-registered
+    // worker and retrieves the role prompt — same mechanism as supervised
+    // agents, just with the user launching the process instead of the
+    // orchestrator.
+    let manual: Vec<&crate::config::ResolvedAgentConfig> =
+        config.agents.iter().filter(|a| !a.launch).collect();
     if !manual.is_empty() {
         eprintln!("\ndispatch serve: ready. Unmanaged agents — run these in separate terminals:\n");
+        let ctx = orchestrator.lock().await.snapshot_spawn_context();
         for agent in &manual {
-            let cmd =
-                super::orchestrator::build_agent_command(agent, cell_id, monitor_url.as_deref());
+            // Agents with a prompt_file get the boot-prompt bootstrap; the
+            // legacy bare-register path is reserved for configs with no prompt.
+            // Pre-register failures log + fall back to the legacy path so one
+            // misconfigured agent doesn't block the serve banner.
+            let (worker_id, render_config): (Option<String>, crate::config::ResolvedAgentConfig) =
+                if agent.prompt_file_path.is_some() {
+                    match super::orchestrator::pre_register_unmanaged(&ctx, agent).await {
+                        Ok((id, boot_path)) => {
+                            let mut cloned = (*agent).clone();
+                            cloned.prompt_file_path = Some(boot_path);
+                            (Some(id), cloned)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  # warning: pre-register failed for '{}': {e} — falling back to legacy copy-paste",
+                                agent.name
+                            );
+                            (None, (*agent).clone())
+                        }
+                    }
+                } else {
+                    (None, (*agent).clone())
+                };
+            let cmd = super::orchestrator::build_agent_command(
+                &render_config,
+                cell_id,
+                monitor_url.as_deref(),
+                worker_id.as_deref(),
+                config.config_file_path.as_deref(),
+            );
             eprintln!("  # {} ({})", agent.name, agent.role);
             eprintln!("  {cmd}\n");
         }
-    }
-
-    // Print the main agent launch command.
-    if let Some(ref main_agent) = config.main_agent {
-        let cmd = super::orchestrator::build_main_agent_command(
-            main_agent,
-            cell_id,
-            monitor_url.as_deref(),
-        );
-        eprintln!("dispatch serve: main session:\n");
-        eprintln!("  {cmd}\n");
     }
 
     // Run until shutdown signal (OS signal or monitor UI).
@@ -1519,12 +1557,12 @@ mod tests {
             cell_id: cell_id.to_string(),
             backend: None,
             project_root: project_root.to_path_buf(),
+            config_file_path: None,
             agent_cwd: project_root.to_path_buf(),
             monitor_port: None,
             monitor_open: false,
             default_ttl: None,
             agents: vec![],
-            main_agent: None,
             heartbeats: vec![],
         }
     }
@@ -1535,7 +1573,7 @@ mod tests {
     async fn test_client_broker_not_running() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path(), "nonexistent-cell");
-        let backend = LocalBackend::new(&config, None, false);
+        let backend = LocalBackend::new(&config, None);
 
         let result = backend
             .send_request(&BrokerRequest::Team { from: None })
@@ -1559,13 +1597,13 @@ mod tests {
         // Start broker in background.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait for broker to start.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let cfg = test_config(&project_root, cell_id);
-        let backend = LocalBackend::new(&cfg, None, false);
+        let backend = LocalBackend::new(&cfg, None);
         let response = backend
             .send_request(&BrokerRequest::Team { from: None })
             .await;
@@ -1655,7 +1693,7 @@ mod tests {
         // Start broker in background.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait briefly for the server to bind.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1701,7 +1739,7 @@ mod tests {
         });
 
         // Try to start second broker — should fail.
-        let result = serve(&test_config(&project_root, cell_id), None, false).await;
+        let result = serve(&test_config(&project_root, cell_id), None).await;
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -1736,7 +1774,7 @@ mod tests {
         // Starting serve should clean up the stale socket and bind fresh.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
 
         // Wait briefly for the server to bind.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1969,6 +2007,96 @@ mod tests {
         );
     }
 
+    /// A pre-registered worker (caller supplied `worker_id`) is born with
+    /// `claimed = false` so the monitor can show it as "reserved, waiting
+    /// for the agent" rather than solid green. When the agent then
+    /// registers with the same id (idempotent-claim path) OR sends a
+    /// heartbeat, `claimed` flips to true. Self-registered workers
+    /// (no supplied id) skip the reserved state entirely — they're
+    /// always a real process registering itself.
+    #[test]
+    fn test_register_worker_claimed_flips_on_attach() {
+        let mut state = BrokerState::new();
+
+        // Pre-register via supplied id — should start unclaimed.
+        let pre = state
+            .register_worker(
+                "alice".into(),
+                "runner".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                Some("prompt".into()),
+            )
+            .expect("pre-register");
+        assert!(
+            !state.workers.get(&pre).unwrap().claimed,
+            "pre-register must leave worker unclaimed",
+        );
+
+        // Agent-side claim (supplied id matches existing record).
+        let claimed = state
+            .register_worker(
+                "alice".into(),
+                "runner".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim");
+        assert_eq!(claimed, pre);
+        assert!(
+            state.workers.get(&pre).unwrap().claimed,
+            "idempotent claim must flip claimed = true",
+        );
+
+        // Self-register (no supplied id) should be claimed immediately.
+        let self_reg = state
+            .register_worker(
+                "bob".into(),
+                "worker".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("self-register");
+        assert!(
+            state.workers.get(&self_reg).unwrap().claimed,
+            "self-register (no supplied id) must be claimed immediately",
+        );
+
+        // Heartbeat alone is also proof of life — flips claimed on a
+        // pre-registered worker even without a register-claim step.
+        let hb_pre = state
+            .register_worker(
+                "carol".into(),
+                "worker".into(),
+                "d".into(),
+                vec![],
+                None,
+                false,
+                Some("w-carol".into()),
+                None,
+            )
+            .expect("pre-register carol");
+        assert!(!state.workers.get(&hb_pre).unwrap().claimed);
+        state
+            .heartbeat_worker(&hb_pre, None)
+            .expect("heartbeat on pre-registered worker");
+        assert!(
+            state.workers.get(&hb_pre).unwrap().claimed,
+            "heartbeat must flip claimed = true",
+        );
+    }
+
     /// Issue #43: evicting a worker (via `evict=true` or TTL expiry) drops
     /// its stored prompt too — no stale prompts left behind.
     #[test]
@@ -2152,7 +2280,7 @@ mod tests {
         // Start broker.
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Send register request via raw socket.
@@ -2200,7 +2328,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, "cap-test");
@@ -2446,7 +2574,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2486,7 +2614,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2519,7 +2647,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2654,7 +2782,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2696,7 +2824,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2897,7 +3025,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2944,7 +3072,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -2984,7 +3112,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3037,7 +3165,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3086,7 +3214,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3115,7 +3243,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
@@ -3161,7 +3289,7 @@ mod tests {
 
         let root = project_root.clone();
         let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None, false).await });
+            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let sock = socket_path(&project_root, cell_id);
