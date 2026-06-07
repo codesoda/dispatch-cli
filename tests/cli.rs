@@ -804,12 +804,27 @@ fn claude_hook_stop_is_silent_when_broker_unreachable() {
     );
 }
 
-/// With a live broker, the stop hook prints the block-decision JSON so
-/// the agent keeps listening for the next dispatch message.
+/// Helper: extract the first worker id whose `name` matches from a
+/// `dispatch status` JSON response.
+fn worker_id_by_name(status_json: &str, name: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(status_json).ok()?;
+    v["workers"]
+        .as_array()?
+        .iter()
+        .find(|w| w["name"] == name)
+        .and_then(|w| w["id"].as_str())
+        .map(|s| s.to_string())
+}
+
+/// US-005: the stop hook is identity-gated. With a live broker but NO
+/// `DISPATCH_WORKER_ID` (an ad-hoc vendor session in a hooked repo, not a
+/// dispatch worker), it must emit nothing and allow the stop — even though the
+/// broker is reachable. This inverts the pre-US-005 behavior where mere broker
+/// reachability blocked the stop.
 #[test]
-fn codex_hook_stop_blocks_when_broker_alive() {
+fn codex_hook_stop_allows_without_identity() {
     let dir = TempDir::new().unwrap();
-    let cell_id = "test-codex-hook-alive";
+    let cell_id = "test-codex-hook-no-identity";
     let _broker = start_broker(&dir, cell_id);
     let socket =
         std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
@@ -820,6 +835,52 @@ fn codex_hook_stop_blocks_when_broker_alive() {
         .arg("stop")
         .current_dir(dir.path())
         .env("DISPATCH_SOCKET_PATH", &socket)
+        .env_remove("DISPATCH_WORKER_ID")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "no identity must allow stop (empty stdout), got: {stdout:?}",
+    );
+}
+
+/// US-005: with `DISPATCH_WORKER_ID` set and that worker `active`, the hook
+/// blocks the stop and returns the continue-instruction as the reason, keeping
+/// the agent in its listen loop.
+#[test]
+fn codex_hook_stop_blocks_when_worker_active() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-codex-hook-active";
+    let _broker = start_broker(&dir, cell_id);
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+
+    // Register an active worker with a known id.
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "worker-a",
+            "--role",
+            "runner",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-active",
+        ])
+        .assert()
+        .success();
+
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &socket)
+        .env("DISPATCH_WORKER_ID", "w-active")
         .assert()
         .success()
         .get_output()
@@ -830,7 +891,117 @@ fn codex_hook_stop_blocks_when_broker_alive() {
     assert_eq!(json["decision"], "block");
     assert!(
         json["reason"].as_str().is_some_and(|s| !s.is_empty()),
-        "block decision must carry a non-empty reason",
+        "block decision must carry a non-empty continue-instruction reason",
+    );
+}
+
+/// US-005 parity: the claude-hook stop handler shares `run_stop_hook`, so it
+/// must also block an `active` worker.
+#[test]
+fn claude_hook_stop_blocks_when_worker_active() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-claude-hook-active";
+    let _broker = start_broker(&dir, cell_id);
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "worker-c",
+            "--role",
+            "runner",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-claude-active",
+        ])
+        .assert()
+        .success();
+
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("claude-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &socket)
+        .env("DISPATCH_WORKER_ID", "w-claude-active")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("stop hook stdout should be JSON: {stdout:?}"));
+    assert_eq!(json["decision"], "block");
+}
+
+/// US-005 × US-004: once the coordinator marks a worker `stopping`, that
+/// worker's own stop hook must allow the stop (so it can exit cleanly) instead
+/// of fighting the shutdown. Uses the real coordinator path: a managed agent is
+/// pre-registered, then `agent stop` transitions it to `stopping`.
+#[test]
+fn codex_hook_stop_allows_when_worker_stopping() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-codex-hook-stopping";
+
+    let prompt = dir.path().join("sleeper.prompt.md");
+    std::fs::write(&prompt, "you are a sleeper\n").unwrap();
+    let config = format!(
+        r#"
+[[agents]]
+name = "sleeper"
+role = "worker"
+description = "sleeps"
+adapter = "command"
+command = "sleep 60"
+prompt_file = {:?}
+launch = true
+"#,
+        prompt.display()
+    );
+    std::fs::write(dir.path().join("dispatch.config.toml"), config).unwrap();
+
+    let _broker = start_broker(&dir, cell_id);
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+
+    // Capture the pre-registered worker's id while it's still active.
+    let mut worker_id = String::new();
+    for _ in 0..100 {
+        let out = dispatch_cmd(&dir, cell_id).arg("status").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(id) = worker_id_by_name(&stdout, "sleeper") {
+            worker_id = id;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!worker_id.is_empty(), "sleeper worker never surfaced");
+
+    // Coordinator stops it → control state becomes `stopping`.
+    dispatch_cmd(&dir, cell_id)
+        .args(["agent", "stop", "sleeper"])
+        .assert()
+        .success();
+
+    // The dying agent's own stop hook now sees `stopping` → allow (no output).
+    let output = assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &socket)
+        .env("DISPATCH_WORKER_ID", &worker_id)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "stopping worker must allow stop (empty stdout), got: {stdout:?}",
     );
 }
 

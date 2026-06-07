@@ -9,60 +9,107 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::backend::socket_path;
 use crate::config::resolve_config;
+use crate::protocol::{BrokerRequest, BrokerResponse, ControlState, ResponsePayload};
 
 pub mod claude;
 pub mod codex;
 
-/// Reason string returned to the vendor CLI telling the agent to keep
-/// listening for more dispatch messages instead of stopping.
-///
-/// Kept short and imperative so the LLM treats it as a continuation
-/// instruction rather than conversational text.
-///
-/// Prefixed with an "if you are a dispatch agent" guard because both vendor
-/// stop hooks fire for *every* claude/codex session inside a repo where the
-/// hook is installed — including ad-hoc sessions the user runs by hand. A
-/// non-dispatch session that reads this should treat it as a no-op.
-pub const CONTINUE_REASON: &str = "If you are a dispatch agent (you have a registered worker_id from `dispatch register`): the dispatch broker may still have work queued for you. Do not stop yet — call `dispatch listen` again with your worker_id and a timeout (e.g. 270) to wait for the next message. When a message arrives, process it and then return to this listen step.\n\nIf you are NOT a dispatch agent (you have no worker_id and the user did not start you via dispatch), ignore this notice and stop normally.";
+/// How long the stop hook waits for the broker to answer the control-state
+/// query before giving up and allowing the stop. Kept well under the codex
+/// hook's ~10s budget — a `Status` query is answered immediately, so this is
+/// purely a failsafe against a hung or vanishing broker.
+const STOP_HOOK_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long the stop hook waits for a connection to the broker socket
-/// before treating it as unreachable. Kept short because the hook is in
-/// the critical path of every agent turn.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Read the dispatch worker identity from the environment. Empty is treated as
+/// unset. Only a dispatch-launched agent has this set — it is the gate that
+/// keeps the stop hook from hijacking unrelated ad-hoc vendor sessions.
+fn env_worker_id() -> Option<String> {
+    std::env::var("DISPATCH_WORKER_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
 
-/// JSON body every stop hook emits on stdout. Both vendors accept this shape.
-pub fn stop_decision_json() -> String {
+/// Read the dispatch agent name from the environment, used to resolve the
+/// per-agent `continue_instruction`. Empty is treated as unset.
+fn env_agent_name() -> Option<String> {
+    std::env::var("DISPATCH_AGENT_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// JSON body the stop hook emits on stdout to keep the agent alive. Both
+/// vendors accept `{"decision":"block","reason":"..."}`. `reason` is the
+/// resolved `continue_instruction` (US-009).
+pub fn stop_decision_json(reason: &str) -> String {
     serde_json::json!({
         "decision": "block",
-        "reason": CONTINUE_REASON,
+        "reason": reason,
     })
     .to_string()
 }
 
-/// Handler for both `dispatch codex-hook stop` and `dispatch claude-hook stop`.
+/// Handler for both `dispatch codex-hook stop` and `dispatch claude-hook stop`
+/// (US-005). Decides whether to keep the agent in its listen loop:
 ///
-/// Probes the broker socket; if a broker is reachable, prints the block
-/// decision so the vendor keeps the agent alive. If the broker is
-/// unreachable (dispatch shutdown, never started, config missing) we
-/// print nothing and exit 0 — the vendor treats that as "allow stop".
+/// 1. No `DISPATCH_WORKER_ID` → **allow** (an ad-hoc vendor session in a
+///    hooked repo, not a dispatch worker). The hook fires for *every* session,
+///    so identity is the gate that stops it from hijacking unrelated agents.
+/// 2. Worker `active` → **block**, returning the configured
+///    `continue_instruction` so the agent runs `dispatch listen` again.
+/// 3. Worker `stopping`/`stopped`/unknown, or the broker is
+///    unreachable/slow/malformed → **allow**. The coordinator owns the stop
+///    decision; a shutting-down or gone dispatch must never strand the agent.
 ///
-/// Never returns an error: probe failures map to "allow stop".
+/// Never returns an error: every failure maps to "allow stop" (no output).
 pub async fn run_stop_hook(cwd: &Path) {
-    match resolve_socket_path(cwd) {
-        Some(path) => {
-            if probe_broker(&path).await {
-                tracing::debug!(path = %path.display(), "broker reachable; blocking stop");
-                println!("{}", stop_decision_json());
-            } else {
-                tracing::debug!(path = %path.display(), "broker unreachable; allowing stop");
-            }
+    let worker_id = match env_worker_id() {
+        Some(id) => id,
+        None => {
+            tracing::debug!("no DISPATCH_WORKER_ID; allowing stop");
+            return;
         }
+    };
+
+    let socket = match resolve_socket_path(cwd) {
+        Some(p) => p,
         None => {
             tracing::debug!("no socket path resolvable; allowing stop");
+            return;
+        }
+    };
+
+    match query_control_state(&socket, &worker_id).await {
+        Some(ControlState::Active) => {
+            let reason = resolve_continue_instruction(cwd);
+            println!("{}", stop_decision_json(&reason));
+            tracing::debug!(worker = %worker_id, "worker active; blocking stop");
+        }
+        other => {
+            tracing::debug!(
+                worker = %worker_id,
+                state = ?other,
+                "worker not active; allowing stop",
+            );
+        }
+    }
+}
+
+/// Resolve the `continue_instruction` for this agent from its config, falling
+/// back to the shipped default when no config is resolvable. Runs in the
+/// agent's own process, which carries `DISPATCH_CONFIG_PATH` +
+/// `DISPATCH_AGENT_NAME`, so the per-agent override is visible (US-009).
+fn resolve_continue_instruction(cwd: &Path) -> String {
+    let agent = env_agent_name();
+    match resolve_config(None, None, cwd) {
+        Ok(cfg) => cfg.continue_instruction_for(agent.as_deref()),
+        Err(e) => {
+            tracing::debug!(error = %e, "config resolution failed; using default continue instruction");
+            crate::config::DEFAULT_CONTINUE_INSTRUCTION.to_string()
         }
     }
 }
@@ -94,13 +141,46 @@ fn resolve_socket_path_with_env(env_path: Option<&str>, cwd: &Path) -> Option<Pa
     }
 }
 
-/// Attempt a short-timeout connect to the broker's Unix socket.
-/// Returns `true` only if a connection succeeds within `PROBE_TIMEOUT`.
-async fn probe_broker(path: &Path) -> bool {
-    matches!(
-        tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await,
-        Ok(Ok(_))
-    )
+/// Query the broker for `worker_id`'s control state via a `Status` request.
+/// The `Status` request is reused deliberately rather than adding a new wire
+/// variant (keeps the untagged response enum — and its delicate `Timeout`
+/// disambiguation — untouched). Returns `None` on *any* failure — unreachable,
+/// timeout, malformed response, or worker not found — so every failure maps to
+/// "allow stop". Bounded by [`STOP_HOOK_QUERY_TIMEOUT`].
+async fn query_control_state(socket: &Path, worker_id: &str) -> Option<ControlState> {
+    let exchange = async {
+        let stream = UnixStream::connect(socket).await.ok()?;
+        let (reader, mut writer) = stream.into_split();
+
+        let request = BrokerRequest::Status {
+            worker_id: Some(worker_id.to_string()),
+            clear: false,
+        };
+        let mut bytes = serde_json::to_vec(&request).ok()?;
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await.ok()?;
+
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await.ok()? == 0 {
+            return None;
+        }
+
+        match serde_json::from_str::<BrokerResponse>(line.trim()).ok()? {
+            BrokerResponse::Ok {
+                payload: ResponsePayload::StatusResult { workers },
+            } => workers
+                .into_iter()
+                .find(|w| w.id == worker_id)
+                .map(|w| w.control_state),
+            _ => None,
+        }
+    };
+
+    tokio::time::timeout(STOP_HOOK_QUERY_TIMEOUT, exchange)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -108,29 +188,80 @@ mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
-    #[tokio::test]
-    async fn probe_returns_true_when_broker_listens() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("live.sock");
-        let _listener = UnixListener::bind(&sock).unwrap();
-        assert!(probe_broker(&sock).await);
+    /// One-shot mock broker: binds `socket` synchronously (so the file exists
+    /// before the caller connects), then accepts a single connection, drains
+    /// the request line, and replies with `response_json`.
+    fn spawn_mock_broker(socket: &Path, response_json: String) {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let mut body = response_json.into_bytes();
+                body.push(b'\n');
+                let _ = writer.write_all(&body).await;
+            }
+        });
+    }
+
+    /// Mirror of the real broker's `StatusResult` wire shape for one worker.
+    /// A `WorkerStatus` serializes without `Worker`'s required `description` /
+    /// `capabilities` / `expires_at`, so untagged dispatch skips `WorkerList`
+    /// and lands on `StatusResult` — this test locks that behavior.
+    fn status_response(worker_id: &str, control_state: &str) -> String {
+        serde_json::json!({
+            "status": "ok",
+            "workers": [{
+                "id": worker_id,
+                "name": "alice",
+                "role": "runner",
+                "control_state": control_state,
+            }],
+        })
+        .to_string()
     }
 
     #[tokio::test]
-    async fn probe_returns_false_when_socket_missing() {
+    async fn query_control_state_returns_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("active.sock");
+        spawn_mock_broker(&sock, status_response("w1", "active"));
+        assert_eq!(
+            query_control_state(&sock, "w1").await,
+            Some(ControlState::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn query_control_state_returns_stopping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("stopping.sock");
+        spawn_mock_broker(&sock, status_response("w1", "stopping"));
+        assert_eq!(
+            query_control_state(&sock, "w1").await,
+            Some(ControlState::Stopping)
+        );
+    }
+
+    /// An empty worker list (worker not registered / already finalized) maps to
+    /// `None` → allow stop.
+    #[tokio::test]
+    async fn query_control_state_none_when_worker_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("empty.sock");
+        let resp = serde_json::json!({ "status": "ok", "workers": [] }).to_string();
+        spawn_mock_broker(&sock, resp);
+        assert_eq!(query_control_state(&sock, "w1").await, None);
+    }
+
+    /// No broker listening on the socket → `None` (failsafe: allow stop).
+    #[tokio::test]
+    async fn query_control_state_none_when_unreachable() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("missing.sock");
-        assert!(!probe_broker(&sock).await);
-    }
-
-    #[tokio::test]
-    async fn probe_returns_false_when_socket_stale() {
-        // File exists but nothing is bound — UnixStream::connect fails with
-        // ConnectionRefused. We treat that as "broker unreachable".
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("stale.sock");
-        std::fs::write(&sock, b"").unwrap();
-        assert!(!probe_broker(&sock).await);
+        assert_eq!(query_control_state(&sock, "w1").await, None);
     }
 
     /// Env-var precedence: when DISPATCH_SOCKET_PATH is set, resolution
