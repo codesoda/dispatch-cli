@@ -138,6 +138,13 @@ pub enum BrokerRequest {
         worker_id: Option<String>,
         #[serde(default)]
         clear: bool,
+        /// Marks the purpose of this query so the broker can record a traceable
+        /// event (US-010). The stop hook sets `Some("stop_hook")` so its
+        /// block/allow decision is logged as a `stop_decision` event; ordinary
+        /// status queries leave it `None` (no event). Additive — keeps the hook
+        /// on the existing `Status` request rather than a new wire variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe: Option<String>,
     },
     /// Start a configured agent by name.
     AgentStart { name: String },
@@ -394,6 +401,7 @@ mod tests {
             BrokerRequest::Status {
                 worker_id: Some("w1".into()),
                 clear: false,
+                probe: None,
             },
             BrokerRequest::AgentStart {
                 name: "reviewer".into(),

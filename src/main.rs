@@ -289,7 +289,11 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 // `status` intentionally keeps its "no identity = all workers"
                 // default — a coordinator's `dispatch status` should show the
                 // whole team, so we don't fold env identity in here.
-                Commands::Status { worker_id, clear } => BrokerRequest::Status { worker_id, clear },
+                Commands::Status { worker_id, clear } => BrokerRequest::Status {
+                    worker_id,
+                    clear,
+                    probe: None,
+                },
                 Commands::Ack {
                     worker_id,
                     message_id,
@@ -463,6 +467,7 @@ async fn worker_is_active(backend: &dyn dispatch::backend::Backend, worker_id: &
     let request = BrokerRequest::Status {
         worker_id: Some(worker_id.to_string()),
         clear: false,
+        probe: None,
     };
     matches!(
         backend.send_request(&request).await,

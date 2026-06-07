@@ -47,6 +47,11 @@ pub struct ResolvedConfig {
     /// [`ResolvedConfig::continue_instruction_for`], never read directly, so
     /// the per-agent > global > default precedence stays in one place.
     pub continue_instruction: Option<String>,
+    /// When true, broker events that reference a prompt/packet body may include
+    /// the full body. Default `false` (US-010): bodies are logged by hash +
+    /// byte size only, never the full text, so prompts don't leak into the
+    /// event history / logs.
+    pub log_prompt_bodies: bool,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Scheduled heartbeat commands.
@@ -120,6 +125,10 @@ pub struct ConfigFile {
     /// `listen --for-agent` timeout renderer (US-009). Overridable per agent
     /// in `[[agents]]`. When unset, the shipped default applies.
     pub continue_instruction: Option<String>,
+    /// When true, broker events may log full prompt/packet bodies. Default
+    /// `false` (US-010) — bodies are recorded as hash + byte size only.
+    #[serde(default)]
+    pub log_prompt_bodies: bool,
     /// Monitor dashboard configuration.
     pub monitor: Option<MonitorConfig>,
     /// Agent definitions to launch on serve.
@@ -374,6 +383,11 @@ const CONFIG_TEMPLATE: &str = "\
 # [[agents]]. When unset, a built-in default is used.
 # continue_instruction = \"No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.\"
 
+# Log full prompt/packet bodies in broker events. Default false — bodies are
+# recorded by hash + byte size only, so prompts don't leak into the event
+# history or logs. Enable only for debugging.
+# log_prompt_bodies = false
+
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
@@ -568,6 +582,7 @@ fn resolve_config_inner(
         global_listen_timeout,
         stopping_drain_secs,
         continue_instruction,
+        log_prompt_bodies,
         config_cwd,
         monitor_config,
         raw_agents,
@@ -580,6 +595,7 @@ fn resolve_config_inner(
             c.listen_timeout,
             c.stopping_drain_secs,
             c.continue_instruction,
+            c.log_prompt_bodies,
             c.cwd,
             c.monitor,
             c.agents,
@@ -592,6 +608,7 @@ fn resolve_config_inner(
             None,
             None,
             None,
+            false,
             None,
             None,
             vec![],
@@ -627,6 +644,7 @@ fn resolve_config_inner(
         default_ttl,
         stopping_drain_secs,
         continue_instruction,
+        log_prompt_bodies,
         agents,
         heartbeats,
     })

@@ -205,6 +205,10 @@ pub struct BrokerState {
     /// Drain window (seconds) a `stopping` worker lingers before the broker
     /// finalizes it. Set from config `stopping_drain_secs` in `serve`.
     pub stopping_drain_secs: u64,
+    /// When true, prompt/packet-body events may carry the full body; otherwise
+    /// bodies are logged by hash + byte size only (US-010). Set from config
+    /// `log_prompt_bodies` in `serve`; defaults to `false`.
+    pub log_prompt_bodies: bool,
     /// Total number of messages sent through the broker.
     pub messages_sent: u64,
     /// Total number of messages delivered to listeners.
@@ -241,6 +245,7 @@ impl BrokerState {
             message_history_max: DEFAULT_EVENT_HISTORY_MAX,
             default_ttl,
             stopping_drain_secs: DEFAULT_STOPPING_DRAIN_SECS,
+            log_prompt_bodies: false,
             messages_sent: 0,
             messages_delivered: 0,
             requests_handled: 0,
@@ -824,6 +829,18 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Fingerprint a prompt/packet body for traceability (US-010): a hex hash plus
+/// the byte length, logged in events instead of the full body so prompts don't
+/// leak into the event history. Not cryptographic — it exists to answer "did
+/// the prompt change / how big was it", not to resist forgery.
+pub fn body_fingerprint(body: &str) -> (String, usize) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    (format!("{:016x}", hasher.finish()), body.len())
+}
+
 /// Push a status entry into a worker's history ring, deduping against the
 /// most-recent entry and capping the ring at `STATUS_HISTORY_MAX`.
 ///
@@ -915,6 +932,7 @@ pub async fn serve(
     if let Some(drain) = config.stopping_drain_secs {
         broker_state.stopping_drain_secs = drain;
     }
+    broker_state.log_prompt_bodies = config.log_prompt_bodies;
     let state = Arc::new(Mutex::new(broker_state));
     let (event_tx, _) = broadcast::channel::<BrokerEvent>(256);
 
@@ -1155,6 +1173,12 @@ async fn handle_request(
             role_prompt,
         } => {
             let mut state = state.lock().await;
+            // A claim (the agent fetching its own prompt) passes no
+            // `role_prompt` and receives the stored body back — that's the
+            // prompt-delivery moment (US-010). The orchestrator's pre-register
+            // passes `role_prompt = Some(body)` (storing, not delivering), so
+            // it is not counted as a delivery.
+            let is_claim = role_prompt.is_none();
             let worker_id = match state.register_worker(
                 name.clone(),
                 role.clone(),
@@ -1188,6 +1212,27 @@ async fn handle_request(
             // spawned agent receives its first instructions as the response
             // body of its own `dispatch register` claim.
             let role_prompt = state.role_prompts.get(&worker_id).cloned();
+            // US-010: record the delivery by fingerprint (hash + byte size),
+            // never the full body unless `log_prompt_bodies` is set, so prompt
+            // cost/compliance is auditable via `dispatch events --type prompt`.
+            if is_claim {
+                if let Some(ref prompt) = role_prompt {
+                    let log_bodies = state.log_prompt_bodies;
+                    let (hash, bytes) = body_fingerprint(prompt);
+                    let mut payload = serde_json::json!({ "hash": hash, "bytes": bytes });
+                    if log_bodies {
+                        payload["body"] = serde_json::Value::String(prompt.clone());
+                    }
+                    state.emit_and_record(
+                        event_tx,
+                        "prompt",
+                        &worker_id,
+                        Some(&name),
+                        &format!("delivered role prompt ({bytes} bytes, {hash})"),
+                        Some(payload),
+                    );
+                }
+            }
             BrokerResponse::Ok {
                 payload: ResponsePayload::WorkerRegistered {
                     worker_id,
@@ -1480,7 +1525,11 @@ async fn handle_request(
                 Err(msg) => BrokerResponse::Error { message: msg },
             }
         }
-        BrokerRequest::Status { worker_id, clear } => {
+        BrokerRequest::Status {
+            worker_id,
+            clear,
+            probe,
+        } => {
             let mut state = state.lock().await;
             if clear {
                 match worker_id {
@@ -1499,6 +1548,32 @@ async fn handle_request(
                 }
             } else {
                 let workers = state.get_status(worker_id.as_deref());
+                // US-010: a stop-hook probe records the block/allow decision it
+                // implies, derived from the worker's control state, as a
+                // `stop_decision` event (the hook itself runs in the agent's
+                // process and can't write to the broker's history directly).
+                if probe.as_deref() == Some("stop_hook") {
+                    if let Some(id) = worker_id.as_deref() {
+                        let observed = workers.iter().find(|w| w.id == id).map(|w| w.control_state);
+                        let (state_label, decision) = match observed {
+                            Some(ControlState::Active) => ("active", "block"),
+                            Some(ControlState::Stopping) => ("stopping", "allow"),
+                            Some(ControlState::Stopped) => ("stopped", "allow"),
+                            None => ("unknown", "allow"),
+                        };
+                        state.emit_and_record(
+                            event_tx,
+                            "stop_decision",
+                            id,
+                            None,
+                            &format!("{state_label} -> {decision}"),
+                            Some(serde_json::json!({
+                                "control_state": state_label,
+                                "decision": decision,
+                            })),
+                        );
+                    }
+                }
                 BrokerResponse::Ok {
                     payload: ResponsePayload::StatusResult { workers },
                 }
@@ -1751,6 +1826,7 @@ mod tests {
             default_ttl: None,
             stopping_drain_secs: None,
             continue_instruction: None,
+            log_prompt_bodies: false,
             agents: vec![],
             heartbeats: vec![],
         }
@@ -3423,6 +3499,20 @@ mod tests {
             .find(|m| m.message_id == message_id)
             .expect("message in history");
         assert!(hist.acked_at.is_some(), "result must ack the message");
+    }
+
+    /// US-010: `body_fingerprint` is deterministic, returns a 16-hex-char hash
+    /// plus the byte length, and distinguishes different bodies.
+    #[test]
+    fn body_fingerprint_is_stable_and_sized() {
+        let (h1, n1) = body_fingerprint("hello world");
+        let (h2, n2) = body_fingerprint("hello world");
+        assert_eq!(h1, h2, "same body must hash identically");
+        assert_eq!(n1, 11);
+        assert_eq!(n2, 11);
+        assert_eq!(h1.len(), 16, "hash is 16 hex chars");
+        let (h3, _) = body_fingerprint("a different body");
+        assert_ne!(h1, h3, "different bodies must differ");
     }
 
     #[tokio::test]

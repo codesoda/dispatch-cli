@@ -155,6 +155,9 @@ async fn query_control_state(socket: &Path, worker_id: &str) -> Option<ControlSt
         let request = BrokerRequest::Status {
             worker_id: Some(worker_id.to_string()),
             clear: false,
+            // Mark this as a stop-hook probe so the broker records the
+            // block/allow decision as a `stop_decision` event (US-010).
+            probe: Some("stop_hook".to_string()),
         };
         let mut bytes = serde_json::to_vec(&request).ok()?;
         bytes.push(b'\n');

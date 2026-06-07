@@ -1607,6 +1607,184 @@ fn result_for_agent_terse_confirmation() {
     );
 }
 
+// ── Traceability & metrics (US-010) ───────────────────────────────────
+
+/// US-010: when an agent claims its pre-registered prompt, the broker records a
+/// `prompt` event by hash + byte size — and by default does NOT log the body.
+#[test]
+fn prompt_delivery_event_omits_body_by_default() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-prompt-event-default";
+    let _broker = start_broker(&dir, cell_id);
+
+    let secret = "SECRET-PROMPT-BODY-12345";
+    // Pre-register storing a role prompt (role_prompt present → not a delivery).
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "pr",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-pr",
+            "--role-prompt",
+            secret,
+        ])
+        .assert()
+        .success();
+    // Claim it (no role_prompt → delivery; routes the body to stdout).
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "pr",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-pr",
+            "--for-agent",
+        ])
+        .assert()
+        .success();
+
+    let ev = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--type", "prompt"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ev_s = String::from_utf8(ev).unwrap();
+    assert!(
+        ev_s.contains("\"bytes\":"),
+        "prompt event must record byte size, got: {ev_s}"
+    );
+    assert!(
+        ev_s.contains("\"hash\":"),
+        "prompt event must record a hash, got: {ev_s}"
+    );
+    assert!(
+        !ev_s.contains(secret),
+        "prompt body must NOT be logged by default, got: {ev_s}"
+    );
+}
+
+/// US-010: with `log_prompt_bodies = true`, the `prompt` event includes the
+/// full body (opt-in).
+#[test]
+fn prompt_delivery_event_includes_body_when_enabled() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-prompt-event-enabled";
+    std::fs::write(
+        dir.path().join("dispatch.config.toml"),
+        "log_prompt_bodies = true\n",
+    )
+    .unwrap();
+    let _broker = start_broker(&dir, cell_id);
+
+    let secret = "SECRET-PROMPT-BODY-67890";
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "pr",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-pr",
+            "--role-prompt",
+            secret,
+        ])
+        .assert()
+        .success();
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "pr",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-pr",
+            "--for-agent",
+        ])
+        .assert()
+        .success();
+
+    let ev = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--type", "prompt"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ev_s = String::from_utf8(ev).unwrap();
+    assert!(
+        ev_s.contains(secret),
+        "with log_prompt_bodies=true the body must be logged, got: {ev_s}"
+    );
+}
+
+/// US-010: a stop-hook probe makes the broker record the block/allow decision
+/// as a `stop_decision` event (the hook runs client-side and can't write the
+/// broker history itself).
+#[test]
+fn stop_hook_records_stop_decision_event() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-stop-decision-event";
+    let _broker = start_broker(&dir, cell_id);
+    let socket =
+        std::path::PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"));
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "sd",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-sd",
+        ])
+        .assert()
+        .success();
+
+    // Run the stop hook with identity → broker records the decision.
+    assert_cmd::Command::cargo_bin("dispatch")
+        .unwrap()
+        .arg("codex-hook")
+        .arg("stop")
+        .current_dir(dir.path())
+        .env("DISPATCH_SOCKET_PATH", &socket)
+        .env("DISPATCH_WORKER_ID", "w-sd")
+        .assert()
+        .success();
+
+    let ev = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--type", "stop_decision"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ev_s = String::from_utf8(ev).unwrap();
+    assert!(
+        ev_s.contains("\"decision\":\"block\""),
+        "stop_decision event must record the block decision, got: {ev_s}"
+    );
+}
+
 // ── stdout/stderr separation ──────────────────────────────────────────
 
 #[test]
