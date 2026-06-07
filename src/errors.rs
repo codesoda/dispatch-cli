@@ -46,6 +46,9 @@ pub enum DispatchError {
     #[error("register --for-agent failed: {message}")]
     RegisterForAgentFailed { message: String },
 
+    #[error("result failed: {message}")]
+    ResultForAgentFailed { message: String },
+
     #[error(
         "no worker identity -- pass --worker-id <id> (or --from <id>), or set $DISPATCH_WORKER_ID (dispatch-launched agents have it set automatically)"
     )]

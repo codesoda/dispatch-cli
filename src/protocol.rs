@@ -84,12 +84,26 @@ pub enum BrokerRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    /// Acknowledge receipt of a message.
+    /// Acknowledge receipt of a message. `dispatch result` rides the same
+    /// request as a "super-ack" (US-007): when `status` is present the broker
+    /// records a completion (status + optional summary + artifacts) in the same
+    /// `ack_log` and emits a `result` event instead of a plain `ack`. All three
+    /// completion fields are additive and omitted on the wire for a plain `ack`.
     Ack {
         worker_id: String,
         message_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Completion status: `done` | `failed` | `blocked`. `Some` marks this
+        /// as a `result` rather than a plain ack.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Optional free-text completion summary.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// Optional artifact paths/URLs produced by the task.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<String>,
     },
     /// Query event history.
     Events {
@@ -349,6 +363,18 @@ mod tests {
                 worker_id: "w1".into(),
                 message_id: "m1".into(),
                 note: Some("starting impl".into()),
+                status: None,
+                summary: None,
+                artifacts: vec![],
+            },
+            // `result` super-ack shape (US-007): status + summary + artifacts.
+            BrokerRequest::Ack {
+                worker_id: "w1".into(),
+                message_id: "m2".into(),
+                note: None,
+                status: Some("done".into()),
+                summary: Some("shipped".into()),
+                artifacts: vec!["out/report.md".into()],
             },
             BrokerRequest::Events {
                 since: Some(100),

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -217,6 +217,37 @@ pub enum Commands {
         note: Option<String>,
     },
 
+    /// Report task completion for a message (a "super-ack": records status,
+    /// summary, and artifacts on top of an ack). The message must have been
+    /// addressed to this worker.
+    Result {
+        /// Worker ID reporting completion. Falls back to the global `--from`,
+        /// then `$DISPATCH_WORKER_ID`.
+        #[arg(long)]
+        worker_id: Option<String>,
+
+        /// Message ID this result completes
+        #[arg(long)]
+        message_id: String,
+
+        /// Completion status: done | failed | blocked
+        #[arg(long, value_enum)]
+        status: ResultStatus,
+
+        /// Optional free-text completion summary
+        #[arg(long)]
+        summary: Option<String>,
+
+        /// Artifact path or URL produced by the task (repeatable)
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+
+        /// Render a terse confirmation for direct LLM tool-result consumption
+        /// instead of the JSON envelope
+        #[arg(long = "for-agent")]
+        for_agent: bool,
+    },
+
     /// Renew worker liveness TTL
     Heartbeat {
         /// Worker ID to heartbeat. Falls back to the global `--from`, then
@@ -246,6 +277,27 @@ pub enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+}
+
+/// Completion status reported by `dispatch result` (US-007). Maps 1:1 to the
+/// wire string stored in the ack log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ResultStatus {
+    Done,
+    Failed,
+    Blocked,
+}
+
+impl ResultStatus {
+    /// Wire string sent to the broker (`done` | `failed` | `blocked`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResultStatus::Done => "done",
+            ResultStatus::Failed => "failed",
+            ResultStatus::Blocked => "blocked",
+        }
+    }
 }
 
 #[derive(Subcommand)]

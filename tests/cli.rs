@@ -1429,6 +1429,184 @@ fn ack_command_rejects_unknown_message() {
     );
 }
 
+// ── result super-ack (US-007) ─────────────────────────────────────────
+
+/// Helper: register a worker and queue one message addressed to it, returning
+/// `(worker_id, message_id)`.
+fn worker_with_message(dir: &TempDir, cell_id: &str, name: &str) -> (String, String) {
+    let worker_id = register_worker(dir, cell_id, name, "tester");
+    let send_out = dispatch_cmd(dir, cell_id)
+        .args([
+            "send", "--to", &worker_id, "--body", "task", "--from", "harness",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let send: serde_json::Value = serde_json::from_slice(&send_out).unwrap();
+    let message_id = send["message_id"].as_str().unwrap().to_string();
+    (worker_id, message_id)
+}
+
+/// US-007: `dispatch result` records completion (status + summary + artifacts)
+/// on the ack substrate without a prior `ack`, and surfaces as a `result`
+/// event distinct from `ack`/`deliver`.
+#[test]
+fn result_records_completion() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-result-records";
+    let _broker = start_broker(&dir, cell_id);
+    let (worker_id, message_id) = worker_with_message(&dir, cell_id, "res-worker");
+
+    let out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "result",
+            "--worker-id",
+            &worker_id,
+            "--message-id",
+            &message_id,
+            "--status",
+            "done",
+            "--summary",
+            "did the task",
+            "--artifact",
+            "out/report.md",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["ack_confirmed"], true);
+    assert_eq!(json["message_id"], message_id);
+
+    let ev = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--type", "result"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ev_s = String::from_utf8(ev).unwrap();
+    assert!(
+        ev_s.contains("\"status\":\"done\""),
+        "result event must carry status, got: {ev_s}"
+    );
+    assert!(
+        ev_s.contains("did the task"),
+        "result event must carry summary, got: {ev_s}"
+    );
+    assert!(
+        ev_s.contains("out/report.md"),
+        "result event must carry artifact, got: {ev_s}"
+    );
+}
+
+/// US-007: an invalid `--status` is rejected at parse time (clap value-enum),
+/// before any broker request.
+#[test]
+fn result_rejects_invalid_status() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-result-bad-status";
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "result",
+            "--worker-id",
+            "w",
+            "--message-id",
+            "m",
+            "--status",
+            "bogus",
+        ])
+        .assert()
+        .failure();
+}
+
+/// US-007: results are idempotent at the verb level — a duplicate result on
+/// the same message succeeds (the latest status wins in the ack log). Also
+/// exercises the `failed` status.
+#[test]
+fn result_duplicate_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-result-dup";
+    let _broker = start_broker(&dir, cell_id);
+    let (worker_id, message_id) = worker_with_message(&dir, cell_id, "dup-worker");
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "result",
+            "--worker-id",
+            &worker_id,
+            "--message-id",
+            &message_id,
+            "--status",
+            "done",
+        ])
+        .assert()
+        .success();
+
+    let out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "result",
+            "--worker-id",
+            &worker_id,
+            "--message-id",
+            &message_id,
+            "--status",
+            "failed",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(json["ack_confirmed"], true);
+}
+
+/// US-007: `result --for-agent` prints a terse confirmation (not JSON) for
+/// direct tool-result consumption.
+#[test]
+fn result_for_agent_terse_confirmation() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-result-for-agent";
+    let _broker = start_broker(&dir, cell_id);
+    let (worker_id, message_id) = worker_with_message(&dir, cell_id, "fa-worker");
+
+    let out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "result",
+            "--for-agent",
+            "--worker-id",
+            &worker_id,
+            "--message-id",
+            &message_id,
+            "--status",
+            "done",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(
+        s.contains("result recorded"),
+        "terse confirmation expected, got: {s:?}"
+    );
+    assert!(
+        s.contains("done"),
+        "confirmation should mention status, got: {s:?}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(s.trim()).is_err(),
+        "for-agent confirmation must be plain text, not JSON, got: {s:?}"
+    );
+}
+
 // ── stdout/stderr separation ──────────────────────────────────────────
 
 #[test]

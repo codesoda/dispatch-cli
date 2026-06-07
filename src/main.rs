@@ -179,6 +179,9 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 } | Commands::Listen {
                     for_agent: true,
                     ..
+                } | Commands::Result {
+                    for_agent: true,
+                    ..
                 }
             );
             let request = match cmd {
@@ -295,6 +298,27 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     worker_id: require_identity(worker_id, cli.from.clone())?,
                     message_id,
                     note,
+                    status: None,
+                    summary: None,
+                    artifacts: vec![],
+                },
+                // `result` rides the Ack request as a super-ack (US-007): same
+                // identity resolution + broker-side validation, but `status`
+                // present flips the recorded event to `result`.
+                Commands::Result {
+                    worker_id,
+                    message_id,
+                    status,
+                    summary,
+                    artifacts,
+                    for_agent: _,
+                } => BrokerRequest::Ack {
+                    worker_id: require_identity(worker_id, cli.from.clone())?,
+                    message_id,
+                    note: None,
+                    status: Some(status.as_str().to_string()),
+                    summary,
+                    artifacts,
                 },
                 Commands::Heartbeat { worker_id, status } => BrokerRequest::Heartbeat {
                     worker_id: require_identity(worker_id, cli.from.clone())?,
@@ -316,6 +340,14 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     BrokerRequest::Listen { worker_id, .. } => {
                         render_listen_for_agent(backend.as_ref(), &config, worker_id, &response)
                             .await?;
+                    }
+                    // `result --for-agent` (US-007): terse completion
+                    // confirmation. Only `result` sets `--for-agent` on an Ack
+                    // request (plain `ack` has no such flag).
+                    BrokerRequest::Ack {
+                        message_id, status, ..
+                    } => {
+                        render_result_for_agent(&response, message_id, status.as_deref())?;
                     }
                     // `register --for-agent` (issue #43): prompt body to stdout,
                     // JSON envelope to stderr. If the broker has no prompt stored
@@ -438,6 +470,34 @@ async fn worker_is_active(backend: &dyn dispatch::backend::Backend, worker_id: &
             payload: ResponsePayload::StatusResult { workers },
         }) if workers.iter().any(|w| w.id == worker_id && w.control_state == ControlState::Active)
     )
+}
+
+/// Render `result --for-agent` (US-007): a terse one-line confirmation on
+/// success — the loop contract lives elsewhere (the stop hook re-arms `listen`
+/// for hook-capable agents; SEAMS supplies any coda for the rest), so this adds
+/// no loop logic. A broker-side failure becomes a typed error so the exit code
+/// reflects it instead of a silent JSON dump.
+fn render_result_for_agent(
+    response: &BrokerResponse,
+    message_id: &str,
+    status: Option<&str>,
+) -> Result<(), DispatchError> {
+    match response {
+        BrokerResponse::Ok {
+            payload: ResponsePayload::AckConfirm { .. },
+        } => {
+            let short = &message_id[..message_id.len().min(8)];
+            println!("result recorded: {} ({short})", status.unwrap_or("done"));
+            Ok(())
+        }
+        BrokerResponse::Error { message } => Err(DispatchError::ResultForAgentFailed {
+            message: message.clone(),
+        }),
+        _ => {
+            println!("{}", serde_json::to_string(response)?);
+            Ok(())
+        }
+    }
 }
 
 async fn run_codex_hook(

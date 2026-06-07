@@ -160,13 +160,25 @@ impl super::Backend for LocalBackend {
 // Broker state
 // ---------------------------------------------------------------------------
 
-/// Record of a message acknowledgement.
+/// Record of a message acknowledgement. When a `dispatch result` rides the ack
+/// substrate (US-007), `status`/`summary`/`artifacts` capture the completion;
+/// they are `None`/empty for a plain `ack`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AckRecord {
     pub message_id: String,
     pub worker_id: String,
     pub note: Option<String>,
     pub acked_at: u64,
+    /// Completion status (`done` | `failed` | `blocked`) when recorded via
+    /// `dispatch result`; `None` for a plain ack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Optional free-text completion summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional artifact paths/URLs produced by the task.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
 }
 
 /// In-memory broker state.
@@ -630,6 +642,9 @@ impl BrokerState {
         worker_id: &str,
         message_id: &str,
         note: Option<String>,
+        status: Option<String>,
+        summary: Option<String>,
+        artifacts: Vec<String>,
     ) -> Result<(), String> {
         self.evict_expired();
         if !self.workers.contains_key(worker_id) {
@@ -654,6 +669,9 @@ impl BrokerState {
                 worker_id: worker_id.to_string(),
                 note,
                 acked_at: now,
+                status,
+                summary,
+                artifacts,
             },
         );
         if let Some(hist) = self
@@ -1407,23 +1425,51 @@ async fn handle_request(
             worker_id,
             message_id,
             note,
+            status,
+            summary,
+            artifacts,
         } => {
             let mut state = state.lock().await;
+            // `dispatch result` rides this request as a super-ack (US-007): when
+            // `status` is present, emit a `result` event with the completion
+            // payload; otherwise a plain `ack` with its original shape. Capture
+            // what we need for the event before the fields move into ack_message.
+            let is_result = status.is_some();
             let note_clone = note.clone();
-            match state.ack_message(&worker_id, &message_id, note) {
+            let status_clone = status.clone();
+            let summary_clone = summary.clone();
+            let artifacts_clone = artifacts.clone();
+            match state.ack_message(&worker_id, &message_id, note, status, summary, artifacts) {
                 Ok(()) => {
-                    tracing::info!(worker_id = %worker_id, message_id = %message_id, "message acked");
-                    state.emit_and_record(
-                        event_tx,
-                        "ack",
-                        &worker_id,
-                        None,
-                        &format!("acked {}", &message_id[..message_id.len().min(8)]),
-                        Some(serde_json::json!({
-                            "message_id": message_id,
-                            "note": note_clone,
-                        })),
-                    );
+                    let short = &message_id[..message_id.len().min(8)];
+                    let (kind, detail, payload) = if is_result {
+                        (
+                            "result",
+                            format!(
+                                "result {} {}",
+                                status_clone.as_deref().unwrap_or("done"),
+                                short
+                            ),
+                            serde_json::json!({
+                                "message_id": message_id,
+                                "note": note_clone,
+                                "status": status_clone,
+                                "summary": summary_clone,
+                                "artifacts": artifacts_clone,
+                            }),
+                        )
+                    } else {
+                        (
+                            "ack",
+                            format!("acked {short}"),
+                            serde_json::json!({
+                                "message_id": message_id,
+                                "note": note_clone,
+                            }),
+                        )
+                    };
+                    tracing::info!(worker_id = %worker_id, message_id = %message_id, kind, "message acked");
+                    state.emit_and_record(event_tx, kind, &worker_id, None, &detail, Some(payload));
                     BrokerResponse::Ok {
                         payload: ResponsePayload::AckConfirm {
                             message_id,
@@ -3243,7 +3289,7 @@ mod tests {
     fn test_ack_message_rejects_unknown_worker() {
         let mut state = BrokerState::new();
         let err = state
-            .ack_message("missing-worker", "msg-1", None)
+            .ack_message("missing-worker", "msg-1", None, None, None, vec![])
             .unwrap_err();
         assert!(err.contains("worker not found"), "got: {err}");
     }
@@ -3264,7 +3310,7 @@ mod tests {
             )
             .expect("register");
         let err = state
-            .ack_message(&worker_id, "nonexistent-message", None)
+            .ack_message(&worker_id, "nonexistent-message", None, None, None, vec![])
             .unwrap_err();
         assert!(err.contains("message not found"), "got: {err}");
     }
@@ -3299,7 +3345,9 @@ mod tests {
         let message_id = state
             .send_message(alice.clone(), "for alice".into(), None)
             .expect("send");
-        let err = state.ack_message(&bob, &message_id, None).unwrap_err();
+        let err = state
+            .ack_message(&bob, &message_id, None, None, None, vec![])
+            .unwrap_err();
         assert!(
             err.contains("not addressed to worker"),
             "expected recipient-mismatch error, got: {err}"
@@ -3325,7 +3373,14 @@ mod tests {
             .send_message(alice.clone(), "hello".into(), None)
             .expect("send");
         state
-            .ack_message(&alice, &message_id, Some("noted".into()))
+            .ack_message(
+                &alice,
+                &message_id,
+                Some("noted".into()),
+                None,
+                None,
+                vec![],
+            )
             .expect("ack should succeed");
         let hist = state
             .message_history
@@ -3334,6 +3389,40 @@ mod tests {
             .expect("message in history");
         assert!(hist.acked_at.is_some(), "acked_at should be set");
         assert!(state.ack_log.contains_key(&message_id));
+    }
+
+    /// US-007: `ack_message` carrying completion fields (the `result`
+    /// super-ack) records them on the `AckRecord` and still marks the message
+    /// acked — no prior plain ack required.
+    #[test]
+    fn ack_message_with_status_records_result() {
+        let mut state = BrokerState::new();
+        let alice = register_active(&mut state, "alice");
+        let message_id = state
+            .send_message(alice.clone(), "do the thing".into(), None)
+            .expect("send");
+        state
+            .ack_message(
+                &alice,
+                &message_id,
+                None,
+                Some("done".into()),
+                Some("did the thing".into()),
+                vec!["out/report.md".into()],
+            )
+            .expect("result should succeed");
+
+        let rec = state.ack_log.get(&message_id).expect("ack record");
+        assert_eq!(rec.status.as_deref(), Some("done"));
+        assert_eq!(rec.summary.as_deref(), Some("did the thing"));
+        assert_eq!(rec.artifacts, vec!["out/report.md".to_string()]);
+
+        let hist = state
+            .message_history
+            .iter()
+            .find(|m| m.message_id == message_id)
+            .expect("message in history");
+        assert!(hist.acked_at.is_some(), "result must ack the message");
     }
 
     #[tokio::test]
