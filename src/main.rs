@@ -10,13 +10,22 @@ use dispatch::config::resolve_config;
 use dispatch::errors::DispatchError;
 use dispatch::hooks;
 use dispatch::logging::init_tracing;
-use dispatch::protocol::{BrokerRequest, BrokerResponse, ResponsePayload};
+use dispatch::protocol::{BrokerRequest, BrokerResponse, ControlState, ResponsePayload};
 
 /// Read `$DISPATCH_WORKER_ID`, treating an empty value as unset. A
 /// dispatch-launched agent always has this set (the orchestrator injects it),
 /// so the agent's commands can be bare (`dispatch listen`, `dispatch ack ...`).
 fn env_worker_id() -> Option<String> {
     std::env::var("DISPATCH_WORKER_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read `$DISPATCH_AGENT_NAME` (empty treated as unset). Used to resolve the
+/// per-agent `continue_instruction` when `listen --for-agent` times out while
+/// the worker is still active (US-006).
+fn env_agent_name() -> Option<String> {
+    std::env::var("DISPATCH_AGENT_NAME")
         .ok()
         .filter(|s| !s.is_empty())
 }
@@ -167,6 +176,9 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 Commands::Register {
                     for_agent: true,
                     ..
+                } | Commands::Listen {
+                    for_agent: true,
+                    ..
                 }
             );
             let request = match cmd {
@@ -210,7 +222,11 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     body,
                     from: resolve_identity(None, cli.from.clone()),
                 },
-                Commands::Listen { worker_id, timeout } => BrokerRequest::Listen {
+                Commands::Listen {
+                    worker_id,
+                    timeout,
+                    for_agent: _,
+                } => BrokerRequest::Listen {
                     worker_id: require_identity(worker_id, cli.from.clone())?,
                     timeout_secs: resolve_listen_timeout(timeout),
                 },
@@ -293,55 +309,65 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
             };
             let response = backend.send_request(&request).await?;
             if for_agent {
-                // Prompt body to stdout, JSON envelope to stderr. If the
-                // broker has no prompt stored for this worker, exit nonzero
-                // — the agent has nothing to do and the supervisor should
-                // restart rather than have the model see empty stdout.
-                match &response {
-                    BrokerResponse::Ok {
-                        payload:
-                            ResponsePayload::WorkerRegistered {
-                                worker_id,
-                                role_prompt: Some(prompt),
-                            },
-                    } => {
-                        // Write the prompt body verbatim (no trailing newline
-                        // added) so the agent receives byte-for-byte what the
-                        // orchestrator stored.
-                        use std::io::Write as _;
-                        let mut stdout = std::io::stdout().lock();
-                        stdout.write_all(prompt.as_bytes())?;
-                        stdout.flush()?;
+                match &request {
+                    // `listen --for-agent` (US-006): deliver a message body
+                    // verbatim; render a timeout as the continue-instruction
+                    // while the worker is active, else the neutral JSON timeout.
+                    BrokerRequest::Listen { worker_id, .. } => {
+                        render_listen_for_agent(backend.as_ref(), &config, worker_id, &response)
+                            .await?;
+                    }
+                    // `register --for-agent` (issue #43): prompt body to stdout,
+                    // JSON envelope to stderr. If the broker has no prompt stored
+                    // for this worker, exit nonzero — the agent has nothing to do
+                    // and the supervisor should restart rather than have the
+                    // model see empty stdout.
+                    _ => match &response {
+                        BrokerResponse::Ok {
+                            payload:
+                                ResponsePayload::WorkerRegistered {
+                                    worker_id,
+                                    role_prompt: Some(prompt),
+                                },
+                        } => {
+                            // Write the prompt body verbatim (no trailing newline
+                            // added) so the agent receives byte-for-byte what the
+                            // orchestrator stored.
+                            use std::io::Write as _;
+                            let mut stdout = std::io::stdout().lock();
+                            stdout.write_all(prompt.as_bytes())?;
+                            stdout.flush()?;
 
-                        // Strip `role_prompt` from the stderr envelope so the
-                        // prompt body isn't duplicated into agent logs.
-                        let stripped = BrokerResponse::Ok {
-                            payload: ResponsePayload::WorkerRegistered {
-                                worker_id: worker_id.clone(),
-                                role_prompt: None,
-                            },
-                        };
-                        let json = serde_json::to_string(&stripped)?;
-                        eprintln!("{json}");
-                    }
-                    // `send_request` returns `Ok(BrokerResponse::Error { .. })`
-                    // for broker-side errors (e.g. worker_id collision when
-                    // DISPATCH_AGENT_NAME drifted from what was pre-registered).
-                    // Forward `message` verbatim via a typed error so the
-                    // exit-code classifier in `main` stays authoritative.
-                    BrokerResponse::Error { message } => {
-                        return Err(dispatch::errors::DispatchError::RegisterForAgentFailed {
-                            message: message.clone(),
-                        });
-                    }
-                    _ => {
-                        // Log the unexpected JSON envelope to stderr before
-                        // bubbling the typed error — useful for debugging a
-                        // response shape that shouldn't happen in practice.
-                        let json = serde_json::to_string(&response)?;
-                        eprintln!("{json}");
-                        return Err(dispatch::errors::DispatchError::NoRolePromptReturned);
-                    }
+                            // Strip `role_prompt` from the stderr envelope so the
+                            // prompt body isn't duplicated into agent logs.
+                            let stripped = BrokerResponse::Ok {
+                                payload: ResponsePayload::WorkerRegistered {
+                                    worker_id: worker_id.clone(),
+                                    role_prompt: None,
+                                },
+                            };
+                            let json = serde_json::to_string(&stripped)?;
+                            eprintln!("{json}");
+                        }
+                        // `send_request` returns `Ok(BrokerResponse::Error { .. })`
+                        // for broker-side errors (e.g. worker_id collision when
+                        // DISPATCH_AGENT_NAME drifted from what was pre-registered).
+                        // Forward `message` verbatim via a typed error so the
+                        // exit-code classifier in `main` stays authoritative.
+                        BrokerResponse::Error { message } => {
+                            return Err(dispatch::errors::DispatchError::RegisterForAgentFailed {
+                                message: message.clone(),
+                            });
+                        }
+                        _ => {
+                            // Log the unexpected JSON envelope to stderr before
+                            // bubbling the typed error — useful for debugging a
+                            // response shape that shouldn't happen in practice.
+                            let json = serde_json::to_string(&response)?;
+                            eprintln!("{json}");
+                            return Err(dispatch::errors::DispatchError::NoRolePromptReturned);
+                        }
+                    },
                 }
             } else {
                 let json = serde_json::to_string(&response)?;
@@ -351,6 +377,67 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
     }
 
     Ok(())
+}
+
+/// Render a `listen --for-agent` response for direct LLM tool-result
+/// consumption (US-006).
+///
+/// - A delivered `Message` body is written to stdout **verbatim** (no JSON, no
+///   added newline) — the coordinator authored exactly what the agent should
+///   act on.
+/// - A `Timeout` triggers a control-state re-query: if the worker is still
+///   `active`, the configured `continue_instruction` is printed so the agent
+///   loops back into `listen`; otherwise the neutral JSON timeout is emitted
+///   unchanged so a stopping/stopped agent can exit.
+/// - Anything else is forwarded as JSON (shouldn't normally happen for listen).
+async fn render_listen_for_agent(
+    backend: &dyn dispatch::backend::Backend,
+    config: &dispatch::config::ResolvedConfig,
+    worker_id: &str,
+    response: &BrokerResponse,
+) -> Result<(), DispatchError> {
+    match response {
+        BrokerResponse::Ok {
+            payload: ResponsePayload::Message { body, .. },
+        } => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(body.as_bytes())?;
+            stdout.flush()?;
+        }
+        BrokerResponse::Ok {
+            payload: ResponsePayload::Timeout(_),
+        } => {
+            if worker_is_active(backend, worker_id).await {
+                let agent = env_agent_name();
+                println!("{}", config.continue_instruction_for(agent.as_deref()));
+            } else {
+                // Neutral timeout JSON — same shape as the non-for-agent path.
+                println!("{}", serde_json::to_string(response)?);
+            }
+        }
+        _ => {
+            println!("{}", serde_json::to_string(response)?);
+        }
+    }
+    Ok(())
+}
+
+/// Re-query the broker for `worker_id`'s control state via `Status` (additive,
+/// no new wire variant). Returns `true` only when the worker is present and
+/// `Active`; any error, miss, or non-active state → `false` (→ emit the neutral
+/// timeout so the agent isn't told to keep looping a dead/stopping worker).
+async fn worker_is_active(backend: &dyn dispatch::backend::Backend, worker_id: &str) -> bool {
+    let request = BrokerRequest::Status {
+        worker_id: Some(worker_id.to_string()),
+        clear: false,
+    };
+    matches!(
+        backend.send_request(&request).await,
+        Ok(BrokerResponse::Ok {
+            payload: ResponsePayload::StatusResult { workers },
+        }) if workers.iter().any(|w| w.id == worker_id && w.control_state == ControlState::Active)
+    )
 }
 
 async fn run_codex_hook(

@@ -582,6 +582,172 @@ fn listen_times_out_with_no_messages() {
     );
 }
 
+// ── Agent-facing listen rendering (US-006) ────────────────────────────
+
+/// `listen --for-agent` writes a delivered message body to stdout verbatim —
+/// no JSON envelope, no added newline — so it lands cleanly in the agent's
+/// tool result.
+#[test]
+fn listen_for_agent_renders_message_body_verbatim() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-listen-for-agent-msg";
+    let _broker = start_broker(&dir, cell_id);
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "recv",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-recv",
+        ])
+        .assert()
+        .success();
+
+    dispatch_cmd(&dir, cell_id)
+        .args(["send", "--to", "w-recv", "--body", "hello agent"])
+        .assert()
+        .success();
+
+    let out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "listen",
+            "--for-agent",
+            "--worker-id",
+            "w-recv",
+            "--timeout",
+            "5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert_eq!(
+        stdout, "hello agent",
+        "message body must be rendered verbatim (no JSON, no trailing newline)"
+    );
+}
+
+/// `listen --for-agent` that times out while the worker is `active` prints the
+/// configured continue-instruction (plain text), not the neutral JSON timeout,
+/// so the agent loops back into `listen`.
+#[test]
+fn listen_for_agent_timeout_while_active_prints_continue_instruction() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-listen-for-agent-active";
+    let _broker = start_broker(&dir, cell_id);
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "act",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-act",
+        ])
+        .assert()
+        .success();
+
+    let out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "listen",
+            "--for-agent",
+            "--worker-id",
+            "w-act",
+            "--timeout",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains("dispatch listen"),
+        "active timeout must print the continue-instruction, got: {stdout:?}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
+        "active timeout must be plain text, not the neutral JSON timeout, got: {stdout:?}"
+    );
+}
+
+/// `listen --for-agent` that times out while the worker is `stopping` emits the
+/// neutral JSON timeout (same shape as the non-`--for-agent` path), so a
+/// stopping agent isn't told to keep looping.
+#[test]
+fn listen_for_agent_timeout_while_stopping_emits_neutral_json() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-listen-for-agent-stopping";
+    let _broker = start_broker(&dir, cell_id);
+
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--name",
+            "s-stop2",
+            "--role",
+            "worker",
+            "--description",
+            "d",
+            "--worker-id",
+            "w-stop2",
+        ])
+        .assert()
+        .success();
+
+    // Transition the worker to `stopping`. `agent stop` marks the worker
+    // stopping *before* attempting the (here nonexistent) process kill, so the
+    // command exits non-zero but the control-state side effect lands. We then
+    // confirm the precondition via `status` before relying on it.
+    let _ = dispatch_cmd(&dir, cell_id)
+        .args(["agent", "stop", "s-stop2"])
+        .output();
+
+    let mut is_stopping = false;
+    for _ in 0..20 {
+        let out = dispatch_cmd(&dir, cell_id).arg("status").output().unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        if s.contains("\"id\":\"w-stop2\"") && s.contains("\"control_state\":\"stopping\"") {
+            is_stopping = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(is_stopping, "precondition: w-stop2 must be marked stopping");
+
+    let out = dispatch_cmd(&dir, cell_id)
+        .args([
+            "listen",
+            "--for-agent",
+            "--worker-id",
+            "w-stop2",
+            "--timeout",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("stopping timeout must be neutral JSON, got: {stdout:?}"));
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["worker_id"], "w-stop2");
+}
+
 // ── Env-driven identity (US-001) ──────────────────────────────────────
 
 /// A dispatch-launched agent runs a bare `dispatch listen` (no `--worker-id`);

@@ -128,6 +128,15 @@ pub enum Commands {
         /// built-in default of 270s.
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Render results for direct LLM tool-result consumption (US-006): a
+        /// delivered message body is written verbatim to stdout (no JSON
+        /// envelope); on timeout, if the worker is still `active`, the
+        /// configured `continue_instruction` is printed so the agent listens
+        /// again, otherwise the neutral JSON timeout is emitted. Without the
+        /// flag, `listen` prints the raw JSON response unchanged.
+        #[arg(long = "for-agent")]
+        for_agent: bool,
     },
 
     /// Query event history
