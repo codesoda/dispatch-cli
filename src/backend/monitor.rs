@@ -507,6 +507,7 @@ mod tests {
             prompt: None,
             prompt_file_path: None,
             ttl: None,
+            listen_timeout: None,
             stream_json: false,
             interactive: false,
             launch: false,

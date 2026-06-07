@@ -54,6 +54,12 @@ pub struct ResolvedAgentConfig {
     /// substitution in command-adapter shell strings.
     pub prompt_file_path: Option<PathBuf>,
     pub ttl: Option<u64>,
+    /// Effective default `--timeout` (seconds) for this agent's
+    /// `dispatch listen` calls, injected as `DISPATCH_LISTEN_TIMEOUT`.
+    /// Already resolved at config time as per-agent override **>** global
+    /// `listen_timeout`; `None` means "unset" and the CLI's built-in 270s
+    /// default applies.
+    pub listen_timeout: Option<u64>,
     /// Issue #43: when true, the claude adapter is launched with
     /// `--output-format stream-json --verbose` so per-tool-use entries
     /// appear in the agent log.
@@ -83,6 +89,10 @@ pub struct ConfigFile {
     pub cwd: Option<String>,
     /// Default TTL in seconds for agents that don't specify one.
     pub default_ttl: Option<u64>,
+    /// Global default `--timeout` (seconds) for `dispatch listen`, injected
+    /// into spawned agents as `DISPATCH_LISTEN_TIMEOUT`. Overridable per
+    /// agent in `[[agents]]`. When unset, the CLI's built-in 270s applies.
+    pub listen_timeout: Option<u64>,
     /// Monitor dashboard configuration.
     pub monitor: Option<MonitorConfig>,
     /// Agent definitions to launch on serve.
@@ -135,6 +145,10 @@ pub struct AgentConfig {
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     pub ttl: Option<u64>,
+    /// Per-agent override of the global `listen_timeout` (seconds). Injected
+    /// as `DISPATCH_LISTEN_TIMEOUT` so this agent's bare `dispatch listen`
+    /// long-polls for the configured duration.
+    pub listen_timeout: Option<u64>,
     /// Whether `dispatch serve` should auto-start this agent under the
     /// supervisor. `false` (the default) prints a copy-paste command at
     /// startup instead so you can run the agent yourself.
@@ -160,6 +174,7 @@ pub struct AgentConfig {
 fn resolve_agent_config(
     agent: &AgentConfig,
     project_root: &Path,
+    global_listen_timeout: Option<u64>,
 ) -> Result<ResolvedAgentConfig, DispatchError> {
     use crate::adapter::Adapter;
 
@@ -252,6 +267,9 @@ fn resolve_agent_config(
         prompt,
         prompt_file_path,
         ttl: agent.ttl,
+        // Per-agent override wins over the global default; `None` here means
+        // both are unset and the CLI's built-in 270s default applies.
+        listen_timeout: agent.listen_timeout.or(global_listen_timeout),
         stream_json: agent.stream_json,
         launch: agent.launch,
         interactive,
@@ -307,6 +325,11 @@ const CONFIG_TEMPLATE: &str = "\
 # Default TTL in seconds for agents that don't specify their own (default: 3600)
 # default_ttl = 3600
 
+# Default `dispatch listen` timeout in seconds. Injected into spawned agents
+# as DISPATCH_LISTEN_TIMEOUT so a bare `dispatch listen` long-polls for this
+# duration. Overridable per agent in [[agents]]. (default: 270)
+# listen_timeout = 270
+
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
@@ -335,6 +358,8 @@ const CONFIG_TEMPLATE: &str = "\
 # prompt_file = \"prompts/reviewer.md\"            # role prompt body (see above)
 # launch = true
 # ttl = 3600
+# listen_timeout = 540                           # per-agent override of the global
+#                                                # listen_timeout (seconds)
 # stream_json = false                            # when true, claude is launched with
 #                                                # `--output-format stream-json --verbose`
 #                                                # so per-tool-use entries appear in the
@@ -491,19 +516,28 @@ fn resolve_config_inner(
     };
 
     // Extract fields from config file
-    let (name, backend, default_ttl, config_cwd, monitor_config, raw_agents, heartbeats) =
-        match config_file {
-            Some(c) => (
-                c.name,
-                c.backend,
-                c.default_ttl,
-                c.cwd,
-                c.monitor,
-                c.agents,
-                c.heartbeats,
-            ),
-            None => (None, None, None, None, None, vec![], vec![]),
-        };
+    let (
+        name,
+        backend,
+        default_ttl,
+        global_listen_timeout,
+        config_cwd,
+        monitor_config,
+        raw_agents,
+        heartbeats,
+    ) = match config_file {
+        Some(c) => (
+            c.name,
+            c.backend,
+            c.default_ttl,
+            c.listen_timeout,
+            c.cwd,
+            c.monitor,
+            c.agents,
+            c.heartbeats,
+        ),
+        None => (None, None, None, None, None, None, vec![], vec![]),
+    };
 
     // Resolve agent working directory: config cwd (relative to project_root) or project_root
     let agent_cwd = if let Some(ref cwd_path) = config_cwd {
@@ -518,7 +552,7 @@ fn resolve_config_inner(
     // Resolve agent prompt files
     let agents: Vec<ResolvedAgentConfig> = raw_agents
         .iter()
-        .map(|a| resolve_agent_config(a, &project_root))
+        .map(|a| resolve_agent_config(a, &project_root, global_listen_timeout))
         .collect::<Result<_, _>>()?;
 
     Ok(ResolvedConfig {

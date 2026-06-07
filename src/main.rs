@@ -4,11 +4,62 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use dispatch::backend::create_backend;
+use dispatch::backend::local::DEFAULT_LISTEN_TIMEOUT_SECS;
 use dispatch::cli::{AgentAction, Cli, Commands, HookAction};
 use dispatch::config::resolve_config;
+use dispatch::errors::DispatchError;
 use dispatch::hooks;
 use dispatch::logging::init_tracing;
 use dispatch::protocol::{BrokerRequest, BrokerResponse, ResponsePayload};
+
+/// Read `$DISPATCH_WORKER_ID`, treating an empty value as unset. A
+/// dispatch-launched agent always has this set (the orchestrator injects it),
+/// so the agent's commands can be bare (`dispatch listen`, `dispatch ack ...`).
+fn env_worker_id() -> Option<String> {
+    std::env::var("DISPATCH_WORKER_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolve worker identity for an agent command: explicit per-command flag
+/// (`--worker-id`) **>** the global `--from` **>** `$DISPATCH_WORKER_ID`.
+fn resolve_identity(specific: Option<String>, from: Option<String>) -> Option<String> {
+    resolve_identity_with_env(specific, from, env_worker_id())
+}
+
+/// Pure core of [`resolve_identity`] — the process-global env read is lifted
+/// out so the precedence logic is testable without mutating `std::env` (which
+/// races across parallel tests; see `config::resolve_config_with_env`).
+fn resolve_identity_with_env(
+    specific: Option<String>,
+    from: Option<String>,
+    env: Option<String>,
+) -> Option<String> {
+    specific.or(from).or(env)
+}
+
+/// Like [`resolve_identity`] but errors when no identity can be found, for
+/// commands that act *as* a worker (listen / ack / heartbeat / messages).
+fn require_identity(
+    specific: Option<String>,
+    from: Option<String>,
+) -> Result<String, DispatchError> {
+    resolve_identity(specific, from).ok_or(DispatchError::MissingWorkerIdentity)
+}
+
+/// Resolve the `dispatch listen` timeout: explicit `--timeout` flag **>**
+/// `$DISPATCH_LISTEN_TIMEOUT` (injected by the orchestrator from the agent's
+/// resolved `listen_timeout`) **>** the built-in [`DEFAULT_LISTEN_TIMEOUT_SECS`].
+fn resolve_listen_timeout(flag: Option<u64>) -> u64 {
+    let env = std::env::var("DISPATCH_LISTEN_TIMEOUT").ok();
+    resolve_listen_timeout_with_env(flag, env.as_deref())
+}
+
+/// Pure core of [`resolve_listen_timeout`]; env read lifted out for testing.
+fn resolve_listen_timeout_with_env(flag: Option<u64>, env: Option<&str>) -> u64 {
+    flag.or_else(|| env.and_then(|s| s.trim().parse::<u64>().ok()))
+        .unwrap_or(DEFAULT_LISTEN_TIMEOUT_SECS)
+}
 
 /// Parse a timestamp string as either a relative duration (e.g. "5m", "1h", "30s")
 /// or an absolute Unix timestamp. Returns a Unix timestamp in seconds.
@@ -125,20 +176,23 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     capabilities,
                     ttl_secs: ttl,
                     evict,
-                    worker_id,
+                    // Identity from env when no explicit `--worker-id`: a
+                    // dispatch-launched agent claims the pre-registered worker
+                    // dispatch reserved for it (issue #43 bootstrap).
+                    worker_id: worker_id.or_else(env_worker_id),
                     role_prompt,
                 },
                 Commands::Team => BrokerRequest::Team {
-                    from: cli.from.clone(),
+                    from: resolve_identity(None, cli.from.clone()),
                 },
                 Commands::Send { to, body } => BrokerRequest::Send {
                     to,
                     body,
-                    from: cli.from.clone(),
+                    from: resolve_identity(None, cli.from.clone()),
                 },
                 Commands::Listen { worker_id, timeout } => BrokerRequest::Listen {
-                    worker_id,
-                    timeout_secs: timeout,
+                    worker_id: require_identity(worker_id, cli.from.clone())?,
+                    timeout_secs: resolve_listen_timeout(timeout),
                 },
                 Commands::Events {
                     event_type,
@@ -185,7 +239,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                             process::exit(2);
                         });
                     BrokerRequest::Messages {
-                        worker_id,
+                        worker_id: require_identity(worker_id, cli.from.clone())?,
                         unacked,
                         sent,
                         since,
@@ -193,19 +247,23 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                         id,
                     }
                 }
+                // `status` intentionally keeps its "no identity = all workers"
+                // default — a coordinator's `dispatch status` should show the
+                // whole team, so we don't fold env identity in here.
                 Commands::Status { worker_id, clear } => BrokerRequest::Status { worker_id, clear },
                 Commands::Ack {
                     worker_id,
                     message_id,
                     note,
                 } => BrokerRequest::Ack {
-                    worker_id,
+                    worker_id: require_identity(worker_id, cli.from.clone())?,
                     message_id,
                     note,
                 },
-                Commands::Heartbeat { worker_id, status } => {
-                    BrokerRequest::Heartbeat { worker_id, status }
-                }
+                Commands::Heartbeat { worker_id, status } => BrokerRequest::Heartbeat {
+                    worker_id: require_identity(worker_id, cli.from.clone())?,
+                    status,
+                },
                 Commands::Agent { action } => match action {
                     AgentAction::Start { name } => BrokerRequest::AgentStart { name },
                     AgentAction::Stop { name } => BrokerRequest::AgentStop { name },
@@ -339,5 +397,50 @@ mod tests {
     #[test]
     fn parse_timestamp_rejects_garbage() {
         assert!(parse_timestamp("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn identity_prefers_specific_flag_over_from_and_env() {
+        assert_eq!(
+            resolve_identity_with_env(Some("flag".into()), Some("from".into()), Some("env".into())),
+            Some("flag".into())
+        );
+    }
+
+    #[test]
+    fn identity_falls_back_from_then_env() {
+        // No --worker-id → global --from wins over env.
+        assert_eq!(
+            resolve_identity_with_env(None, Some("from".into()), Some("env".into())),
+            Some("from".into())
+        );
+        // Neither flag → env (the dispatch-launched-agent case).
+        assert_eq!(
+            resolve_identity_with_env(None, None, Some("env".into())),
+            Some("env".into())
+        );
+    }
+
+    #[test]
+    fn identity_none_when_nothing_present() {
+        assert_eq!(resolve_identity_with_env(None, None, None), None);
+    }
+
+    #[test]
+    fn listen_timeout_precedence_flag_env_default() {
+        // Flag wins.
+        assert_eq!(resolve_listen_timeout_with_env(Some(5), Some("99")), 5);
+        // No flag → env.
+        assert_eq!(resolve_listen_timeout_with_env(None, Some("99")), 99);
+        // Neither → built-in default (270).
+        assert_eq!(
+            resolve_listen_timeout_with_env(None, None),
+            DEFAULT_LISTEN_TIMEOUT_SECS
+        );
+        // Unparseable env falls through to the default rather than erroring.
+        assert_eq!(
+            resolve_listen_timeout_with_env(None, Some("not-a-number")),
+            DEFAULT_LISTEN_TIMEOUT_SECS
+        );
     }
 }

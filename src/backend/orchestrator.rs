@@ -110,7 +110,13 @@ pub struct SpawnContext {
 }
 
 impl SpawnContext {
-    fn env_vars(&self, name: &str, role: &str, worker_id: Option<&str>) -> HashMap<String, String> {
+    fn env_vars(
+        &self,
+        name: &str,
+        role: &str,
+        worker_id: Option<&str>,
+        listen_timeout: Option<u64>,
+    ) -> HashMap<String, String> {
         let mut vars = HashMap::new();
         vars.insert("DISPATCH_CELL_ID".into(), self.cell_id.clone());
         vars.insert(
@@ -127,6 +133,12 @@ impl SpawnContext {
         vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
         if let Some(id) = worker_id {
             vars.insert("DISPATCH_WORKER_ID".into(), id.into());
+        }
+        // Resolved at config time as per-agent override > global; injected so
+        // the agent's bare `dispatch listen` long-polls for the configured
+        // duration. Omitted when unset — the CLI's 270s default then applies.
+        if let Some(timeout) = listen_timeout {
+            vars.insert("DISPATCH_LISTEN_TIMEOUT".into(), timeout.to_string());
         }
         vars
     }
@@ -614,11 +626,11 @@ pub async fn build_pending_agent(
             let mut sc = config.clone();
             sc.prompt_file_path = Some(boot_path);
 
-            let env = ctx.env_vars(&config.name, &config.role, Some(&id));
+            let env = ctx.env_vars(&config.name, &config.role, Some(&id), config.listen_timeout);
             (env, Some(id), Some(prompt_content), sc)
         } else {
             // Legacy unmanaged path (launch=false, or no prompt_file).
-            let env = ctx.env_vars(&config.name, &config.role, None);
+            let env = ctx.env_vars(&config.name, &config.role, None, config.listen_timeout);
             (env, None, None, config.clone())
         };
 
@@ -1084,6 +1096,13 @@ pub fn build_agent_command(
         parts.push(format!("DISPATCH_WORKER_ID={}", shell_escape(id)));
     }
 
+    if let Some(timeout) = config.listen_timeout {
+        parts.push(format!(
+            "DISPATCH_LISTEN_TIMEOUT={}",
+            shell_escape(&timeout.to_string())
+        ));
+    }
+
     let cmd_str = AgentOrchestrator::build_launch(config)
         .map(|launch| launch_to_shell_string(&launch))
         .unwrap_or_else(|e| format!("# adapter error: {e}"));
@@ -1166,10 +1185,16 @@ mod tests {
         );
         let ctx = orch.snapshot_spawn_context();
 
-        let with_id = ctx.env_vars("alice", "test-runner", Some("w-123"));
+        let with_id = ctx.env_vars("alice", "test-runner", Some("w-123"), Some(540));
         assert_eq!(
             with_id.get("DISPATCH_WORKER_ID").map(String::as_str),
             Some("w-123")
+        );
+        // A resolved per-agent/global listen timeout is injected as
+        // DISPATCH_LISTEN_TIMEOUT so the agent's bare `dispatch listen` uses it.
+        assert_eq!(
+            with_id.get("DISPATCH_LISTEN_TIMEOUT").map(String::as_str),
+            Some("540")
         );
         assert_eq!(
             with_id.get("DISPATCH_AGENT_NAME").map(String::as_str),
@@ -1180,8 +1205,10 @@ mod tests {
             Some("test-runner")
         );
 
-        let without_id = ctx.env_vars("alice", "test-runner", None);
+        let without_id = ctx.env_vars("alice", "test-runner", None, None);
         assert!(!without_id.contains_key("DISPATCH_WORKER_ID"));
+        // No resolved timeout → the key is omitted and the CLI default applies.
+        assert!(!without_id.contains_key("DISPATCH_LISTEN_TIMEOUT"));
         // The other vars must match exactly so the legacy code path is bit-for-bit unchanged.
         assert_eq!(
             without_id.get("DISPATCH_AGENT_NAME").map(String::as_str),
@@ -1212,7 +1239,7 @@ mod tests {
         );
         let ctx = orch.snapshot_spawn_context();
 
-        let vars = ctx.env_vars("alice", "test-runner", None);
+        let vars = ctx.env_vars("alice", "test-runner", None, None);
         assert_eq!(
             vars.get("DISPATCH_CONFIG_PATH").map(String::as_str),
             Some(config_path.display().to_string().as_str())
@@ -1237,7 +1264,7 @@ mod tests {
         );
         let ctx = orch.snapshot_spawn_context();
 
-        let vars = ctx.env_vars("alice", "test-runner", None);
+        let vars = ctx.env_vars("alice", "test-runner", None, None);
         assert!(!vars.contains_key("DISPATCH_CONFIG_PATH"));
     }
 
@@ -1269,6 +1296,7 @@ mod tests {
             prompt: None,
             prompt_file_path: None,
             ttl: None,
+            listen_timeout: None,
             stream_json: false,
             interactive: false,
             launch: true,
@@ -1291,6 +1319,7 @@ mod tests {
             prompt: None,
             prompt_file_path: Some(prompt_path),
             ttl: None,
+            listen_timeout: None,
             stream_json: false,
             interactive: false,
             launch: true,

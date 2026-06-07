@@ -115,13 +115,17 @@ pub enum Commands {
 
     /// Long-poll for incoming messages
     Listen {
-        /// Worker ID to listen as
+        /// Worker ID to listen as. Falls back to the global `--from`, then
+        /// `$DISPATCH_WORKER_ID` — so a dispatch-launched agent can run a
+        /// bare `dispatch listen`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
-        /// Timeout in seconds (default: 270)
-        #[arg(long, default_value = "270")]
-        timeout: u64,
+        /// Timeout in seconds. Falls back to `$DISPATCH_LISTEN_TIMEOUT`
+        /// (injected by the orchestrator from `listen_timeout`), then the
+        /// built-in default of 270s.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Query event history
@@ -149,9 +153,10 @@ pub enum Commands {
 
     /// Query message history (non-destructive)
     Messages {
-        /// Worker ID to inspect messages for
+        /// Worker ID to inspect messages for. Falls back to the global
+        /// `--from`, then `$DISPATCH_WORKER_ID`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
         /// Show only delivered but unacked messages
         #[arg(long)]
@@ -187,9 +192,10 @@ pub enum Commands {
 
     /// Acknowledge receipt of a message
     Ack {
-        /// Worker ID that received the message
+        /// Worker ID that received the message. Falls back to the global
+        /// `--from`, then `$DISPATCH_WORKER_ID`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
         /// Message ID to acknowledge
         #[arg(long)]
@@ -202,9 +208,10 @@ pub enum Commands {
 
     /// Renew worker liveness TTL
     Heartbeat {
-        /// Worker ID to heartbeat
+        /// Worker ID to heartbeat. Falls back to the global `--from`, then
+        /// `$DISPATCH_WORKER_ID`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
         /// Set a status tagline (e.g. "Running e2e tests 3/10")
         #[arg(long)]

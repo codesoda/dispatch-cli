@@ -582,6 +582,110 @@ fn listen_times_out_with_no_messages() {
     );
 }
 
+// ── Env-driven identity (US-001) ──────────────────────────────────────
+
+/// A dispatch-launched agent runs a bare `dispatch listen` (no `--worker-id`);
+/// identity comes from `$DISPATCH_WORKER_ID`, which the orchestrator injects.
+#[test]
+fn listen_resolves_worker_id_from_env() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-listen-env-id";
+    let _broker = start_broker(&dir, cell_id);
+
+    let worker_id = register_worker(&dir, cell_id, "env-listener", "idle");
+
+    // No --worker-id flag; identity flows from DISPATCH_WORKER_ID.
+    let listen_out = dispatch_cmd(&dir, cell_id)
+        .env("DISPATCH_WORKER_ID", &worker_id)
+        .args(["listen", "--timeout", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&listen_out).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(
+        json["worker_id"], worker_id,
+        "bare listen must resolve identity from $DISPATCH_WORKER_ID"
+    );
+}
+
+/// With neither `--worker-id`/`--from` nor `$DISPATCH_WORKER_ID`, a command
+/// that acts *as* a worker fails with a clear, actionable error.
+#[test]
+fn listen_without_identity_errors() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-listen-no-id";
+    // No broker needed: identity is resolved before any broker round-trip.
+    let assert = dispatch_cmd(&dir, cell_id)
+        .env_remove("DISPATCH_WORKER_ID")
+        .args(["listen", "--timeout", "1"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("no worker identity"),
+        "expected a missing-identity error, got: {stderr}"
+    );
+}
+
+/// `register --for-agent` with no `--worker-id` claims the pre-registered
+/// worker named by `$DISPATCH_WORKER_ID` and returns its stored role prompt.
+#[test]
+fn register_for_agent_claims_worker_id_from_env() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-env-claim";
+    let _broker = start_broker(&dir, cell_id);
+
+    let prompt = "Run: dispatch listen";
+    // Pre-register a worker with a fixed id + stored role prompt (the
+    // orchestrator does this server-side at spawn time).
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--worker-id",
+            "w-env-claim",
+            "--name",
+            "claimer",
+            "--role",
+            "worker",
+            "--description",
+            "env claim test",
+            "--role-prompt",
+            prompt,
+        ])
+        .assert()
+        .success();
+
+    // Claim it via env identity (no --worker-id flag). The role prompt body
+    // lands on stdout for the agent's next instruction.
+    let out = dispatch_cmd(&dir, cell_id)
+        .env("DISPATCH_WORKER_ID", "w-env-claim")
+        .args([
+            "register",
+            "--name",
+            "claimer",
+            "--role",
+            "worker",
+            "--description",
+            "env claim test",
+            "--for-agent",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&out).to_string();
+    assert_eq!(
+        stdout, prompt,
+        "register --for-agent must return the pre-registered worker's prompt via env identity"
+    );
+}
+
 // ── Stop-hook broker-liveness probe ───────────────────────────────────
 
 /// With the broker unreachable (env points at a nonexistent socket, no

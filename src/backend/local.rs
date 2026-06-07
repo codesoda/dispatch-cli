@@ -41,8 +41,10 @@ pub enum BrokerError {
 /// Default worker TTL in seconds (1 hour).
 const DEFAULT_WORKER_TTL_SECS: u64 = 3600;
 
-/// Default listen timeout in seconds.
-const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
+/// Default listen timeout in seconds. Single source of truth shared with the
+/// CLI (`main.rs` resolves `--timeout` flag > `$DISPATCH_LISTEN_TIMEOUT` env >
+/// this default) and the broker's own 0-means-default fallback below.
+pub const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 270;
 
 /// Default maximum number of events retained in history.
 const DEFAULT_EVENT_HISTORY_MAX: usize = 10_000;
