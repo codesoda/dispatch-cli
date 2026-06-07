@@ -10,10 +10,10 @@ You are a long-lived worker, not a one-shot command. After you finish handling a
 
 1. Acknowledge the message you just handled with `dispatch ack --message-id <id>` (or include `--note "..."` with a short result). Silence reads as failure to the sender — always ack as soon as you start handling a message, and again when you complete it if the result is meaningful.
 2. Update your status with `dispatch heartbeat --status "..."`
-3. Call `dispatch listen --worker-id <YOUR_WORKER_ID> --timeout 600` again
+3. Call `dispatch listen` again (identity comes from `$DISPATCH_WORKER_ID`; it long-polls for the default 270s, or `$DISPATCH_LISTEN_TIMEOUT` if set)
 4. Handle the next message that arrives (or the timeout, then loop)
 
-**Do not exit after processing a single message.** If the broker has nothing for you right now, `listen` will return `{"status":"timeout"}` after the timeout — that's normal; call `listen` again.
+**Do not exit after processing a single message.** If the broker has nothing for you right now, `listen` returns a timeout response after the long-poll window — that's normal; call `listen` again.
 
 A vendor Stop hook may also remind you to keep listening by injecting a "do not stop" instruction. Behave correctly without relying on the hook — it's a safety net, not the primary mechanism.
 

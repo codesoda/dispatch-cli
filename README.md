@@ -73,17 +73,20 @@ Dispatch runs as a **cell** — a single broker process that coordinates workers
 |---------|-------------|
 | `dispatch init` | Create a `dispatch.config.toml` in the current directory |
 | `dispatch serve` | Start the broker: auto-launches `launch = true` agents; prints copy-paste commands for `launch = false` agents |
-| `dispatch register` | Register a worker (`--evict` replaces existing by name) |
+| `dispatch register` | Register a worker (`--evict` replaces existing by name; `--for-agent` claims the pre-registered worker and prints its role prompt) |
 | `dispatch team` | List active workers |
 | `dispatch send` | Send a direct message to a worker |
-| `dispatch listen` | Long-poll for incoming messages |
+| `dispatch listen` | Long-poll for incoming messages (`--for-agent` renders the body / continue-instruction for direct agent consumption) |
 | `dispatch heartbeat` | Renew worker TTL (add `--status "doing X"` to publish status) |
+
+A dispatch-launched agent resolves its identity from `$DISPATCH_WORKER_ID`, so it runs these bare — no `--worker-id`. See [The JIT prompt control plane](#the-jit-prompt-control-plane).
 
 ### Introspection
 
 | Command | Description |
 |---------|-------------|
 | `dispatch ack` | Acknowledge receipt of a message (`--message-id`, `--note`) |
+| `dispatch result` | Report completion (`--message-id`, `--status done\|failed\|blocked`, `--summary`, `--artifact`) — a "super-ack" |
 | `dispatch status` | View worker status taglines (or `--clear` to wipe) |
 | `dispatch events` | Query event history (`--type`, `--worker`, `--since`, `--limit`) |
 | `dispatch messages` | Inspect message history (`--worker-id`, `--unacked`, `--sent`) |
@@ -115,6 +118,8 @@ cell_id = "my-project"
 ```
 
 Override precedence (highest wins): `--cell-id` flag > `DISPATCH_CELL_ID` env var > config file > derived from path.
+
+`dispatch init` writes a fully-commented `dispatch.config.toml` covering every option, including the control-plane knobs (`listen_timeout`, `continue_instruction`, `stopping_drain_secs`, `log_prompt_bodies`) and `[[agents]]` examples for both a supervised worker (`launch = true`) and an interactive coordinator (`launch = false`, `interactive = true`). See [The JIT prompt control plane](#the-jit-prompt-control-plane).
 
 ## Agent orchestration
 
@@ -170,11 +175,13 @@ dispatch codex-hook install       # writes .codex/hooks.json + enables features.
 dispatch claude-hook install      # merges a Stop hook into .claude/settings.json
 ```
 
-The hook runs `dispatch {codex,claude}-hook stop`, which emits `{"decision":"block","reason":"..."}` on stdout when a dispatch broker is reachable on the project's socket. The block decision tells the vendor not to exit at end-of-turn; the `reason` instructs the agent to call `dispatch listen` again with its `worker_id`, which keeps it alive and waiting for the next message instead of treating its job as done.
+The hook runs `dispatch {codex,claude}-hook stop`, which is **worker-aware** — it decides block vs. allow from the worker's control state, not mere broker reachability:
 
-The reason string is prefixed with an "if you are a dispatch agent" guard so ad-hoc sessions you start by hand inside the same repo can ignore it and stop normally — the hook fires for every claude/codex session in the repo, not just dispatch-launched ones.
+1. **No `$DISPATCH_WORKER_ID`** → allow the stop (print nothing). The hook fires for *every* claude/codex session in the repo; identity is the gate that keeps it from hijacking ad-hoc sessions you start by hand.
+2. **Worker `active`** → emit `{"decision":"block","reason":"..."}`, where `reason` is the configured `continue_instruction` telling the agent to run `dispatch listen` again. This holds the agent in its loop.
+3. **Worker `stopping`/`stopped`/unknown, or the broker is unreachable** → allow the stop. The coordinator owns the stop decision (via `dispatch agent stop`); a shutting-down or gone dispatch never strands the agent.
 
-When the hook can't reach a broker (dispatch is shutting down, was never started, or the agent is running outside a dispatch project), it prints nothing and exits `0` so the vendor stops the agent cleanly instead of pinning it alive. Uninstall with `... uninstall`.
+State is read by reusing the `status` query (no extra protocol surface), bounded by a short timeout so the hook stays well inside the codex 10s budget. Uninstall with `... uninstall`.
 
 ### Monitor dashboard
 
@@ -186,6 +193,60 @@ When the hook can't reach a broker (dispatch is shutting down, was never started
 - **Start / Stop / Restart** buttons wired to `POST /api/agents/{name}/{action}`. A **Copy cmd** button appears for `launch = false` agents so you can paste the launch command into another terminal.
 
 The card endpoints are unauthenticated and local-loopback only — the same posture as `POST /api/shutdown`.
+
+## The JIT prompt control plane
+
+Dispatch can drive cheap-to-prompt, controllable, small-model-friendly agents with an explicit, observable lifecycle. An agent boots with **one line**, gets its operating prompt from dispatch just-in-time, then runs a `listen → work → result → listen` loop held open by the stop hook.
+
+### Bootstrap (one line)
+
+A managed agent (`launch = true` with a `prompt_file`) is pre-registered server-side: dispatch reserves a worker, stores the agent's role prompt under it, and injects identity into the agent's environment (`DISPATCH_WORKER_ID`, `DISPATCH_AGENT_NAME`, `DISPATCH_AGENT_ROLE`, `DISPATCH_AGENT_DESCRIPTION`, `DISPATCH_CONFIG_PATH`, `DISPATCH_LISTEN_TIMEOUT`). The agent's entire boot is:
+
+```sh
+dispatch register --for-agent
+```
+
+`--for-agent` writes the **role prompt body to stdout** (so it lands directly in the model's tool result) and the JSON envelope to stderr. Because identity is in the environment, name/role/description/worker-id all resolve automatically — no flags.
+
+### The listen loop
+
+```sh
+dispatch register --for-agent                 # once: claim worker + fetch role prompt
+dispatch listen   --for-agent                 # long-poll; prints the task body verbatim
+# ...do the work...
+dispatch result  --message-id <id> --status done --summary "<what you did>"
+# turn ends → the stop hook brings the agent back to listen
+```
+
+Commands are **bare** (identity from `$DISPATCH_WORKER_ID`). `listen` long-polls for `listen_timeout` seconds (default 270; the long-poll *is* the backoff — no sleeps) and renews the worker's TTL. With `--for-agent`, a delivered message body is rendered verbatim; on a timeout while the worker is still `active`, the configured `continue_instruction` is printed so the agent listens again. `dispatch result` is a "super-ack": it records completion (status + summary + artifacts) on the same substrate as `ack`, so a worker needs only `result`, not a separate `ack`.
+
+### Stop-hook contract
+
+The turn-ending stop hook is what holds the loop open. It is identity-gated and reads the worker's **control state**: `active` → block the stop and return the `continue_instruction`; `stopping`/`stopped`/unknown/unreachable → allow. The coordinator owns the transition via `dispatch agent stop <name>`, which marks the worker `stopping` (it then lingers for `stopping_drain_secs` so a dying agent's late hook call still resolves cleanly) before terminating it. See [Vendor hooks (keeping LLM agents alive)](#vendor-hooks-keeping-llm-agents-alive).
+
+### Config knobs
+
+```toml
+listen_timeout       = 270    # default long-poll seconds (global; per-agent override in [[agents]])
+continue_instruction = "..."  # the "listen again" text (global; per-agent override)
+stopping_drain_secs  = 10     # how long a stopped worker lingers for late hook calls
+log_prompt_bodies    = false  # log prompt bodies by hash + size only (default), or in full
+```
+
+### Observability
+
+Every step is a queryable event: `dispatch events --type prompt` (prompt delivery by hash + byte size), `--type lifecycle` (`active`/`stopping`/`stopped` transitions), `--type stop_decision` (each hook block/allow), `--type result` (completions). Prompt bodies are never logged in full unless `log_prompt_bodies = true`.
+
+### The dispatch / consumer boundary
+
+Dispatch owns the **messaging substrate, the loop primitives, and the hook *decision***. The consumer (e.g. a process framework like SEAMS) owns **looping policy, hook wiring, and prompt authoring**:
+
+- Dispatch provides: `register`/`listen`/`ack`/`result`, worker control state, the worker-aware stop hook, and the `continue_instruction` text.
+- The consumer provides: when/whether to install hooks (`*-hook install` stays manual), the operating prompts, and any per-agent loop coda. Dispatch never auto-installs hooks or embeds prompts.
+
+### The agent skill
+
+A vendor-neutral skill in [`skills/dispatch/`](skills/dispatch/) teaches an agent the four core verbs and the "don't stop on your own" loop, with full per-command reference pages read on demand. Symlink it into a project (it is intentionally not embedded or written by `dispatch init`).
 
 ## Stale & Refresh Control Messages
 

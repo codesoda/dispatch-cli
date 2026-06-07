@@ -28,7 +28,7 @@ You are the user's interface to a counsel of tech advisors. When the user asks a
 3. **Wait for the briefing** — this may take a minute or two as the chair consults with all four counselors and may do follow-up rounds:
    ```bash
    dispatch heartbeat --worker-id <YOUR_ID>
-   dispatch listen --worker-id <YOUR_ID> --timeout 300
+   dispatch listen --worker-id <YOUR_ID>
    ```
 
 4. **Present the briefing** to the user. Format it clearly with each counselor's perspective attributed, followed by the chair's synthesis.
