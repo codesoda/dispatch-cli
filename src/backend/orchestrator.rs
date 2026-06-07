@@ -114,6 +114,7 @@ impl SpawnContext {
         &self,
         name: &str,
         role: &str,
+        description: &str,
         worker_id: Option<&str>,
         listen_timeout: Option<u64>,
     ) -> HashMap<String, String> {
@@ -131,6 +132,9 @@ impl SpawnContext {
         }
         vars.insert("DISPATCH_AGENT_NAME".into(), name.into());
         vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
+        // Injected so the bare boot line `dispatch register --for-agent` can
+        // resolve the broker-required --description from env (US-003).
+        vars.insert("DISPATCH_AGENT_DESCRIPTION".into(), description.into());
         if let Some(id) = worker_id {
             vars.insert("DISPATCH_WORKER_ID".into(), id.into());
         }
@@ -626,11 +630,23 @@ pub async fn build_pending_agent(
             let mut sc = config.clone();
             sc.prompt_file_path = Some(boot_path);
 
-            let env = ctx.env_vars(&config.name, &config.role, Some(&id), config.listen_timeout);
+            let env = ctx.env_vars(
+                &config.name,
+                &config.role,
+                &config.description,
+                Some(&id),
+                config.listen_timeout,
+            );
             (env, Some(id), Some(prompt_content), sc)
         } else {
             // Legacy unmanaged path (launch=false, or no prompt_file).
-            let env = ctx.env_vars(&config.name, &config.role, None, config.listen_timeout);
+            let env = ctx.env_vars(
+                &config.name,
+                &config.role,
+                &config.description,
+                None,
+                config.listen_timeout,
+            );
             (env, None, None, config.clone())
         };
 
@@ -761,12 +777,16 @@ pub async fn pre_register_unmanaged(
     Ok((id, boot_path))
 }
 
-/// Write the issue-#43 one-line boot prompt to a stable per-agent file
-/// under the log dir. The boot prompt forces the model's first observable
-/// action to be a real `dispatch register --for-agent` tool call, which
-/// returns the role prompt body in its tool result. Description is
-/// substituted at write time (shell-escaped) so the dispatch CLI's
-/// required `--description` flag is satisfied without an env var.
+/// Write the one-line boot prompt to a stable per-agent file under the log
+/// dir. The boot prompt forces the model's first observable action to be a
+/// real `dispatch register --for-agent` tool call, which returns the role
+/// prompt body in its tool result.
+///
+/// US-003: the line is exactly `Run: dispatch register --for-agent` — worker
+/// id, name, role, and description all resolve from the env the orchestrator
+/// injects (`DISPATCH_WORKER_ID` / `DISPATCH_AGENT_NAME` / `_ROLE` /
+/// `_DESCRIPTION`), so the boot prompt is identical across every agent and
+/// carries no per-agent shell-escaped values.
 async fn write_boot_prompt(
     log_dir: &Path,
     config: &ResolvedAgentConfig,
@@ -774,13 +794,7 @@ async fn write_boot_prompt(
     tokio::fs::create_dir_all(log_dir).await?;
     let safe = sanitize_name(&config.name);
     let path = log_dir.join(format!("{safe}.boot.prompt"));
-    let body = format!(
-        "Run: dispatch register --worker-id \"$DISPATCH_WORKER_ID\" \
-         --name \"$DISPATCH_AGENT_NAME\" --role \"$DISPATCH_AGENT_ROLE\" \
-         --description {} --for-agent\n",
-        shell_escape(&config.description),
-    );
-    tokio::fs::write(&path, body).await?;
+    tokio::fs::write(&path, "Run: dispatch register --for-agent\n").await?;
     Ok(path)
 }
 
@@ -1087,6 +1101,10 @@ pub fn build_agent_command(
         "DISPATCH_AGENT_ROLE={}",
         shell_escape(&config.role)
     ));
+    parts.push(format!(
+        "DISPATCH_AGENT_DESCRIPTION={}",
+        shell_escape(&config.description)
+    ));
 
     if let Some(url) = monitor_url {
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
@@ -1185,10 +1203,24 @@ mod tests {
         );
         let ctx = orch.snapshot_spawn_context();
 
-        let with_id = ctx.env_vars("alice", "test-runner", Some("w-123"), Some(540));
+        let with_id = ctx.env_vars(
+            "alice",
+            "test-runner",
+            "does things",
+            Some("w-123"),
+            Some(540),
+        );
         assert_eq!(
             with_id.get("DISPATCH_WORKER_ID").map(String::as_str),
             Some("w-123")
+        );
+        // Description is injected so the bare boot line can resolve the
+        // broker-required --description from env (US-003).
+        assert_eq!(
+            with_id
+                .get("DISPATCH_AGENT_DESCRIPTION")
+                .map(String::as_str),
+            Some("does things")
         );
         // A resolved per-agent/global listen timeout is injected as
         // DISPATCH_LISTEN_TIMEOUT so the agent's bare `dispatch listen` uses it.
@@ -1205,7 +1237,7 @@ mod tests {
             Some("test-runner")
         );
 
-        let without_id = ctx.env_vars("alice", "test-runner", None, None);
+        let without_id = ctx.env_vars("alice", "test-runner", "does things", None, None);
         assert!(!without_id.contains_key("DISPATCH_WORKER_ID"));
         // No resolved timeout → the key is omitted and the CLI default applies.
         assert!(!without_id.contains_key("DISPATCH_LISTEN_TIMEOUT"));
@@ -1239,7 +1271,7 @@ mod tests {
         );
         let ctx = orch.snapshot_spawn_context();
 
-        let vars = ctx.env_vars("alice", "test-runner", None, None);
+        let vars = ctx.env_vars("alice", "test-runner", "does things", None, None);
         assert_eq!(
             vars.get("DISPATCH_CONFIG_PATH").map(String::as_str),
             Some(config_path.display().to_string().as_str())
@@ -1264,7 +1296,7 @@ mod tests {
         );
         let ctx = orch.snapshot_spawn_context();
 
-        let vars = ctx.env_vars("alice", "test-runner", None, None);
+        let vars = ctx.env_vars("alice", "test-runner", "does things", None, None);
         assert!(!vars.contains_key("DISPATCH_CONFIG_PATH"));
     }
 

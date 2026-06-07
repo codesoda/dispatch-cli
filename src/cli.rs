@@ -48,17 +48,19 @@ pub enum Commands {
 
     /// Register a worker with the broker
     Register {
-        /// Worker name
+        /// Worker name. Falls back to `$DISPATCH_AGENT_NAME` — so a
+        /// dispatch-launched agent boots with a bare
+        /// `dispatch register --for-agent`.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
 
-        /// Worker role
+        /// Worker role. Falls back to `$DISPATCH_AGENT_ROLE`.
         #[arg(long)]
-        role: String,
+        role: Option<String>,
 
-        /// Worker description
+        /// Worker description. Falls back to `$DISPATCH_AGENT_DESCRIPTION`.
         #[arg(long)]
-        description: String,
+        description: Option<String>,
 
         /// Worker capabilities (repeatable)
         #[arg(long = "capability")]

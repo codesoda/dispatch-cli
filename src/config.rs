@@ -350,13 +350,14 @@ const CONFIG_TEMPLATE: &str = "\
 # Agent definitions — auto-started by `dispatch serve` when launch = true.
 #
 # When `launch = true` AND `prompt_file` is set (the managed-agent flow),
-# dispatch pre-registers the worker server-side at spawn time, injects
-# DISPATCH_WORKER_ID into the agent's environment, and feeds the agent a
-# one-line boot prompt. The first thing the model does is run
-# `dispatch register --worker-id \"$DISPATCH_WORKER_ID\" ... --for-agent`,
-# whose response body is the contents of `prompt_file` — so the role prompt
-# lands in the model's tool result instead of being narrated up front (this
-# kills a class of hallucination where the model fakes the register step).
+# dispatch pre-registers the worker server-side at spawn time, injects the
+# agent's identity into its environment (DISPATCH_WORKER_ID / DISPATCH_AGENT_NAME
+# / DISPATCH_AGENT_ROLE / DISPATCH_AGENT_DESCRIPTION), and feeds the agent a
+# one-line boot prompt. The first thing the model does is run the bare
+# `dispatch register --for-agent` (identity all from env), whose response body
+# is the contents of `prompt_file` — so the role prompt lands in the model's
+# tool result instead of being narrated up front (this kills a class of
+# hallucination where the model fakes the register step).
 #
 # When `launch = false`, dispatch prints the command for you to copy into a
 # separate terminal and the agent registers itself the legacy way.

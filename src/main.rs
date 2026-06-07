@@ -61,6 +61,19 @@ fn resolve_listen_timeout_with_env(flag: Option<u64>, env: Option<&str>) -> u64 
         .unwrap_or(DEFAULT_LISTEN_TIMEOUT_SECS)
 }
 
+/// Resolve a required `register` field: explicit flag **>** the orchestrator-
+/// injected env var (`DISPATCH_AGENT_NAME` / `_ROLE` / `_DESCRIPTION`). Lets a
+/// launched agent boot with a bare `dispatch register --for-agent` while a
+/// hand-run register that supplies neither fails with a clear message.
+fn require_register_field(
+    flag: Option<String>,
+    env: &'static str,
+    field: &'static str,
+) -> Result<String, DispatchError> {
+    flag.or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+        .ok_or(DispatchError::MissingRegisterField { field, env })
+}
+
 /// Parse a timestamp string as either a relative duration (e.g. "5m", "1h", "30s")
 /// or an absolute Unix timestamp. Returns a Unix timestamp in seconds.
 fn parse_timestamp(s: &str) -> Result<u64, String> {
@@ -170,9 +183,16 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     role_prompt,
                     for_agent: _,
                 } => BrokerRequest::Register {
-                    name,
-                    role,
-                    description,
+                    // name/role/description fall back to the orchestrator-
+                    // injected env so the boot line is a bare
+                    // `dispatch register --for-agent` (US-003).
+                    name: require_register_field(name, "DISPATCH_AGENT_NAME", "name")?,
+                    role: require_register_field(role, "DISPATCH_AGENT_ROLE", "role")?,
+                    description: require_register_field(
+                        description,
+                        "DISPATCH_AGENT_DESCRIPTION",
+                        "description",
+                    )?,
                     capabilities,
                     ttl_secs: ttl,
                     evict,

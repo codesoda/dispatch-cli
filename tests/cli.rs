@@ -686,6 +686,74 @@ fn register_for_agent_claims_worker_id_from_env() {
     );
 }
 
+// ── Uniform minimal bootstrap (US-003) ────────────────────────────────
+
+/// The whole point of US-003: the boot line is exactly
+/// `dispatch register --for-agent` with no flags. name/role/description and
+/// the worker id all resolve from the orchestrator-injected env.
+#[test]
+fn register_for_agent_bare_boot_line_resolves_all_from_env() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-bare-boot";
+    let _broker = start_broker(&dir, cell_id);
+
+    let prompt = "Run: dispatch listen";
+    // Pre-register the worker (what the orchestrator does server-side).
+    dispatch_cmd(&dir, cell_id)
+        .args([
+            "register",
+            "--worker-id",
+            "w-boot",
+            "--name",
+            "booty",
+            "--role",
+            "worker",
+            "--description",
+            "boot desc",
+            "--role-prompt",
+            prompt,
+        ])
+        .assert()
+        .success();
+
+    // The bare boot line — every field from env, nothing on the command line.
+    let out = dispatch_cmd(&dir, cell_id)
+        .env("DISPATCH_WORKER_ID", "w-boot")
+        .env("DISPATCH_AGENT_NAME", "booty")
+        .env("DISPATCH_AGENT_ROLE", "worker")
+        .env("DISPATCH_AGENT_DESCRIPTION", "boot desc")
+        .args(["register", "--for-agent"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        prompt,
+        "bare `dispatch register --for-agent` must resolve all identity from env"
+    );
+}
+
+/// A hand-run `dispatch register` with neither flags nor env for a required
+/// field fails with a clear, actionable error rather than a clap usage wall.
+#[test]
+fn register_without_name_flag_or_env_errors() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-register-missing-name";
+    let assert = dispatch_cmd(&dir, cell_id)
+        .env_remove("DISPATCH_AGENT_NAME")
+        .args(["register", "--role", "r", "--description", "d"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("register requires name"),
+        "expected a missing-field error for name, got: {stderr}"
+    );
+}
+
 // ── Stop-hook broker-liveness probe ───────────────────────────────────
 
 /// With the broker unreachable (env points at a nonexistent socket, no

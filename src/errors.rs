@@ -51,6 +51,14 @@ pub enum DispatchError {
     )]
     MissingWorkerIdentity,
 
+    #[error(
+        "register requires {field} -- pass --{field} <value>, or set ${env} (dispatch-launched agents have it set automatically)"
+    )]
+    MissingRegisterField {
+        field: &'static str,
+        env: &'static str,
+    },
+
     #[error("--for-agent set but response carries no role prompt")]
     NoRolePromptReturned,
 
