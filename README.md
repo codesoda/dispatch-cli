@@ -72,7 +72,7 @@ Dispatch runs as a **cell** — a single broker process that coordinates workers
 | Command | Description |
 |---------|-------------|
 | `dispatch init` | Create a `dispatch.config.toml` in the current directory |
-| `dispatch serve` | Start the broker (prints agent commands; use `--launch` to auto-start) |
+| `dispatch serve` | Start the broker: auto-launches `launch = true` agents; prints copy-paste commands for `launch = false` agents |
 | `dispatch register` | Register a worker (`--evict` replaces existing by name) |
 | `dispatch team` | List active workers |
 | `dispatch send` | Send a direct message to a worker |
@@ -152,7 +152,7 @@ command = "./examples/watch-files.sh --worker-id $DISPATCH_WORKER_ID src/"
 launch = true
 ```
 
-Run `dispatch serve --launch` to auto-spawn every agent with `launch = true`. Agents with `launch = false` (the default) are printed as ready-to-paste commands so you can run them in separate terminals.
+Run `dispatch serve` to auto-spawn every agent with `launch = true` under the supervisor. Agents with `launch = false` (the default) are pre-registered server-side and printed as ready-to-paste bootstrap commands so you can run them in separate terminals — the first tool call each one makes is `dispatch register --for-agent`, which returns its role prompt from the broker.
 
 ### Supervisor + auto-restart
 

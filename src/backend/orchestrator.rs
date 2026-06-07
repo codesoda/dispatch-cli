@@ -102,6 +102,11 @@ pub struct SpawnContext {
     monitor_url: Option<String>,
     agent_cwd: PathBuf,
     log_dir: PathBuf,
+    /// Absolute path of the `dispatch.config.toml` that produced this
+    /// resolution, if one exists. Propagated to spawned agents via
+    /// `DISPATCH_CONFIG_PATH` so child `dispatch` calls resolve the same
+    /// config even when their cwd doesn't contain it.
+    config_file_path: Option<PathBuf>,
 }
 
 impl SpawnContext {
@@ -112,6 +117,9 @@ impl SpawnContext {
             "DISPATCH_SOCKET_PATH".into(),
             self.socket_path.display().to_string(),
         );
+        if let Some(ref path) = self.config_file_path {
+            vars.insert("DISPATCH_CONFIG_PATH".into(), path.display().to_string());
+        }
         if let Some(ref url) = self.monitor_url {
             vars.insert("DISPATCH_MONITOR_URL".into(), url.clone());
         }
@@ -161,6 +169,10 @@ pub struct AgentOrchestrator {
     /// to re-register them on restart so the worker record + role prompt
     /// stay alive across respawns.
     broker: Arc<Mutex<super::local::BrokerState>>,
+    /// Propagated to spawned agents via `DISPATCH_CONFIG_PATH` so child
+    /// `dispatch` calls from any cwd in the agent tree resolve the same
+    /// config the orchestrator loaded.
+    config_file_path: Option<PathBuf>,
 }
 
 impl AgentOrchestrator {
@@ -173,6 +185,7 @@ impl AgentOrchestrator {
         log_dir: PathBuf,
         configs: Vec<ResolvedAgentConfig>,
         broker: Arc<Mutex<super::local::BrokerState>>,
+        config_file_path: Option<PathBuf>,
     ) -> Self {
         Self {
             agents: Vec::new(),
@@ -185,6 +198,7 @@ impl AgentOrchestrator {
             log_dir,
             configs,
             broker,
+            config_file_path,
         }
     }
 
@@ -200,6 +214,7 @@ impl AgentOrchestrator {
             prompt_inline: config.prompt.as_deref(),
             command_string: config.command.as_deref(),
             stream_json: config.stream_json,
+            interactive: config.interactive,
         };
         config
             .adapter
@@ -312,6 +327,7 @@ impl AgentOrchestrator {
             monitor_url: self.monitor_url.clone(),
             agent_cwd: self.agent_cwd.clone(),
             log_dir: self.log_dir.clone(),
+            config_file_path: self.config_file_path.clone(),
         }
     }
 
@@ -664,6 +680,75 @@ pub async fn build_pending_agent(
     })
 }
 
+/// Pre-register an unmanaged (`launch = false`) agent with a
+/// `prompt_file` so the copy-paste command printed at serve startup can
+/// use the same boot-prompt bootstrap as supervised agents. Returns
+/// `(worker_id, boot_prompt_path)`: the caller emits
+/// `DISPATCH_WORKER_ID=<id>` in the printed env and substitutes
+/// `boot_prompt_path` for `config.prompt_file_path` so the adapter's
+/// stdin redirect points at the one-line boot prompt instead of the full
+/// role prompt body.
+///
+/// No supervisor, no re-register hook, no spawn — this is only the
+/// broker-side setup. If the user waits longer than `ttl` to paste the
+/// command, the worker expires and the agent's `--for-agent` claim will
+/// fall through to the insert path with `role_prompt: None` (the same
+/// deterministic failure mode as a supervised agent whose TTL elapses
+/// during downtime). In practice the user pastes the command seconds
+/// after serve startup, so this is a non-issue; bumping `ttl` covers
+/// longer windows.
+pub async fn pre_register_unmanaged(
+    ctx: &SpawnContext,
+    config: &ResolvedAgentConfig,
+) -> Result<(String, PathBuf), DispatchError> {
+    let prompt_path =
+        config
+            .prompt_file_path
+            .as_ref()
+            .ok_or_else(|| DispatchError::AgentLaunchFailed {
+                name: config.name.clone(),
+                reason: "pre_register_unmanaged requires prompt_file_path".into(),
+            })?;
+    let prompt_content = tokio::fs::read_to_string(prompt_path).await.map_err(|_| {
+        DispatchError::PromptFileNotFound {
+            name: config.name.clone(),
+            path: prompt_path.clone(),
+        }
+    })?;
+
+    // Write boot prompt BEFORE register_worker so a write failure can't
+    // leave an orphan broker entry — same ordering invariant as the
+    // managed path in `build_pending_agent`.
+    let boot_path = write_boot_prompt(&ctx.log_dir, config).await.map_err(|e| {
+        DispatchError::AgentLaunchFailed {
+            name: config.name.clone(),
+            reason: format!("write boot prompt: {e}"),
+        }
+    })?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut broker = ctx.broker.lock().await;
+        broker
+            .register_worker(
+                config.name.clone(),
+                config.role.clone(),
+                config.description.clone(),
+                Vec::new(),
+                config.ttl,
+                true, // evict any stale same-name worker from a prior session
+                Some(id.clone()),
+                Some(prompt_content),
+            )
+            .map_err(|e| DispatchError::AgentLaunchFailed {
+                name: config.name.clone(),
+                reason: format!("pre-register failed: {e}"),
+            })?;
+    }
+
+    Ok((id, boot_path))
+}
+
 /// Write the issue-#43 one-line boot prompt to a stable per-agent file
 /// under the log dir. The boot prompt forces the model's first observable
 /// action to be a real `dispatch register --for-agent` tool call, which
@@ -953,26 +1038,50 @@ async fn supervise_agent(
 /// Build an agent command string for the user to paste.
 ///
 /// Includes the dispatch env vars (shell-escaped) and the adapter-assembled
-/// launch string. Used by the monitor dashboard's sidebar and by the
-/// serve-time "Unmanaged agents" banner — both are copy-paste paths where
-/// the agent runs its own `dispatch register` and receives a broker-assigned
-/// id. The managed-spawn flow (issue #43, `launch = true` + `prompt_file`)
-/// goes through `build_pending_agent` / `spawn_child_process`, which assembles
-/// the command via `build_launch` directly and injects `DISPATCH_WORKER_ID`
-/// via the env snapshot rather than the command string.
+/// launch string. When `worker_id` is `Some`, emits
+/// `DISPATCH_WORKER_ID=<id>` so the agent's first
+/// `dispatch register --for-agent` call idempotently claims a worker
+/// pre-registered via `pre_register_unmanaged` and retrieves its stored
+/// role prompt. When `None`, the legacy unmanaged path applies: the
+/// agent calls `dispatch register` without a supplied id and gets a
+/// broker-assigned one back.
+///
+/// Used by the monitor dashboard's sidebar and by the serve-time
+/// "Unmanaged agents" banner. The managed-spawn flow (`launch = true` +
+/// `prompt_file`) goes through `build_pending_agent` /
+/// `spawn_child_process`, which assembles the argv directly and injects
+/// `DISPATCH_WORKER_ID` via the env snapshot rather than this helper.
 pub fn build_agent_command(
     config: &ResolvedAgentConfig,
     cell_id: &str,
     monitor_url: Option<&str>,
+    worker_id: Option<&str>,
+    config_file_path: Option<&Path>,
 ) -> String {
-    let mut parts = vec![
-        format!("DISPATCH_CELL_ID={}", shell_escape(cell_id)),
-        format!("DISPATCH_AGENT_NAME={}", shell_escape(&config.name)),
-        format!("DISPATCH_AGENT_ROLE={}", shell_escape(&config.role)),
-    ];
+    let mut parts = vec![format!("DISPATCH_CELL_ID={}", shell_escape(cell_id))];
+
+    if let Some(path) = config_file_path {
+        parts.push(format!(
+            "DISPATCH_CONFIG_PATH={}",
+            shell_escape(&path.display().to_string())
+        ));
+    }
+
+    parts.push(format!(
+        "DISPATCH_AGENT_NAME={}",
+        shell_escape(&config.name)
+    ));
+    parts.push(format!(
+        "DISPATCH_AGENT_ROLE={}",
+        shell_escape(&config.role)
+    ));
 
     if let Some(url) = monitor_url {
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
+    }
+
+    if let Some(id) = worker_id {
+        parts.push(format!("DISPATCH_WORKER_ID={}", shell_escape(id)));
     }
 
     let cmd_str = AgentOrchestrator::build_launch(config)
@@ -1004,36 +1113,6 @@ fn launch_to_shell_string(launch: &Launch) -> String {
         ));
     }
     s
-}
-
-/// Build the main agent command string for the user to paste.
-pub fn build_main_agent_command(
-    main: &crate::config::MainAgentConfig,
-    cell_id: &str,
-    monitor_url: Option<&str>,
-) -> String {
-    let mut parts = vec![format!("DISPATCH_CELL_ID={}", shell_escape(cell_id))];
-
-    if let Some(url) = monitor_url {
-        parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
-    }
-
-    let mut cmd = main.command.clone();
-
-    if let Some(ref model) = main.model {
-        cmd.push_str(&format!(" --model {model}"));
-    }
-
-    if let Some(ref prompt_file) = main.prompt_file {
-        // Tell the agent to read the prompt file rather than inlining it.
-        let msg = format!("Read and follow the instructions in {prompt_file}");
-        cmd.push_str(&format!(" {}", shell_escape(&msg)));
-    } else if let Some(ref prompt) = main.prompt {
-        cmd.push_str(&format!(" {}", shell_escape(prompt)));
-    }
-
-    parts.push(cmd);
-    parts.join(" ")
 }
 
 /// Whether `s` is safe to use as a single filename component on disk and as
@@ -1083,6 +1162,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
         let ctx = orch.snapshot_spawn_context();
 
@@ -1111,6 +1191,54 @@ mod tests {
             without_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
             Some("test-runner")
         );
+    }
+
+    /// `DISPATCH_CONFIG_PATH` is injected when the orchestrator carries a
+    /// config file path, so child `dispatch` calls from any cwd in the
+    /// agent tree resolve the same config.
+    #[test]
+    fn env_vars_includes_config_path_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        let orch = AgentOrchestrator::new(
+            "cell-x",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            Some(config_path.clone()),
+        );
+        let ctx = orch.snapshot_spawn_context();
+
+        let vars = ctx.env_vars("alice", "test-runner", None);
+        assert_eq!(
+            vars.get("DISPATCH_CONFIG_PATH").map(String::as_str),
+            Some(config_path.display().to_string().as_str())
+        );
+    }
+
+    /// When the orchestrator has no config file path (e.g. serve launched
+    /// outside a project), no `DISPATCH_CONFIG_PATH` env var is emitted
+    /// — regression guard for configs that don't opt into the feature.
+    #[test]
+    fn env_vars_absent_when_config_path_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orch = AgentOrchestrator::new(
+            "cell-x",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
+        );
+        let ctx = orch.snapshot_spawn_context();
+
+        let vars = ctx.env_vars("alice", "test-runner", None);
+        assert!(!vars.contains_key("DISPATCH_CONFIG_PATH"));
     }
 
     /// Exponential doubling capped at 30s — table-driven so the intent is
@@ -1142,6 +1270,7 @@ mod tests {
             prompt_file_path: None,
             ttl: None,
             stream_json: false,
+            interactive: false,
             launch: true,
         }
     }
@@ -1163,6 +1292,7 @@ mod tests {
             prompt_file_path: Some(prompt_path),
             ttl: None,
             stream_json: false,
+            interactive: false,
             launch: true,
         }
     }
@@ -1186,6 +1316,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let cfg = managed_test_config("alice", "sleep 30", prompt_path);
         orch.spawn_agent(&cfg).await.expect("spawn");
@@ -1221,6 +1352,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let mut cfg = test_config("bob", "sleep 30");
         cfg.launch = false; // explicitly unmanaged
@@ -1252,6 +1384,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
         let cfg = managed_test_config("alice", "sleep 30", tmp.path().join("does-not-exist.md"));
         let err = orch.spawn_agent(&cfg).await.expect_err("must fail");
@@ -1290,6 +1423,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::clone(&broker),
+            None,
         );
 
         // Force `spawn_agent` to fail and verify the broker is left with no
@@ -1324,6 +1458,132 @@ mod tests {
         );
     }
 
+    /// Issue #45: `pre_register_unmanaged` mirrors the managed-agent
+    /// pre-register flow without spawning. The unmanaged serve-time banner
+    /// calls this so the printed copy-paste command can include a
+    /// `DISPATCH_WORKER_ID` that the agent's first
+    /// `dispatch register --for-agent` call can idempotently claim.
+    #[tokio::test]
+    async fn pre_register_unmanaged_stores_worker_and_role_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt_path = tmp.path().join("coord.md");
+        let prompt_body = "Run: dispatch listen --timeout 270\nCoordinator instructions.";
+        tokio::fs::write(&prompt_path, prompt_body).await.unwrap();
+
+        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
+        let orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::clone(&broker),
+            None,
+        );
+        let mut cfg = managed_test_config("coordinator", "true", prompt_path);
+        cfg.launch = false;
+
+        let ctx = orch.snapshot_spawn_context();
+        let (worker_id, boot_path) = pre_register_unmanaged(&ctx, &cfg)
+            .await
+            .expect("pre_register_unmanaged must succeed");
+
+        let b = broker.lock().await;
+        assert_eq!(b.workers.len(), 1);
+        let worker = b
+            .workers
+            .get(&worker_id)
+            .expect("worker must be stored under returned id");
+        assert_eq!(worker.name, "coordinator");
+        assert_eq!(worker.role, "test-runner");
+        assert_eq!(
+            b.role_prompts.get(&worker_id).map(String::as_str),
+            Some(prompt_body),
+        );
+        assert!(
+            boot_path.exists(),
+            "boot prompt file must be written: {}",
+            boot_path.display()
+        );
+    }
+
+    /// Issue #45: `pre_register_unmanaged` refuses a config without a
+    /// `prompt_file_path` — the caller should only reach this path for
+    /// unmanaged agents that actually need the boot-prompt bootstrap.
+    #[tokio::test]
+    async fn pre_register_unmanaged_rejects_config_without_prompt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
+        let orch = AgentOrchestrator::new(
+            "test-cell",
+            &tmp.path().join("broker.sock"),
+            None,
+            tmp.path(),
+            tmp.path().join("logs"),
+            Vec::new(),
+            Arc::clone(&broker),
+            None,
+        );
+        let mut cfg = test_config("bare", "true");
+        cfg.launch = false;
+
+        let ctx = orch.snapshot_spawn_context();
+        let err = pre_register_unmanaged(&ctx, &cfg)
+            .await
+            .expect_err("must fail without prompt_file_path");
+        assert!(
+            matches!(err, DispatchError::AgentLaunchFailed { .. }),
+            "expected AgentLaunchFailed, got: {err:?}",
+        );
+        assert!(
+            broker.lock().await.workers.is_empty(),
+            "failed pre-register must not leave a worker behind",
+        );
+    }
+
+    /// Issue #45: `build_agent_command` emits `DISPATCH_WORKER_ID=<id>`
+    /// only when the id is supplied — the legacy bare-register path
+    /// (no prompt_file → no pre-register) keeps its previous output.
+    #[test]
+    fn build_agent_command_includes_worker_id_when_some() {
+        let cfg = test_config("alice", "echo hi");
+        let with_id = build_agent_command(&cfg, "cell-x", None, Some("w-123"), None);
+        // shell_escape wraps the value in single quotes; assert on the
+        // escaped form we'll actually see in the printed banner.
+        assert!(
+            with_id.contains("DISPATCH_WORKER_ID='w-123'"),
+            "expected worker id in: {with_id}",
+        );
+
+        let without_id = build_agent_command(&cfg, "cell-x", None, None, None);
+        assert!(
+            !without_id.contains("DISPATCH_WORKER_ID"),
+            "legacy path must not emit worker id: {without_id}",
+        );
+    }
+
+    /// `build_agent_command` emits `DISPATCH_CONFIG_PATH=<shell-escaped>`
+    /// when a path is supplied, right alongside `DISPATCH_CELL_ID` so the
+    /// printed banner lets the pasted command resolve the same config from
+    /// any cwd. Unset → omitted, byte-identical to the previous banner.
+    #[test]
+    fn build_agent_command_includes_config_path_when_some() {
+        let cfg = test_config("alice", "echo hi");
+        let cfg_path = std::path::PathBuf::from("/tmp/ex/dispatch.config.toml");
+        let with_path = build_agent_command(&cfg, "cell-x", None, None, Some(cfg_path.as_path()));
+        assert!(
+            with_path.contains("DISPATCH_CONFIG_PATH='/tmp/ex/dispatch.config.toml'"),
+            "expected config path in: {with_path}"
+        );
+
+        let without = build_agent_command(&cfg, "cell-x", None, None, None);
+        assert!(
+            !without.contains("DISPATCH_CONFIG_PATH"),
+            "unset path must not appear: {without}"
+        );
+    }
+
     /// `start_by_name` must release the `starting` reservation when
     /// `build_pending_agent` fails — otherwise a bad prompt_file (or any
     /// other build error) permanently blocks the name from ever being
@@ -1342,6 +1602,7 @@ mod tests {
             tmp.path().join("logs"),
             vec![bad_cfg],
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
 
         // Build fails because the prompt file doesn't exist.
@@ -1375,6 +1636,7 @@ mod tests {
             tmp.path().join("logs"),
             vec![cfg.clone()],
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
 
         // First reservation succeeds.
@@ -1435,6 +1697,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
         let cfg = test_config("alice", "sleep 30");
         orch.spawn_agent(&cfg).await.expect("spawn");
@@ -1463,6 +1726,7 @@ mod tests {
             tmp.path().join("logs"),
             Vec::new(),
             Arc::new(Mutex::new(super::super::local::BrokerState::new())),
+            None,
         );
         let cfg = test_config("flaky", "exit 1");
         orch.spawn_agent(&cfg).await.expect("spawn");

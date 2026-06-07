@@ -60,6 +60,7 @@ mod tests {
             prompt_inline: None,
             command_string: command,
             stream_json: false,
+            interactive: false,
         }
     }
 

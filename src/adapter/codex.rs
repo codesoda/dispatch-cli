@@ -1,13 +1,18 @@
 //! Codex CLI adapter.
 //!
-//! Assembles `codex exec [extra_args...]` and feeds the prompt via stdin from
-//! `prompt_file`. Non-interactive (`exec`) mode only; interactive support is
-//! a follow-up.
+//! Headless mode (default): assembles `codex exec [extra_args...]` and feeds
+//! the prompt via stdin from `prompt_file`.
+//!
+//! Interactive mode (`interactive = true`): omits the `exec` subcommand so
+//! codex opens in its REPL. Extra args still follow.
 
 use super::{AdapterError, BuildContext, Launch};
 
 pub fn build(ctx: &BuildContext<'_>) -> Result<Launch, AdapterError> {
-    let mut args: Vec<String> = vec!["exec".to_string()];
+    let mut args: Vec<String> = Vec::new();
+    if !ctx.interactive {
+        args.push("exec".to_string());
+    }
     args.extend(ctx.extra_args.iter().cloned());
 
     Ok(Launch {
@@ -30,7 +35,17 @@ mod tests {
             prompt_inline: None,
             command_string: None,
             stream_json: false,
+            interactive: false,
         }
+    }
+
+    fn ctx_interactive<'a>(
+        extras: &'a [String],
+        prompt_file: Option<&'a Path>,
+    ) -> BuildContext<'a> {
+        let mut c = ctx(extras, prompt_file);
+        c.interactive = true;
+        c
     }
 
     #[test]
@@ -77,6 +92,21 @@ mod tests {
                 "-c",
                 "service_tier=\"fast\"",
             ]
+        );
+    }
+
+    /// `interactive = true` drops the `exec` subcommand so codex opens
+    /// in its REPL. User extras still pass through in the same order.
+    #[test]
+    fn interactive_omits_exec() {
+        let extras = vec!["-m".to_string(), "gpt-5.4".to_string()];
+        let launch = Adapter::Codex
+            .build(&ctx_interactive(&extras, None))
+            .unwrap();
+        assert_eq!(launch.args, vec!["-m", "gpt-5.4"]);
+        assert!(
+            !launch.args.iter().any(|a| a == "exec"),
+            "`exec` must be omitted in interactive mode",
         );
     }
 }

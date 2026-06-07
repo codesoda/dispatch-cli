@@ -15,7 +15,10 @@ Exit codes:
 Docs: https://github.com/codesoda/dispatch"
 )]
 pub struct Cli {
-    /// Path to dispatch.config.toml (default: ./dispatch.config.toml)
+    /// Path to dispatch.config.toml (default: ./dispatch.config.toml).
+    /// Falls back to the `DISPATCH_CONFIG_PATH` env var when unset — the
+    /// orchestrator injects that var into spawned agents so child
+    /// `dispatch` calls resolve the same config from any cwd.
     #[arg(long, global = true)]
     pub config: Option<std::path::PathBuf>,
 
@@ -41,10 +44,6 @@ pub enum Commands {
         /// Start an HTTP monitor dashboard on this port
         #[arg(long)]
         monitor: Option<u16>,
-
-        /// Auto-launch configured agents (default: print commands only)
-        #[arg(long)]
-        launch: bool,
     },
 
     /// Register a worker with the broker

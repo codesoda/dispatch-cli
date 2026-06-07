@@ -1,10 +1,13 @@
 //! Claude Code CLI adapter.
 //!
-//! Assembles `claude [extra_args...] -p` and feeds the prompt via stdin from
-//! `prompt_file`. Non-interactive (`-p`) mode only; interactive support is a
-//! follow-up.
+//! Headless mode (default): assembles `claude [extra_args...] -p` and feeds
+//! the prompt via stdin from `prompt_file`.
 //!
-//! Issue #43: when `stream_json` is set, appends
+//! Interactive mode (`interactive = true`): omits `-p` so claude opens in
+//! its REPL. `stream_json` is a no-op in this mode (the output-format /
+//! verbose flags require `-p`).
+//!
+//! Issue #43: when `stream_json` is set (headless only), appends
 //! `--output-format stream-json --verbose` so per-tool-use entries appear
 //! in the agent log. Required because claude's default `-p` output only
 //! shows the final assistant message — making a hallucinated `dispatch
@@ -14,13 +17,15 @@ use super::{AdapterError, BuildContext, Launch};
 
 pub fn build(ctx: &BuildContext<'_>) -> Result<Launch, AdapterError> {
     let mut args: Vec<String> = ctx.extra_args.to_vec();
-    if ctx.stream_json {
-        // Claude Code requires --verbose when combining -p with stream-json.
-        args.push("--output-format".to_string());
-        args.push("stream-json".to_string());
-        args.push("--verbose".to_string());
+    if !ctx.interactive {
+        if ctx.stream_json {
+            // Claude Code requires --verbose when combining -p with stream-json.
+            args.push("--output-format".to_string());
+            args.push("stream-json".to_string());
+            args.push("--verbose".to_string());
+        }
+        args.push("-p".to_string());
     }
-    args.push("-p".to_string());
 
     Ok(Launch {
         program: "claude".to_string(),
@@ -42,12 +47,22 @@ mod tests {
             prompt_inline: None,
             command_string: None,
             stream_json: false,
+            interactive: false,
         }
     }
 
     fn ctx_stream<'a>(extras: &'a [String], prompt_file: Option<&'a Path>) -> BuildContext<'a> {
         let mut c = ctx(extras, prompt_file);
         c.stream_json = true;
+        c
+    }
+
+    fn ctx_interactive<'a>(
+        extras: &'a [String],
+        prompt_file: Option<&'a Path>,
+    ) -> BuildContext<'a> {
+        let mut c = ctx(extras, prompt_file);
+        c.interactive = true;
         c
     }
 
@@ -117,5 +132,31 @@ mod tests {
                 "-p",
             ],
         );
+    }
+
+    /// `interactive = true` drops `-p` so claude opens its REPL; user
+    /// extras still come through unchanged.
+    #[test]
+    fn interactive_omits_dash_p() {
+        let extras = vec!["--model".to_string(), "sonnet".to_string()];
+        let launch = Adapter::Claude
+            .build(&ctx_interactive(&extras, None))
+            .unwrap();
+        assert_eq!(launch.args, vec!["--model", "sonnet"]);
+        assert!(
+            !launch.args.iter().any(|a| a == "-p"),
+            "-p must be omitted in interactive mode",
+        );
+    }
+
+    /// In interactive mode, stream_json is a no-op: the `--output-format`
+    /// / `--verbose` flags are rejected by claude without `-p`, so we
+    /// skip them to keep the REPL launchable.
+    #[test]
+    fn interactive_suppresses_stream_json_flags() {
+        let mut c = ctx_interactive(&[], None);
+        c.stream_json = true;
+        let launch = Adapter::Claude.build(&c).unwrap();
+        assert!(launch.args.is_empty(), "got {:?}", launch.args);
     }
 }

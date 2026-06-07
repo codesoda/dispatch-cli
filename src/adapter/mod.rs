@@ -51,6 +51,10 @@ pub struct BuildContext<'a> {
     /// `--output-format stream-json --verbose` so per-tool-use entries
     /// appear in the agent log. Other adapters ignore this flag.
     pub stream_json: bool,
+    /// When true, the adapter omits its headless flag (`-p` for claude,
+    /// `exec` for codex) so the program opens in REPL / interactive mode.
+    /// The `command` adapter ignores this (user owns the shell string).
+    pub interactive: bool,
 }
 
 /// The result of an adapter building a launch specification.

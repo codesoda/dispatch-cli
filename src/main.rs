@@ -82,13 +82,13 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
 
     // Extract monitor port: CLI flag takes precedence over config.
-    let (monitor_port, launch_agents) = if let Commands::Serve { monitor, launch } = &cli.command {
-        (monitor.or(config.monitor_port), *launch)
+    let monitor_port = if let Commands::Serve { monitor } = &cli.command {
+        monitor.or(config.monitor_port)
     } else {
-        (None, false)
+        None
     };
 
-    let backend = create_backend(&config, monitor_port, launch_agents)?;
+    let backend = create_backend(&config, monitor_port)?;
 
     match cli.command {
         Commands::Serve { .. } => {
