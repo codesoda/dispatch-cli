@@ -79,13 +79,21 @@ async fn dashboard() -> Html<&'static str> {
 async fn api_team(State(state): State<MonitorState>) -> axum::Json<Vec<crate::protocol::Worker>> {
     let mut broker = state.broker.lock().await;
     let expired = broker.evict_expired();
-    for (id, name) in &expired {
+    for (id, name, reason) in &expired {
+        let (kind, detail, payload) = match reason {
+            super::local::EvictReason::TtlExpired => ("expire", "worker expired", None),
+            super::local::EvictReason::StopDrained => (
+                "lifecycle",
+                "worker stopped (drain window elapsed)",
+                Some(serde_json::json!({ "control_state": "stopped" })),
+            ),
+        };
         let _ = state.events.send(super::local::BrokerEvent {
-            kind: "expire".to_string(),
+            kind: kind.to_string(),
             worker_id: id.clone(),
             worker_name: Some(name.clone()),
-            detail: "worker expired".to_string(),
-            payload: None,
+            detail: detail.to_string(),
+            payload,
             timestamp: super::local::now_secs(),
         });
     }

@@ -154,6 +154,11 @@ pub struct WorkerStatus {
     pub last_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_status_at: Option<u64>,
+    /// Coordinator-controlled lifecycle state (see [`ControlState`]). Additive
+    /// field — lets the stop hook and `listen` renderer read worker state via
+    /// a `Status` query without introducing a new wire variant.
+    #[serde(default)]
+    pub control_state: ControlState,
 }
 
 /// A response sent from the broker back to the client.
@@ -167,6 +172,21 @@ pub enum BrokerResponse {
     },
     /// Error response.
     Error { message: String },
+}
+
+/// Coordinator-controlled lifecycle state of a worker, tracked independently
+/// of its TTL/`expires_at`. "Supposed to be alive" == `Active`. `Stopping` is
+/// a tombstone: after `agent stop`, the record lingers for the broker's drain
+/// window so late stop-hook calls still resolve deterministically, then it is
+/// finalized (`Stopped`/removed). Defaults to `Active` so payloads from older
+/// brokers (no field) decode unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlState {
+    #[default]
+    Active,
+    Stopping,
+    Stopped,
 }
 
 /// A registered worker in the broker.
@@ -206,6 +226,16 @@ pub struct Worker {
     /// older brokers (no field present) decode as `false`.
     #[serde(default)]
     pub claimed: bool,
+    /// Coordinator-controlled lifecycle state, independent of TTL. See
+    /// [`ControlState`]. `#[serde(default)]` so responses from older brokers
+    /// (no field) decode as `Active`.
+    #[serde(default)]
+    pub control_state: ControlState,
+    /// Unix timestamp when the worker entered `Stopping`; used to measure the
+    /// drain window. `None` unless currently stopping. Skipped when absent so
+    /// the wire shape is unchanged for active workers and older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopping_since: Option<u64>,
 }
 
 /// The payload inside a successful response, varies by request type.
@@ -390,6 +420,8 @@ mod tests {
                     last_status_at: None,
                     status_history: VecDeque::new(),
                     claimed: false,
+                    control_state: ControlState::Active,
+                    stopping_since: None,
                 }],
             },
             ResponsePayload::HeartbeatAck {
@@ -449,6 +481,8 @@ mod tests {
             last_status_at: Some(110),
             status_history: history.clone(),
             claimed: true,
+            control_state: ControlState::Active,
+            stopping_since: None,
         };
         let json = serde_json::to_string(&worker).unwrap();
         assert!(json.contains("status_history"));
@@ -464,6 +498,39 @@ mod tests {
         assert!(!json.contains("status_history"));
         let back: Worker = serde_json::from_str(&json).unwrap();
         assert!(back.status_history.is_empty());
+    }
+
+    /// `control_state` defaults to `Active` when absent from the wire (older
+    /// brokers) and round-trips through JSON. `stopping_since` is omitted while
+    /// `None`, so the active-worker wire shape is unchanged.
+    #[test]
+    fn worker_control_state_defaults_and_round_trips() {
+        // A payload from an older broker (no control_state / stopping_since)
+        // decodes as Active with no stop clock — rolling-upgrade safe.
+        let legacy = r#"{"id":"w1","name":"n","role":"r","description":"d","capabilities":[],"ttl_secs":300,"expires_at":1000}"#;
+        let w: Worker = serde_json::from_str(legacy).unwrap();
+        assert_eq!(w.control_state, ControlState::Active);
+        assert!(w.stopping_since.is_none());
+
+        // An active worker serializes control_state but omits stopping_since.
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(json.contains("\"control_state\":\"active\""));
+        assert!(
+            !json.contains("stopping_since"),
+            "active worker must omit stopping_since: {json}"
+        );
+
+        // A stopping worker carries both and round-trips faithfully.
+        let stopping = Worker {
+            control_state: ControlState::Stopping,
+            stopping_since: Some(42),
+            ..w
+        };
+        let json = serde_json::to_string(&stopping).unwrap();
+        assert!(json.contains("\"control_state\":\"stopping\""));
+        let back: Worker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.control_state, ControlState::Stopping);
+        assert_eq!(back.stopping_since, Some(42));
     }
 
     /// Regression: `AckConfirm` is structurally a superset of `MessageAck`.

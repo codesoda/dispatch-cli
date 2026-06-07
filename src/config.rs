@@ -31,6 +31,9 @@ pub struct ResolvedConfig {
     pub monitor_open: bool,
     /// Default TTL in seconds for agents that don't specify one.
     pub default_ttl: Option<u64>,
+    /// Drain window (seconds) a `stopping` worker lingers before the broker
+    /// finalizes it. `None` → the broker's built-in default applies.
+    pub stopping_drain_secs: Option<u64>,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Scheduled heartbeat commands.
@@ -93,6 +96,9 @@ pub struct ConfigFile {
     /// into spawned agents as `DISPATCH_LISTEN_TIMEOUT`. Overridable per
     /// agent in `[[agents]]`. When unset, the CLI's built-in 270s applies.
     pub listen_timeout: Option<u64>,
+    /// Drain window (seconds) a `stopping` worker lingers before the broker
+    /// finalizes it. When unset, the broker's built-in default (10s) applies.
+    pub stopping_drain_secs: Option<u64>,
     /// Monitor dashboard configuration.
     pub monitor: Option<MonitorConfig>,
     /// Agent definitions to launch on serve.
@@ -330,6 +336,12 @@ const CONFIG_TEMPLATE: &str = "\
 # duration. Overridable per agent in [[agents]]. (default: 270)
 # listen_timeout = 270
 
+# How long (seconds) a worker stays `stopping` after `dispatch agent stop`
+# before the broker finalizes it. This drain window lets a dying agent's late
+# stop-hook call still see `stopping` (and exit cleanly) rather than racing the
+# record's removal. (default: 10)
+# stopping_drain_secs = 10
+
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
@@ -521,6 +533,7 @@ fn resolve_config_inner(
         backend,
         default_ttl,
         global_listen_timeout,
+        stopping_drain_secs,
         config_cwd,
         monitor_config,
         raw_agents,
@@ -531,12 +544,13 @@ fn resolve_config_inner(
             c.backend,
             c.default_ttl,
             c.listen_timeout,
+            c.stopping_drain_secs,
             c.cwd,
             c.monitor,
             c.agents,
             c.heartbeats,
         ),
-        None => (None, None, None, None, None, None, vec![], vec![]),
+        None => (None, None, None, None, None, None, None, vec![], vec![]),
     };
 
     // Resolve agent working directory: config cwd (relative to project_root) or project_root
@@ -565,6 +579,7 @@ fn resolve_config_inner(
         monitor_port,
         monitor_open,
         default_ttl,
+        stopping_drain_secs,
         agents,
         heartbeats,
     })

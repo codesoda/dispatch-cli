@@ -13,7 +13,7 @@ use tracing::instrument;
 
 use crate::errors::DispatchError;
 use crate::protocol::{
-    BrokerRequest, BrokerResponse, Message, ResponsePayload, StatusEntry, Worker,
+    BrokerRequest, BrokerResponse, ControlState, Message, ResponsePayload, StatusEntry, Worker,
     STATUS_HISTORY_MAX,
 };
 
@@ -48,6 +48,22 @@ pub const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 270;
 
 /// Default maximum number of events retained in history.
 const DEFAULT_EVENT_HISTORY_MAX: usize = 10_000;
+
+/// How long (seconds) a `stopping` worker lingers as a tombstone before the
+/// broker finalizes it. The drain window lets a dying agent's late stop-hook
+/// call still see `stopping` (and be allowed to exit) instead of racing the
+/// record's removal. Overridable via config `stopping_drain_secs`.
+pub const DEFAULT_STOPPING_DRAIN_SECS: u64 = 10;
+
+/// Why a worker was removed during an eviction sweep — drives which event the
+/// caller emits (`expire` vs a `lifecycle` "stopped").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictReason {
+    /// The worker's TTL (`expires_at`) elapsed.
+    TtlExpired,
+    /// The worker was `stopping` and its drain window elapsed.
+    StopDrained,
+}
 
 /// Event emitted by the broker for the monitor dashboard.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -174,6 +190,9 @@ pub struct BrokerState {
     pub message_history_max: usize,
     /// Default TTL for workers that don't specify one.
     pub default_ttl: u64,
+    /// Drain window (seconds) a `stopping` worker lingers before the broker
+    /// finalizes it. Set from config `stopping_drain_secs` in `serve`.
+    pub stopping_drain_secs: u64,
     /// Total number of messages sent through the broker.
     pub messages_sent: u64,
     /// Total number of messages delivered to listeners.
@@ -209,6 +228,7 @@ impl BrokerState {
             message_history: VecDeque::new(),
             message_history_max: DEFAULT_EVENT_HISTORY_MAX,
             default_ttl,
+            stopping_drain_secs: DEFAULT_STOPPING_DRAIN_SECS,
             messages_sent: 0,
             messages_delivered: 0,
             requests_handled: 0,
@@ -350,6 +370,10 @@ impl BrokerState {
             last_status_at: None,
             status_history: VecDeque::new(),
             claimed,
+            // Freshly registered workers are alive. The coordinator moves them
+            // to `stopping` via `set_control_state` (US-004 `agent stop`).
+            control_state: ControlState::Active,
+            stopping_since: None,
         };
         self.workers.insert(id.clone(), worker);
         if let Some(prompt) = role_prompt {
@@ -370,21 +394,57 @@ impl BrokerState {
         self.role_prompts.remove(id);
     }
 
-    /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
-    /// Returns `(id, name)` pairs for the evicted workers so callers can populate
-    /// expire events with the worker's name (which is otherwise lost on removal).
-    pub fn evict_expired(&mut self) -> Vec<(String, String)> {
+    /// Remove workers that should no longer exist, including their mailboxes,
+    /// notifiers, and role prompts. Two reasons, checked in this request-driven
+    /// sweep (there is no background tick): a worker's TTL elapsed
+    /// (`TtlExpired`), or a `stopping` worker's drain window elapsed
+    /// (`StopDrained`). Returns `(id, name, reason)` so callers can emit the
+    /// right event (`expire` vs `lifecycle`) with the worker's name, which is
+    /// otherwise lost on removal. With zero traffic a drained worker lingers
+    /// until the next request triggers a sweep — acceptable, same as TTL.
+    pub fn evict_expired(&mut self) -> Vec<(String, String, EvictReason)> {
         let now = now_secs();
-        let expired: Vec<(String, String)> = self
+        let drain = self.stopping_drain_secs;
+        let removable: Vec<(String, String, EvictReason)> = self
             .workers
             .iter()
-            .filter(|(_, w)| w.expires_at <= now)
-            .map(|(id, w)| (id.clone(), w.name.clone()))
+            .filter_map(|(id, w)| {
+                if w.expires_at <= now {
+                    Some((id.clone(), w.name.clone(), EvictReason::TtlExpired))
+                } else if w.control_state == ControlState::Stopping
+                    && w.stopping_since.is_some_and(|since| since + drain <= now)
+                {
+                    Some((id.clone(), w.name.clone(), EvictReason::StopDrained))
+                } else {
+                    None
+                }
+            })
             .collect();
-        for (id, _) in &expired {
+        for (id, _, _) in &removable {
             self.remove_worker(id);
         }
-        expired
+        removable
+    }
+
+    /// Set a worker's coordinator-controlled lifecycle state. Stamps
+    /// `stopping_since` on the first transition into `Stopping` so the drain
+    /// window can be measured; clears it when leaving `Stopping`. Returns
+    /// `false` if no such worker exists. Does **not** touch TTL — control
+    /// state and liveness are orthogonal.
+    pub fn set_control_state(&mut self, worker_id: &str, state: ControlState) -> bool {
+        if let Some(w) = self.workers.get_mut(worker_id) {
+            match state {
+                ControlState::Stopping if w.control_state != ControlState::Stopping => {
+                    w.stopping_since = Some(now_secs());
+                }
+                ControlState::Stopping => {}
+                _ => w.stopping_since = None,
+            }
+            w.control_state = state;
+            true
+        } else {
+            false
+        }
     }
 
     /// Return a list of all active (non-expired) workers.
@@ -454,6 +514,7 @@ impl BrokerState {
                         role: w.role.clone(),
                         last_status: w.last_status.clone(),
                         last_status_at: w.last_status_at,
+                        control_state: w.control_state,
                     }]
                 })
                 .unwrap_or_default(),
@@ -466,6 +527,7 @@ impl BrokerState {
                     role: w.role.clone(),
                     last_status: w.last_status.clone(),
                     last_status_at: w.last_status_at,
+                    control_state: w.control_state,
                 })
                 .collect(),
         }
@@ -809,11 +871,15 @@ pub async fn serve(
         cell_id
     );
 
-    let state = Arc::new(Mutex::new(if let Some(ttl) = config.default_ttl {
+    let mut broker_state = if let Some(ttl) = config.default_ttl {
         BrokerState::with_default_ttl(ttl)
     } else {
         BrokerState::new()
-    }));
+    };
+    if let Some(drain) = config.stopping_drain_secs {
+        broker_state.stopping_drain_secs = drain;
+    }
+    let state = Arc::new(Mutex::new(broker_state));
     let (event_tx, _) = broadcast::channel::<BrokerEvent>(256);
 
     // Shutdown signal shared with the monitor dashboard.
@@ -1162,8 +1228,25 @@ async fn handle_request(
             let (notifier, immediate_msg, listener_name) = {
                 let mut s = state.lock().await;
                 let expired = s.evict_expired();
-                for (id, name) in &expired {
-                    s.emit_and_record(event_tx, "expire", id, Some(name), "worker expired", None);
+                for (id, name, reason) in &expired {
+                    match reason {
+                        EvictReason::TtlExpired => s.emit_and_record(
+                            event_tx,
+                            "expire",
+                            id,
+                            Some(name),
+                            "worker expired",
+                            None,
+                        ),
+                        EvictReason::StopDrained => s.emit_and_record(
+                            event_tx,
+                            "lifecycle",
+                            id,
+                            Some(name),
+                            "worker stopped (drain window elapsed)",
+                            Some(serde_json::json!({ "control_state": "stopped" })),
+                        ),
+                    }
                 }
                 if !s.workers.contains_key(&worker_id) {
                     return BrokerResponse::Error {
@@ -1564,6 +1647,7 @@ mod tests {
             monitor_port: None,
             monitor_open: false,
             default_ttl: None,
+            stopping_drain_secs: None,
             agents: vec![],
             heartbeats: vec![],
         }
@@ -2271,6 +2355,154 @@ mod tests {
         state.workers.get_mut(&id).unwrap().expires_at = 0;
         state.evict_expired();
         assert!(state.workers.is_empty(), "expired worker should be evicted");
+    }
+
+    /// Helper: register a plain active worker and return its id.
+    fn register_active(state: &mut BrokerState, name: &str) -> String {
+        state
+            .register_worker(
+                name.into(),
+                "role".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("register")
+    }
+
+    /// Freshly registered workers are `Active` with no `stopping_since`.
+    #[test]
+    fn register_defaults_to_active_control_state() {
+        let mut state = BrokerState::new();
+        let id = register_active(&mut state, "alice");
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.control_state, ControlState::Active);
+        assert!(w.stopping_since.is_none());
+    }
+
+    /// `set_control_state` stamps `stopping_since` entering `Stopping` and
+    /// clears it on the way back out; unknown ids return false.
+    #[test]
+    fn set_control_state_manages_stopping_since() {
+        let mut state = BrokerState::new();
+        let id = register_active(&mut state, "alice");
+
+        assert!(state.set_control_state(&id, ControlState::Stopping));
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.control_state, ControlState::Stopping);
+        assert!(
+            w.stopping_since.is_some(),
+            "entering Stopping stamps the clock"
+        );
+
+        // Re-asserting Stopping must not reset the original stamp.
+        let stamp = state.workers.get(&id).unwrap().stopping_since;
+        assert!(state.set_control_state(&id, ControlState::Stopping));
+        assert_eq!(state.workers.get(&id).unwrap().stopping_since, stamp);
+
+        // Leaving Stopping clears the stamp.
+        assert!(state.set_control_state(&id, ControlState::Active));
+        let w = state.workers.get(&id).unwrap();
+        assert_eq!(w.control_state, ControlState::Active);
+        assert!(w.stopping_since.is_none());
+
+        assert!(!state.set_control_state("nonexistent", ControlState::Stopping));
+    }
+
+    /// Control state is orthogonal to TTL: a `stopping` worker is finalized
+    /// only once its drain window elapses, with reason `StopDrained`. A
+    /// freshly-stopping worker (still inside the window) is retained.
+    #[test]
+    fn evict_finalizes_drained_stopping_worker() {
+        let mut state = BrokerState::new();
+        state.stopping_drain_secs = 10;
+        let id = register_active(&mut state, "alice");
+        state.set_control_state(&id, ControlState::Stopping);
+
+        // Still inside the drain window → retained, no removal reported.
+        let removed = state.evict_expired();
+        assert!(
+            removed.is_empty(),
+            "worker within drain window must survive"
+        );
+        assert!(state.workers.contains_key(&id));
+
+        // Push the stop time past the window → finalized as StopDrained.
+        state.workers.get_mut(&id).unwrap().stopping_since = Some(now_secs() - 11);
+        let removed = state.evict_expired();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, id);
+        assert_eq!(removed[0].2, EvictReason::StopDrained);
+        assert!(
+            state.workers.is_empty(),
+            "drained stopping worker must be removed"
+        );
+    }
+
+    /// TTL expiry of an active worker reports `TtlExpired`, distinct from the
+    /// drain path — so callers emit `expire` vs `lifecycle` correctly.
+    #[test]
+    fn evict_reports_ttl_expiry_reason() {
+        let mut state = BrokerState::new();
+        let id = register_active(&mut state, "alice");
+        state.workers.get_mut(&id).unwrap().expires_at = 0;
+        let removed = state.evict_expired();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].2, EvictReason::TtlExpired);
+    }
+
+    /// A claim (idempotent re-register) of a `stopping` worker must NOT revive
+    /// it to `active` — only the coordinator owns that transition.
+    #[test]
+    fn claim_does_not_revive_stopping_worker() {
+        let mut state = BrokerState::new();
+        let id = state
+            .register_worker(
+                "alice".into(),
+                "runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("pre-register");
+        state.set_control_state(&id, ControlState::Stopping);
+
+        // The agent process re-registers (claims) its id.
+        state
+            .register_worker(
+                "alice".into(),
+                "runner".into(),
+                "desc".into(),
+                vec![],
+                None,
+                false,
+                Some("w-fixed".into()),
+                None,
+            )
+            .expect("claim");
+        assert_eq!(
+            state.workers.get(&id).unwrap().control_state,
+            ControlState::Stopping,
+            "claim must not silently revive a stopping worker",
+        );
+    }
+
+    /// `get_status` surfaces the worker's control state so the stop hook /
+    /// listen renderer can read it via a `Status` query.
+    #[test]
+    fn get_status_exposes_control_state() {
+        let mut state = BrokerState::new();
+        let id = register_active(&mut state, "alice");
+        state.set_control_state(&id, ControlState::Stopping);
+        let statuses = state.get_status(Some(&id));
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].control_state, ControlState::Stopping);
     }
 
     #[tokio::test]
