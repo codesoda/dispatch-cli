@@ -251,7 +251,7 @@ A worker's listen loop can parse the body and take action based on the message t
 WORKER_ID="$1"
 
 while true; do
-  RESPONSE=$(dispatch listen --worker-id "$WORKER_ID" --timeout 60)
+  RESPONSE=$(dispatch listen --worker-id "$WORKER_ID" --timeout 270)
   STATUS=$(echo "$RESPONSE" | jq -r '.status')
 
   if [ "$STATUS" = "ok" ]; then

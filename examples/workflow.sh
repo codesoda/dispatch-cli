@@ -141,7 +141,7 @@ dispatch team | jq -r '.workers[] | "  \(.role)\t\(.name)\t\(.id[0:8])..."' >&2
 run_planner() {
   log_planner "waiting for task..."
   local response
-  response=$(dispatch listen --worker-id "$PLANNER_ID" --timeout 30)
+  response=$(dispatch listen --worker-id "$PLANNER_ID" --timeout 270)
   local status
   status=$(echo "$response" | jq -r '.status')
 
@@ -179,7 +179,7 @@ run_planner() {
 run_implementer() {
   log_implementer "waiting for plan..."
   local response
-  response=$(dispatch listen --worker-id "$IMPLEMENTER_ID" --timeout 30)
+  response=$(dispatch listen --worker-id "$IMPLEMENTER_ID" --timeout 270)
   local status
   status=$(echo "$response" | jq -r '.status')
 
@@ -218,7 +218,7 @@ run_implementer() {
 run_reviewer() {
   log_reviewer "waiting for code to review..."
   local response
-  response=$(dispatch listen --worker-id "$REVIEWER_ID" --timeout 30)
+  response=$(dispatch listen --worker-id "$REVIEWER_ID" --timeout 270)
   local status
   status=$(echo "$response" | jq -r '.status')
 
@@ -259,7 +259,7 @@ run_reviewer() {
 run_test_runner() {
   log_test "waiting for reviewed code..."
   local response
-  response=$(dispatch listen --worker-id "$RUNNER_ID" --timeout 30)
+  response=$(dispatch listen --worker-id "$RUNNER_ID" --timeout 270)
   local status
   status=$(echo "$response" | jq -r '.status')
 
@@ -299,7 +299,7 @@ run_test_runner() {
 run_shipper() {
   log_shipper "waiting for tested code..."
   local response
-  response=$(dispatch listen --worker-id "$SHIPPER_ID" --timeout 30)
+  response=$(dispatch listen --worker-id "$SHIPPER_ID" --timeout 270)
   local status
   status=$(echo "$response" | jq -r '.status')
 

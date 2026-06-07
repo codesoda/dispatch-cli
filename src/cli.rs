@@ -119,8 +119,8 @@ pub enum Commands {
         #[arg(long)]
         worker_id: String,
 
-        /// Timeout in seconds (default: 30)
-        #[arg(long, default_value = "30")]
+        /// Timeout in seconds (default: 270)
+        #[arg(long, default_value = "270")]
         timeout: u64,
     },
 
