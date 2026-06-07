@@ -1704,6 +1704,7 @@ mod tests {
             monitor_open: false,
             default_ttl: None,
             stopping_drain_secs: None,
+            continue_instruction: None,
             agents: vec![],
             heartbeats: vec![],
         }

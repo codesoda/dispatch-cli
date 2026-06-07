@@ -516,6 +516,7 @@ mod tests {
             prompt_file_path: None,
             ttl: None,
             listen_timeout: None,
+            continue_instruction: None,
             stream_json: false,
             interactive: false,
             launch: false,

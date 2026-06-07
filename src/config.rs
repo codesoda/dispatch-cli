@@ -7,6 +7,13 @@ use serde::Deserialize;
 
 use crate::errors::DispatchError;
 
+/// Shipped fallback for the "listen again" instruction (US-009). Used when
+/// neither a per-agent `[[agents]]` `continue_instruction` nor a global one is
+/// set. Tells the agent to keep long-polling and not to stop on its own — the
+/// coordinator owns the stop decision via the worker's control state.
+pub const DEFAULT_CONTINUE_INSTRUCTION: &str =
+    "No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.";
+
 /// Runtime configuration for Dispatch, resolved from multiple sources.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -34,6 +41,12 @@ pub struct ResolvedConfig {
     /// Drain window (seconds) a `stopping` worker lingers before the broker
     /// finalizes it. `None` → the broker's built-in default applies.
     pub stopping_drain_secs: Option<u64>,
+    /// Global "listen again" instruction (US-009). The fallback when an agent
+    /// has no per-agent override; `None` → the shipped
+    /// [`DEFAULT_CONTINUE_INSTRUCTION`]. Resolve via
+    /// [`ResolvedConfig::continue_instruction_for`], never read directly, so
+    /// the per-agent > global > default precedence stays in one place.
+    pub continue_instruction: Option<String>,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Scheduled heartbeat commands.
@@ -63,6 +76,10 @@ pub struct ResolvedAgentConfig {
     /// `listen_timeout`; `None` means "unset" and the CLI's built-in 270s
     /// default applies.
     pub listen_timeout: Option<u64>,
+    /// Per-agent override of the "listen again" instruction (US-009). `None`
+    /// falls back to the global `continue_instruction`, then the shipped
+    /// default. Read via [`ResolvedConfig::continue_instruction_for`].
+    pub continue_instruction: Option<String>,
     /// Issue #43: when true, the claude adapter is launched with
     /// `--output-format stream-json --verbose` so per-tool-use entries
     /// appear in the agent log.
@@ -99,6 +116,10 @@ pub struct ConfigFile {
     /// Drain window (seconds) a `stopping` worker lingers before the broker
     /// finalizes it. When unset, the broker's built-in default (10s) applies.
     pub stopping_drain_secs: Option<u64>,
+    /// Global "listen again" instruction returned by the stop hook and the
+    /// `listen --for-agent` timeout renderer (US-009). Overridable per agent
+    /// in `[[agents]]`. When unset, the shipped default applies.
+    pub continue_instruction: Option<String>,
     /// Monitor dashboard configuration.
     pub monitor: Option<MonitorConfig>,
     /// Agent definitions to launch on serve.
@@ -155,6 +176,8 @@ pub struct AgentConfig {
     /// as `DISPATCH_LISTEN_TIMEOUT` so this agent's bare `dispatch listen`
     /// long-polls for the configured duration.
     pub listen_timeout: Option<u64>,
+    /// Per-agent override of the global `continue_instruction` (US-009).
+    pub continue_instruction: Option<String>,
     /// Whether `dispatch serve` should auto-start this agent under the
     /// supervisor. `false` (the default) prints a copy-paste command at
     /// startup instead so you can run the agent yourself.
@@ -276,6 +299,9 @@ fn resolve_agent_config(
         // Per-agent override wins over the global default; `None` here means
         // both are unset and the CLI's built-in 270s default applies.
         listen_timeout: agent.listen_timeout.or(global_listen_timeout),
+        // Kept raw (per-agent only): `continue_instruction_for` layers global
+        // and the shipped default on top, so don't fold them in here.
+        continue_instruction: agent.continue_instruction.clone(),
         stream_json: agent.stream_json,
         launch: agent.launch,
         interactive,
@@ -341,6 +367,12 @@ const CONFIG_TEMPLATE: &str = "\
 # stop-hook call still see `stopping` (and exit cleanly) rather than racing the
 # record's removal. (default: 10)
 # stopping_drain_secs = 10
+
+# What to tell an agent when it has no task right now — returned by the stop
+# hook (to keep the agent listening) and by `dispatch listen --for-agent` on a
+# timeout while the worker is still `active`. Overridable per agent in
+# [[agents]]. When unset, a built-in default is used.
+# continue_instruction = \"No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.\"
 
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
@@ -535,6 +567,7 @@ fn resolve_config_inner(
         default_ttl,
         global_listen_timeout,
         stopping_drain_secs,
+        continue_instruction,
         config_cwd,
         monitor_config,
         raw_agents,
@@ -546,12 +579,24 @@ fn resolve_config_inner(
             c.default_ttl,
             c.listen_timeout,
             c.stopping_drain_secs,
+            c.continue_instruction,
             c.cwd,
             c.monitor,
             c.agents,
             c.heartbeats,
         ),
-        None => (None, None, None, None, None, None, None, vec![], vec![]),
+        None => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+        ),
     };
 
     // Resolve agent working directory: config cwd (relative to project_root) or project_root
@@ -581,9 +626,38 @@ fn resolve_config_inner(
         monitor_open,
         default_ttl,
         stopping_drain_secs,
+        continue_instruction,
         agents,
         heartbeats,
     })
+}
+
+impl ResolvedConfig {
+    /// Resolve the "listen again" instruction for `agent_name` with precedence
+    /// per-agent `[[agents]]` override **>** global `continue_instruction` **>**
+    /// shipped [`DEFAULT_CONTINUE_INSTRUCTION`] (US-009).
+    ///
+    /// `agent_name` is the agent's `DISPATCH_AGENT_NAME` when known; `None`
+    /// (ad-hoc session, or a name not in this config) skips straight to the
+    /// global/default fallback. The single resolver feeds both the stop hook
+    /// (US-005) and the `listen --for-agent` timeout renderer (US-006) so the
+    /// two can't drift.
+    pub fn continue_instruction_for(&self, agent_name: Option<&str>) -> String {
+        if let Some(name) = agent_name {
+            if let Some(text) = self
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.continue_instruction.as_deref())
+            {
+                return text.to_string();
+            }
+        }
+        self.continue_instruction
+            .as_deref()
+            .unwrap_or(DEFAULT_CONTINUE_INSTRUCTION)
+            .to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1276,6 +1350,109 @@ model = "opus"
             stored.is_absolute(),
             "discovered path must be absolute, got: {}",
             stored.display()
+        );
+    }
+
+    /// US-009: with no `continue_instruction` anywhere, the resolver returns
+    /// the shipped built-in default — for a configured agent and for an
+    /// unknown / ad-hoc (`None`) name alike.
+    #[test]
+    fn continue_instruction_falls_back_to_shipped_default() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "worker"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert_eq!(
+            resolved.continue_instruction_for(Some("worker")),
+            DEFAULT_CONTINUE_INSTRUCTION
+        );
+        assert_eq!(
+            resolved.continue_instruction_for(None),
+            DEFAULT_CONTINUE_INSTRUCTION
+        );
+    }
+
+    /// US-009: a global `continue_instruction` overrides the shipped default
+    /// for every agent that doesn't set its own (and for `None`).
+    #[test]
+    fn continue_instruction_uses_global_override() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+continue_instruction = "global: keep listening"
+
+[[agents]]
+name = "worker"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert_eq!(
+            resolved.continue_instruction_for(Some("worker")),
+            "global: keep listening"
+        );
+        assert_eq!(
+            resolved.continue_instruction_for(None),
+            "global: keep listening"
+        );
+    }
+
+    /// US-009: a per-agent `continue_instruction` wins over the global one for
+    /// that agent; a sibling without its own override still gets the global.
+    #[test]
+    fn continue_instruction_per_agent_overrides_global() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+continue_instruction = "global text"
+
+[[agents]]
+name = "special"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+continue_instruction = "special text"
+
+[[agents]]
+name = "plain"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        assert_eq!(
+            resolved.continue_instruction_for(Some("special")),
+            "special text"
+        );
+        assert_eq!(
+            resolved.continue_instruction_for(Some("plain")),
+            "global text"
         );
     }
 }
