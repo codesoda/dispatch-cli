@@ -1179,3 +1179,84 @@ launch = true
         "env dump missing {needle:?}; got:\n{contents}"
     );
 }
+
+// ── Coordinator-driven lifecycle (US-004) ─────────────────────────────
+
+/// `dispatch agent stop <name>` marks the worker `stopping` (stamping the
+/// drain clock) BEFORE killing the process, so the record lingers in the
+/// drain window — a late stop-hook call from the dying agent then sees
+/// `stopping` and is allowed to exit instead of racing the record away.
+///
+/// A managed `launch = true` + `prompt_file` agent is pre-registered
+/// server-side, so a worker exists to transition. `sleep 60` keeps the
+/// process alive long enough for `agent stop` to find a live supervisor
+/// handle to signal.
+#[test]
+fn agent_stop_marks_worker_stopping() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-agent-stop-stopping";
+
+    let prompt = dir.path().join("sleeper.prompt.md");
+    std::fs::write(&prompt, "you are a sleeper\n").unwrap();
+    let config = format!(
+        r#"
+[[agents]]
+name = "sleeper"
+role = "worker"
+description = "sleeps"
+adapter = "command"
+command = "sleep 60"
+prompt_file = {:?}
+launch = true
+"#,
+        prompt.display()
+    );
+    std::fs::write(dir.path().join("dispatch.config.toml"), config).unwrap();
+
+    let _broker = start_broker(&dir, cell_id);
+
+    // Wait for the pre-registered worker to surface as `active`. The broker
+    // serves client requests only after `launch_all` completes, so once
+    // `status` reports the worker its supervisor handle is registered too.
+    let mut saw_active = false;
+    for _ in 0..100 {
+        let out = dispatch_cmd(&dir, cell_id).arg("status").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains("\"name\":\"sleeper\"")
+            && stdout.contains("\"control_state\":\"active\"")
+        {
+            saw_active = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_active,
+        "pre-registered sleeper never surfaced as active"
+    );
+
+    // Stop it: marks `stopping`, then signals the supervisor to kill.
+    dispatch_cmd(&dir, cell_id)
+        .args(["agent", "stop", "sleeper"])
+        .assert()
+        .success();
+
+    // Within the drain window the worker lingers as `stopping`.
+    let out = dispatch_cmd(&dir, cell_id).arg("status").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"control_state\":\"stopping\""),
+        "worker should be `stopping` after agent stop; got: {stdout}"
+    );
+
+    // The transition is observable as a `lifecycle` event.
+    let out = dispatch_cmd(&dir, cell_id)
+        .args(["events", "--type", "lifecycle"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("active -> stopping"),
+        "expected a lifecycle event for the stop transition; got: {stdout}"
+    );
+}

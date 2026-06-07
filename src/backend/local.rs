@@ -447,6 +447,24 @@ impl BrokerState {
         }
     }
 
+    /// Set the control state of every worker registered under `name` (normally
+    /// one; eviction keeps same-name duplicates from accumulating). Returns the
+    /// affected worker ids so the caller can emit lifecycle events. Used by the
+    /// coordinator's `agent stop`/`restart` to mark a worker `stopping` before
+    /// its process is killed (US-004).
+    pub fn set_control_state_by_name(&mut self, name: &str, state: ControlState) -> Vec<String> {
+        let ids: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| w.name == name)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            self.set_control_state(id, state);
+        }
+        ids
+    }
+
     /// Return a list of all active (non-expired) workers.
     pub fn list_workers(&mut self) -> Vec<Worker> {
         self.evict_expired();
@@ -1517,6 +1535,10 @@ async fn handle_request(
         }
         BrokerRequest::AgentStop { name } => {
             let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            // Mark the worker `stopping` BEFORE the kill so a late stop-hook
+            // call from the dying agent sees `stopping` (and is allowed to
+            // exit) instead of racing the record away (US-004/US-005).
+            mark_worker_stopping(&state, event_tx, &resolved).await;
             // Release the orchestrator mutex before awaiting the supervisor's
             // shutdown so concurrent list_state / monitor polls don't stall
             // for 500ms+ per stop.
@@ -1538,11 +1560,10 @@ async fn handle_request(
         }
         BrokerRequest::AgentRestart { name } => {
             let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
-            // Split phases mirror api_agent_restart: lock → signal stop →
-            // unlock → await → lock → start. Avoids pinning the orchestrator
-            // mutex across the kill window.
-            let handle = {
-                let mut orch = orchestrator.lock().await;
+            // Validate the config up front so a bad name doesn't mark a worker
+            // stopping for an agent we can't restart.
+            {
+                let orch = orchestrator.lock().await;
                 if !orch.has_config(&resolved) {
                     return BrokerResponse::Error {
                         message: format!(
@@ -1550,6 +1571,16 @@ async fn handle_request(
                         ),
                     };
                 }
+            }
+            // Stopping semantics for the OLD worker before the respawn (US-004):
+            // mark it stopping, then kill. The fresh spawn re-registers an
+            // active worker (its evict pass wipes the old id).
+            mark_worker_stopping(&state, event_tx, &resolved).await;
+            // Split phases mirror api_agent_restart: lock → signal stop →
+            // unlock → await → lock → start. Avoids pinning the orchestrator
+            // mutex across the kill window.
+            let handle = {
+                let mut orch = orchestrator.lock().await;
                 orch.signal_stop_by_name(&resolved)
             };
             if let Some(h) = handle {
@@ -1583,6 +1614,31 @@ async fn handle_request(
                 payload: ResponsePayload::Ack {},
             }
         }
+    }
+}
+
+/// Mark every worker registered under `name` as `stopping` (stamping the drain
+/// clock) and emit a lifecycle event per worker. Called before the process is
+/// killed so a late stop-hook call from the dying agent sees `stopping` and is
+/// allowed to exit, and so the record drains rather than vanishing instantly
+/// (US-004). A no-op when no worker by that name is registered (e.g. an
+/// unmanaged agent that never attached).
+async fn mark_worker_stopping(
+    state: &Arc<Mutex<BrokerState>>,
+    event_tx: &broadcast::Sender<BrokerEvent>,
+    name: &str,
+) {
+    let mut s = state.lock().await;
+    let ids = s.set_control_state_by_name(name, ControlState::Stopping);
+    for id in &ids {
+        s.emit_and_record(
+            event_tx,
+            "lifecycle",
+            id,
+            Some(name),
+            "active -> stopping",
+            Some(serde_json::json!({ "control_state": "stopping" })),
+        );
     }
 }
 
@@ -2503,6 +2559,34 @@ mod tests {
         let statuses = state.get_status(Some(&id));
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].control_state, ControlState::Stopping);
+    }
+
+    /// `set_control_state_by_name` marks every worker registered under a name
+    /// (and only those) `stopping`, returning the affected ids — the broker-side
+    /// primitive the coordinator's `agent stop`/`restart` calls before the kill
+    /// (US-004).
+    #[test]
+    fn set_control_state_by_name_marks_matching_workers() {
+        let mut state = BrokerState::new();
+        let alice = register_active(&mut state, "alice");
+        let bob = register_active(&mut state, "bob");
+
+        let affected = state.set_control_state_by_name("alice", ControlState::Stopping);
+        assert_eq!(affected, vec![alice.clone()]);
+        let w = state.workers.get(&alice).unwrap();
+        assert_eq!(w.control_state, ControlState::Stopping);
+        assert!(w.stopping_since.is_some(), "marks the drain clock");
+
+        // A worker under a different name is left untouched.
+        assert_eq!(
+            state.workers.get(&bob).unwrap().control_state,
+            ControlState::Active,
+        );
+
+        // No worker by that name → empty result, no panic.
+        assert!(state
+            .set_control_state_by_name("nobody", ControlState::Stopping)
+            .is_empty());
     }
 
     #[tokio::test]
