@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-09
+
 ### Added
 - **JIT prompt control plane.** An agent boots with one line (`dispatch register --for-agent`), receives its operating prompt from dispatch, then runs a `listen → work → result → listen` loop held open by a worker-aware stop hook. Dispatch owns messaging, primitives, and the hook *decision*; the consumer owns looping policy, hook wiring, and prompt authoring.
 - Env-driven identity: `dispatch listen`/`ack`/`result`/`heartbeat`/`messages` resolve the worker id from `DISPATCH_WORKER_ID` when `--worker-id` is omitted, and `send`/`team` resolve `--from` the same way. Agents loop with bare commands; no id threading required. Missing identity yields a typed `MissingWorkerIdentity` error. (`dispatch status` intentionally keeps its "no identity = all workers" coordinator view and is *not* folded into env identity.)
@@ -154,7 +156,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Binary integration tests for all CLI commands
 - GitHub Actions CI workflow (fmt, clippy, build, test)
 
-[Unreleased]: https://github.com/codesoda/dispatch-cli/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/codesoda/dispatch-cli/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/codesoda/dispatch-cli/compare/v0.5.1...v0.6.0
 [0.3.1]: https://github.com/codesoda/dispatch-cli/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/codesoda/dispatch-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/codesoda/dispatch-cli/compare/v0.1.1...v0.2.0
