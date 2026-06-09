@@ -74,7 +74,7 @@ pub enum Commands {
         #[arg(long)]
         evict: bool,
 
-        /// Pre-assigned worker id (issue #43). When set, the broker uses
+        /// Pre-assigned worker id. When set, the broker uses
         /// this id rather than generating one. If a worker with this id
         /// already exists with the same name+role, the call is treated as
         /// an idempotent claim — used by spawned agents to attach to a
@@ -82,7 +82,7 @@ pub enum Commands {
         #[arg(long = "worker-id")]
         worker_id: Option<String>,
 
-        /// Role prompt body to associate with this worker (issue #43).
+        /// Role prompt body to associate with this worker.
         /// Only the orchestrator passes this — at pre-register time it
         /// loads the agent's `prompt_file` and ships the content here so
         /// the spawned agent can fetch it back via `--for-agent`.
@@ -91,7 +91,7 @@ pub enum Commands {
 
         /// Route the role prompt body to stdout (for downstream LLM tool
         /// result consumption); the JSON envelope is redirected to stderr
-        /// with `role_prompt` stripped (issue #43). Intentional CLI wart
+        /// with `role_prompt` stripped. Intentional CLI wart
         /// whose only purpose is to be friendly to a downstream LLM tool
         /// result: the spawned agent's first tool call is `dispatch
         /// register --for-agent`, and the prompt body landing on stdout
@@ -129,7 +129,7 @@ pub enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Render results for direct LLM tool-result consumption (US-006): a
+        /// Render results for direct LLM tool-result consumption: a
         /// delivered message body is written verbatim to stdout (no JSON
         /// envelope); on timeout, if the worker is still `active`, the
         /// configured `continue_instruction` is printed so the agent listens
@@ -279,7 +279,7 @@ pub enum Commands {
     },
 }
 
-/// Completion status reported by `dispatch result` (US-007). Maps 1:1 to the
+/// Completion status reported by `dispatch result`. Maps 1:1 to the
 /// wire string stored in the ack log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]

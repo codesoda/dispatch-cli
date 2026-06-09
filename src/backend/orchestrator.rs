@@ -133,7 +133,7 @@ impl SpawnContext {
         vars.insert("DISPATCH_AGENT_NAME".into(), name.into());
         vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
         // Injected so the bare boot line `dispatch register --for-agent` can
-        // resolve the broker-required --description from env (US-003).
+        // resolve the broker-required --description from env.
         vars.insert("DISPATCH_AGENT_DESCRIPTION".into(), description.into());
         if let Some(id) = worker_id {
             vars.insert("DISPATCH_WORKER_ID".into(), id.into());
@@ -181,7 +181,7 @@ pub struct AgentOrchestrator {
     /// when responding to `dispatch agent start/restart <name>` requests.
     configs: Vec<ResolvedAgentConfig>,
     /// Shared broker state — used by `spawn_agent` to pre-register managed
-    /// agents server-side at spawn time (issue #43) and by the supervisor
+    /// agents server-side at spawn time and by the supervisor
     /// to re-register them on restart so the worker record + role prompt
     /// stay alive across respawns.
     broker: Arc<Mutex<super::local::BrokerState>>,
@@ -782,7 +782,7 @@ pub async fn pre_register_unmanaged(
 /// real `dispatch register --for-agent` tool call, which returns the role
 /// prompt body in its tool result.
 ///
-/// US-003: the line is exactly `Run: dispatch register --for-agent` — worker
+/// The line is exactly `Run: dispatch register --for-agent` — worker
 /// id, name, role, and description all resolve from the env the orchestrator
 /// injects (`DISPATCH_WORKER_ID` / `DISPATCH_AGENT_NAME` / `_ROLE` /
 /// `_DESCRIPTION`), so the boot prompt is identical across every agent and
@@ -901,8 +901,8 @@ async fn supervise_agent(
     state: Arc<Mutex<AgentState>>,
     shutdown: Arc<Notify>,
     // `Some((broker, worker_id, role_prompt))` for managed agents that need
-    // the broker worker record + role prompt re-stored on every respawn
-    // (issue #43). `None` for unmanaged agents on the legacy path.
+    // the broker worker record + role prompt re-stored on every respawn.
+    // `None` for unmanaged agents on the legacy path.
     re_register: Option<(Arc<Mutex<super::local::BrokerState>>, String, String)>,
 ) {
     let mut child = initial_child;
@@ -1215,7 +1215,7 @@ mod tests {
             Some("w-123")
         );
         // Description is injected so the bare boot line can resolve the
-        // broker-required --description from env (US-003).
+        // broker-required --description from env.
         assert_eq!(
             with_id
                 .get("DISPATCH_AGENT_DESCRIPTION")
@@ -1337,7 +1337,7 @@ mod tests {
     }
 
     /// Helper: build a managed test config (launch=true, with prompt_file)
-    /// that exercises the issue-#43 pre-register flow. Uses the `command`
+    /// that exercises the pre-register flow. Uses the `command`
     /// adapter so we don't need `claude` on the test host — the prompt file
     /// is created but ignored by the adapter; what we're testing is whether
     /// the orchestrator correctly pre-registers the worker server-side.

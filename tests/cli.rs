@@ -582,7 +582,7 @@ fn listen_times_out_with_no_messages() {
     );
 }
 
-// ── Agent-facing listen rendering (US-006) ────────────────────────────
+// ── Agent-facing listen rendering ─────────────────────────────────────
 
 /// `listen --for-agent` writes a delivered message body to stdout verbatim —
 /// no JSON envelope, no added newline — so it lands cleanly in the agent's
@@ -748,7 +748,7 @@ fn listen_for_agent_timeout_while_stopping_emits_neutral_json() {
     assert_eq!(json["worker_id"], "w-stop2");
 }
 
-// ── Env-driven identity (US-001) ──────────────────────────────────────
+// ── Env-driven identity ───────────────────────────────────────────────
 
 /// A dispatch-launched agent runs a bare `dispatch listen` (no `--worker-id`);
 /// identity comes from `$DISPATCH_WORKER_ID`, which the orchestrator injects.
@@ -852,9 +852,9 @@ fn register_for_agent_claims_worker_id_from_env() {
     );
 }
 
-// ── Uniform minimal bootstrap (US-003) ────────────────────────────────
+// ── Uniform minimal bootstrap ─────────────────────────────────────────
 
-/// The whole point of US-003: the boot line is exactly
+/// The boot line is exactly
 /// `dispatch register --for-agent` with no flags. name/role/description and
 /// the worker id all resolve from the orchestrator-injected env.
 #[test]
@@ -982,10 +982,10 @@ fn worker_id_by_name(status_json: &str, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// US-005: the stop hook is identity-gated. With a live broker but NO
+/// The stop hook is identity-gated. With a live broker but NO
 /// `DISPATCH_WORKER_ID` (an ad-hoc vendor session in a hooked repo, not a
 /// dispatch worker), it must emit nothing and allow the stop — even though the
-/// broker is reachable. This inverts the pre-US-005 behavior where mere broker
+/// broker is reachable. This inverts the earlier behavior where mere broker
 /// reachability blocked the stop.
 #[test]
 fn codex_hook_stop_allows_without_identity() {
@@ -1013,7 +1013,7 @@ fn codex_hook_stop_allows_without_identity() {
     );
 }
 
-/// US-005: with `DISPATCH_WORKER_ID` set and that worker `active`, the hook
+/// With `DISPATCH_WORKER_ID` set and that worker `active`, the hook
 /// blocks the stop and returns the continue-instruction as the reason, keeping
 /// the agent in its listen loop.
 #[test]
@@ -1061,7 +1061,7 @@ fn codex_hook_stop_blocks_when_worker_active() {
     );
 }
 
-/// US-005 parity: the claude-hook stop handler shares `run_stop_hook`, so it
+/// Parity: the claude-hook stop handler shares `run_stop_hook`, so it
 /// must also block an `active` worker.
 #[test]
 fn claude_hook_stop_blocks_when_worker_active() {
@@ -1103,7 +1103,7 @@ fn claude_hook_stop_blocks_when_worker_active() {
     assert_eq!(json["decision"], "block");
 }
 
-/// US-005 × US-004: once the coordinator marks a worker `stopping`, that
+/// Once the coordinator marks a worker `stopping`, that
 /// worker's own stop hook must allow the stop (so it can exit cleanly) instead
 /// of fighting the shutdown. Uses the real coordinator path: a managed agent is
 /// pre-registered, then `agent stop` transitions it to `stopping`.
@@ -1429,7 +1429,7 @@ fn ack_command_rejects_unknown_message() {
     );
 }
 
-// ── result super-ack (US-007) ─────────────────────────────────────────
+// ── result super-ack ──────────────────────────────────────────────────
 
 /// Helper: register a worker and queue one message addressed to it, returning
 /// `(worker_id, message_id)`.
@@ -1449,7 +1449,7 @@ fn worker_with_message(dir: &TempDir, cell_id: &str, name: &str) -> (String, Str
     (worker_id, message_id)
 }
 
-/// US-007: `dispatch result` records completion (status + summary + artifacts)
+/// `dispatch result` records completion (status + summary + artifacts)
 /// on the ack substrate without a prior `ack`, and surfaces as a `result`
 /// event distinct from `ack`/`deliver`.
 #[test]
@@ -1505,7 +1505,7 @@ fn result_records_completion() {
     );
 }
 
-/// US-007: an invalid `--status` is rejected at parse time (clap value-enum),
+/// An invalid `--status` is rejected at parse time (clap value-enum),
 /// before any broker request.
 #[test]
 fn result_rejects_invalid_status() {
@@ -1525,7 +1525,7 @@ fn result_rejects_invalid_status() {
         .failure();
 }
 
-/// US-007: results are idempotent at the verb level — a duplicate result on
+/// Results are idempotent at the verb level — a duplicate result on
 /// the same message succeeds (the latest status wins in the ack log). Also
 /// exercises the `failed` status.
 #[test]
@@ -1567,7 +1567,7 @@ fn result_duplicate_succeeds() {
     assert_eq!(json["ack_confirmed"], true);
 }
 
-/// US-007: `result --for-agent` prints a terse confirmation (not JSON) for
+/// `result --for-agent` prints a terse confirmation (not JSON) for
 /// direct tool-result consumption.
 #[test]
 fn result_for_agent_terse_confirmation() {
@@ -1607,9 +1607,9 @@ fn result_for_agent_terse_confirmation() {
     );
 }
 
-// ── Traceability & metrics (US-010) ───────────────────────────────────
+// ── Traceability & metrics ────────────────────────────────────────────
 
-/// US-010: when an agent claims its pre-registered prompt, the broker records a
+/// When an agent claims its pre-registered prompt, the broker records a
 /// `prompt` event by hash + byte size — and by default does NOT log the body.
 #[test]
 fn prompt_delivery_event_omits_body_by_default() {
@@ -1674,7 +1674,7 @@ fn prompt_delivery_event_omits_body_by_default() {
     );
 }
 
-/// US-010: with `log_prompt_bodies = true`, the `prompt` event includes the
+/// With `log_prompt_bodies = true`, the `prompt` event includes the
 /// full body (opt-in).
 #[test]
 fn prompt_delivery_event_includes_body_when_enabled() {
@@ -1734,7 +1734,7 @@ fn prompt_delivery_event_includes_body_when_enabled() {
     );
 }
 
-/// US-010: a stop-hook probe makes the broker record the block/allow decision
+/// A stop-hook probe makes the broker record the block/allow decision
 /// as a `stop_decision` event (the hook runs client-side and can't write the
 /// broker history itself).
 #[test]
@@ -1873,7 +1873,7 @@ launch = true
     );
 }
 
-// ── Coordinator-driven lifecycle (US-004) ─────────────────────────────
+// ── Coordinator-driven lifecycle ──────────────────────────────────────
 
 /// `dispatch agent stop <name>` marks the worker `stopping` (stamping the
 /// drain clock) BEFORE killing the process, so the record lingers in the
@@ -1951,5 +1951,50 @@ launch = true
     assert!(
         stdout.contains("active -> stopping"),
         "expected a lifecycle event for the stop transition; got: {stdout}"
+    );
+}
+
+/// `dispatch agent stop <worker-id>` marks only the worker with that id —
+/// same-named siblings keep running. (Stopping an unmanaged worker reports
+/// "not running" because there's no supervised process to signal, but the
+/// `stopping` mark lands first, so we assert on the resulting state rather than
+/// the command's exit.)
+#[test]
+fn agent_stop_by_worker_id_spares_same_named_siblings() {
+    let dir = TempDir::new().unwrap();
+    let cell_id = "test-agent-stop-by-id";
+    let _broker = start_broker(&dir, cell_id);
+
+    let twin_a = register_worker(&dir, cell_id, "twin", "worker");
+    let twin_b = register_worker(&dir, cell_id, "twin", "worker");
+    assert_ne!(
+        twin_a, twin_b,
+        "two same-named workers must get distinct ids"
+    );
+
+    // Stop only twin_a, addressed by its worker id (not the shared name).
+    dispatch_cmd(&dir, cell_id)
+        .args(["agent", "stop", &twin_a])
+        .output()
+        .unwrap();
+
+    let a = dispatch_cmd(&dir, cell_id)
+        .args(["status", "--worker-id", &twin_a])
+        .output()
+        .unwrap();
+    let a = String::from_utf8_lossy(&a.stdout);
+    assert!(
+        a.contains("\"control_state\":\"stopping\""),
+        "twin_a should be stopping after stop-by-id; got: {a}"
+    );
+
+    let b = dispatch_cmd(&dir, cell_id)
+        .args(["status", "--worker-id", &twin_b])
+        .output()
+        .unwrap();
+    let b = String::from_utf8_lossy(&b.stdout);
+    assert!(
+        b.contains("\"control_state\":\"active\""),
+        "twin_b (a same-named sibling) must stay active; got: {b}"
     );
 }

@@ -46,7 +46,7 @@ pub enum BrokerRequest {
         /// If true, evict any existing worker with the same name.
         #[serde(default)]
         evict: bool,
-        /// Pre-assigned worker id from the orchestrator (issue #43). When set,
+        /// Pre-assigned worker id from the orchestrator. When set,
         /// the broker uses this id instead of generating a UUID. If a worker
         /// with this id already exists and matches the supplied name+role,
         /// the call is treated as an idempotent claim — useful when dispatch
@@ -54,7 +54,7 @@ pub enum BrokerRequest {
         /// re-issues `dispatch register` to fetch its prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_id: Option<String>,
-        /// Role prompt body to associate with this worker (issue #43). Only
+        /// Role prompt body to associate with this worker. Only
         /// the orchestrator sets this — at pre-register time it loads the
         /// agent's `prompt_file` and ships the content here so the spawned
         /// agent can fetch it back as the response body of its own
@@ -85,7 +85,7 @@ pub enum BrokerRequest {
         status: Option<String>,
     },
     /// Acknowledge receipt of a message. `dispatch result` rides the same
-    /// request as a "super-ack" (US-007): when `status` is present the broker
+    /// request as a "super-ack": when `status` is present the broker
     /// records a completion (status + optional summary + artifacts) in the same
     /// `ack_log` and emits a `result` event instead of a plain `ack`. All three
     /// completion fields are additive and omitted on the wire for a plain `ack`.
@@ -139,7 +139,7 @@ pub enum BrokerRequest {
         #[serde(default)]
         clear: bool,
         /// Marks the purpose of this query so the broker can record a traceable
-        /// event (US-010). The stop hook sets `Some("stop_hook")` so its
+        /// event. The stop hook sets `Some("stop_hook")` so its
         /// block/allow decision is logged as a `stop_decision` event; ordinary
         /// status queries leave it `None` (no event). Additive — keeps the hook
         /// on the existing `Status` request rather than a new wire variant.
@@ -239,7 +239,7 @@ pub struct Worker {
     /// True once the worker has been "claimed" by an actual process:
     /// either the agent ran `dispatch register` with the supplied id
     /// (idempotent-claim path), sent a heartbeat, or reported a status.
-    /// False for freshly-inserted records — including the issue-#43
+    /// False for freshly-inserted records — including the
     /// pre-register path where the orchestrator creates the worker
     /// server-side before the agent starts. The monitor uses this to
     /// distinguish "reserved, waiting for the agent to attach" from
@@ -290,7 +290,7 @@ pub enum ResponsePayload {
     /// in this serde version, hence the wrapper struct.)
     Timeout(TimeoutPayload),
     /// A worker was registered; returns the assigned worker ID. When the
-    /// broker has a role prompt stored for this worker (issue #43), it is
+    /// broker has a role prompt stored for this worker, it is
     /// returned here so the spawned agent receives its first instructions
     /// as the response body of its own `dispatch register` call. The
     /// `role_prompt` field is always serialized (even when `None`) so the
@@ -341,7 +341,7 @@ mod tests {
                 worker_id: None,
                 role_prompt: None,
             },
-            // Pre-assigned worker_id + role_prompt (issue #43) must round-trip cleanly.
+            // Pre-assigned worker_id + role_prompt must round-trip cleanly.
             BrokerRequest::Register {
                 name: "w1".into(),
                 role: "builder".into(),
@@ -374,7 +374,7 @@ mod tests {
                 summary: None,
                 artifacts: vec![],
             },
-            // `result` super-ack shape (US-007): status + summary + artifacts.
+            // `result` super-ack shape: status + summary + artifacts.
             BrokerRequest::Ack {
                 worker_id: "w1".into(),
                 message_id: "m2".into(),

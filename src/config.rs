@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::errors::DispatchError;
 
-/// Shipped fallback for the "listen again" instruction (US-009). Used when
+/// Shipped fallback for the "listen again" instruction. Used when
 /// neither a per-agent `[[agents]]` `continue_instruction` nor a global one is
 /// set. Tells the agent to keep long-polling and not to stop on its own — the
 /// coordinator owns the stop decision via the worker's control state.
@@ -41,14 +41,14 @@ pub struct ResolvedConfig {
     /// Drain window (seconds) a `stopping` worker lingers before the broker
     /// finalizes it. `None` → the broker's built-in default applies.
     pub stopping_drain_secs: Option<u64>,
-    /// Global "listen again" instruction (US-009). The fallback when an agent
+    /// Global "listen again" instruction. The fallback when an agent
     /// has no per-agent override; `None` → the shipped
     /// [`DEFAULT_CONTINUE_INSTRUCTION`]. Resolve via
     /// [`ResolvedConfig::continue_instruction_for`], never read directly, so
     /// the per-agent > global > default precedence stays in one place.
     pub continue_instruction: Option<String>,
     /// When true, broker events that reference a prompt/packet body may include
-    /// the full body. Default `false` (US-010): bodies are logged by hash +
+    /// the full body. Default `false`: bodies are logged by hash +
     /// byte size only, never the full text, so prompts don't leak into the
     /// event history / logs.
     pub log_prompt_bodies: bool,
@@ -81,11 +81,11 @@ pub struct ResolvedAgentConfig {
     /// `listen_timeout`; `None` means "unset" and the CLI's built-in 270s
     /// default applies.
     pub listen_timeout: Option<u64>,
-    /// Per-agent override of the "listen again" instruction (US-009). `None`
+    /// Per-agent override of the "listen again" instruction. `None`
     /// falls back to the global `continue_instruction`, then the shipped
     /// default. Read via [`ResolvedConfig::continue_instruction_for`].
     pub continue_instruction: Option<String>,
-    /// Issue #43: when true, the claude adapter is launched with
+    /// When true, the claude adapter is launched with
     /// `--output-format stream-json --verbose` so per-tool-use entries
     /// appear in the agent log.
     pub stream_json: bool,
@@ -122,11 +122,11 @@ pub struct ConfigFile {
     /// finalizes it. When unset, the broker's built-in default (10s) applies.
     pub stopping_drain_secs: Option<u64>,
     /// Global "listen again" instruction returned by the stop hook and the
-    /// `listen --for-agent` timeout renderer (US-009). Overridable per agent
+    /// `listen --for-agent` timeout renderer. Overridable per agent
     /// in `[[agents]]`. When unset, the shipped default applies.
     pub continue_instruction: Option<String>,
     /// When true, broker events may log full prompt/packet bodies. Default
-    /// `false` (US-010) — bodies are recorded as hash + byte size only.
+    /// `false` — bodies are recorded as hash + byte size only.
     #[serde(default)]
     pub log_prompt_bodies: bool,
     /// Monitor dashboard configuration.
@@ -185,7 +185,7 @@ pub struct AgentConfig {
     /// as `DISPATCH_LISTEN_TIMEOUT` so this agent's bare `dispatch listen`
     /// long-polls for the configured duration.
     pub listen_timeout: Option<u64>,
-    /// Per-agent override of the global `continue_instruction` (US-009).
+    /// Per-agent override of the global `continue_instruction`.
     pub continue_instruction: Option<String>,
     /// Whether `dispatch serve` should auto-start this agent under the
     /// supervisor. `false` (the default) prints a copy-paste command at
@@ -219,7 +219,7 @@ fn resolve_agent_config(
     // Reject names that can't be used as a single on-disk filename
     // component. The HTTP boundaries (`api_agent_start/stop/restart`) already
     // gate on `is_safe_name`, but the `launch_all` / `spawn_agent` path
-    // derives the issue-#43 boot-prompt filename from `sanitize_name`, which
+    // derives the boot-prompt filename from `sanitize_name`, which
     // lossily collapses non-`[A-Za-z0-9_-]` characters to `_`. Two configs
     // like `alice/foo` and `alice_foo` would both map to
     // `alice_foo.boot.prompt`, silently overwriting each other. Enforce the
@@ -422,7 +422,7 @@ const CONFIG_TEMPLATE: &str = "\
 # stream_json = false                            # when true, claude is launched with
 #                                                # `--output-format stream-json --verbose`
 #                                                # so per-tool-use entries appear in the
-#                                                # agent log (issue #43 verification).
+#                                                # agent log (verifies real register calls).
 #
 # # `command` adapter — for bash-script / non-LLM workers:
 # [[agents]]
@@ -437,7 +437,7 @@ const CONFIG_TEMPLATE: &str = "\
 # serve startup. `launch = false` (the default) keeps the orchestrator out
 # of its lifecycle; you run it yourself in a terminal. If a `prompt_file`
 # is set, dispatch pre-registers a worker server-side and the printed
-# command uses the issue-#43 boot-prompt bootstrap — the agent's first
+# command uses the boot-prompt bootstrap — the agent's first
 # tool call is `dispatch register --for-agent`, which returns the prompt
 # body from the broker rather than embedding it in a multi-kB shell string.
 # [[agents]]
@@ -653,12 +653,12 @@ fn resolve_config_inner(
 impl ResolvedConfig {
     /// Resolve the "listen again" instruction for `agent_name` with precedence
     /// per-agent `[[agents]]` override **>** global `continue_instruction` **>**
-    /// shipped [`DEFAULT_CONTINUE_INSTRUCTION`] (US-009).
+    /// shipped [`DEFAULT_CONTINUE_INSTRUCTION`].
     ///
     /// `agent_name` is the agent's `DISPATCH_AGENT_NAME` when known; `None`
     /// (ad-hoc session, or a name not in this config) skips straight to the
     /// global/default fallback. The single resolver feeds both the stop hook
-    /// (US-005) and the `listen --for-agent` timeout renderer (US-006) so the
+    /// and the `listen --for-agent` timeout renderer so the
     /// two can't drift.
     pub fn continue_instruction_for(&self, agent_name: Option<&str>) -> String {
         if let Some(name) = agent_name {
@@ -1371,7 +1371,7 @@ model = "opus"
         );
     }
 
-    /// US-009: with no `continue_instruction` anywhere, the resolver returns
+    /// With no `continue_instruction` anywhere, the resolver returns
     /// the shipped built-in default — for a configured agent and for an
     /// unknown / ad-hoc (`None`) name alike.
     #[test]
@@ -1402,7 +1402,7 @@ command = "./run.sh"
         );
     }
 
-    /// US-009: a global `continue_instruction` overrides the shipped default
+    /// A global `continue_instruction` overrides the shipped default
     /// for every agent that doesn't set its own (and for `None`).
     #[test]
     fn continue_instruction_uses_global_override() {
@@ -1434,7 +1434,7 @@ command = "./run.sh"
         );
     }
 
-    /// US-009: a per-agent `continue_instruction` wins over the global one for
+    /// A per-agent `continue_instruction` wins over the global one for
     /// that agent; a sibling without its own override still gets the global.
     #[test]
     fn continue_instruction_per_agent_overrides_global() {

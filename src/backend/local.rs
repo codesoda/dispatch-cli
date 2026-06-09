@@ -161,7 +161,7 @@ impl super::Backend for LocalBackend {
 // ---------------------------------------------------------------------------
 
 /// Record of a message acknowledgement. When a `dispatch result` rides the ack
-/// substrate (US-007), `status`/`summary`/`artifacts` capture the completion;
+/// substrate, `status`/`summary`/`artifacts` capture the completion;
 /// they are `None`/empty for a plain `ack`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AckRecord {
@@ -206,7 +206,7 @@ pub struct BrokerState {
     /// finalizes it. Set from config `stopping_drain_secs` in `serve`.
     pub stopping_drain_secs: u64,
     /// When true, prompt/packet-body events may carry the full body; otherwise
-    /// bodies are logged by hash + byte size only (US-010). Set from config
+    /// bodies are logged by hash + byte size only. Set from config
     /// `log_prompt_bodies` in `serve`; defaults to `false`.
     pub log_prompt_bodies: bool,
     /// Total number of messages sent through the broker.
@@ -215,7 +215,7 @@ pub struct BrokerState {
     pub messages_delivered: u64,
     /// Total number of requests handled.
     pub requests_handled: u64,
-    /// Per-worker role-prompt body keyed by worker ID (issue #43). Populated
+    /// Per-worker role-prompt body keyed by worker ID. Populated
     /// at orchestrator pre-register time; returned in the `WorkerRegistered`
     /// response when the spawned agent calls `dispatch register` to claim
     /// its session. Absent for workers registered the legacy way.
@@ -259,7 +259,7 @@ impl BrokerState {
     /// old registration is removed (including its mailbox and notifier) before
     /// the new one is created.
     ///
-    /// If `worker_id` is `Some(id)` (issue #43 pre-register flow):
+    /// If `worker_id` is `Some(id)` (the pre-register flow):
     /// - When the id already exists with the same name+role, this is treated
     ///   as an idempotent claim — the existing id is returned and TTL is
     ///   renewed. This lets dispatch pre-register a worker server-side and
@@ -271,7 +271,7 @@ impl BrokerState {
     ///
     /// If `worker_id` is `None`, a fresh UUID is generated (legacy behavior).
     ///
-    /// `role_prompt` (issue #43) is the agent's role prompt body. Only the
+    /// `role_prompt` is the agent's role prompt body. Only the
     /// orchestrator passes it — at pre-register time it loads the agent's
     /// prompt file and ships the content here. The broker stores it under
     /// the worker id so the spawned agent can fetch it back via the
@@ -295,7 +295,7 @@ impl BrokerState {
         // Prune expired workers up front — every other broker entry point
         // (`list_workers`, `heartbeat_worker`, message / team / mailbox
         // handlers) does this, and skipping it here opens a race where the
-        // issue-#43 pre-register path stores a role_prompt, the pre-registered
+        // pre-register path stores a role_prompt, the pre-registered
         // worker's TTL elapses before the agent claims, another broker
         // request (e.g. `listen`) drops it via its own `evict_expired` AND
         // its `role_prompts` entry, the agent's subsequent claim misses the
@@ -365,7 +365,7 @@ impl BrokerState {
         }
 
         // `claimed = false` only when a caller pre-registers with a supplied
-        // id (issue #43 bootstrap flow — orchestrator creates the record
+        // id (the bootstrap flow — orchestrator creates the record
         // server-side before the agent process starts). A fresh register
         // without a supplied id is always an agent registering itself, so
         // mark it claimed immediately. Distinguishing these keeps the
@@ -388,7 +388,7 @@ impl BrokerState {
             status_history: VecDeque::new(),
             claimed,
             // Freshly registered workers are alive. The coordinator moves them
-            // to `stopping` via `set_control_state` (US-004 `agent stop`).
+            // to `stopping` via `set_control_state` (`agent stop`).
             control_state: ControlState::Active,
             stopping_since: None,
         };
@@ -402,7 +402,7 @@ impl BrokerState {
     /// Remove a worker and all per-worker state (mailbox, notifier, role
     /// prompt). Callers should route every worker removal through this so
     /// the broker never retains partial state for a worker that no longer
-    /// exists — an invariant the issue-#43 pre-register cleanup path relies
+    /// exists — an invariant the pre-register cleanup path relies
     /// on.
     pub fn remove_worker(&mut self, id: &str) {
         self.workers.remove(id);
@@ -468,7 +468,7 @@ impl BrokerState {
     /// one; eviction keeps same-name duplicates from accumulating). Returns the
     /// affected worker ids so the caller can emit lifecycle events. Used by the
     /// coordinator's `agent stop`/`restart` to mark a worker `stopping` before
-    /// its process is killed (US-004).
+    /// its process is killed.
     pub fn set_control_state_by_name(&mut self, name: &str, state: ControlState) -> Vec<String> {
         let ids: Vec<String> = self
             .workers
@@ -509,7 +509,7 @@ impl BrokerState {
             // so the monitor shows it as attached rather than "reserved,
             // waiting" (relevant when the orchestrator pre-registers and
             // the agent starts up by heartbeat-without-register, though
-            // the issue-#43 bootstrap always registers first).
+            // the bootstrap always registers first).
             worker.claimed = true;
             if let Some(s) = status {
                 let unchanged = worker.last_status.as_deref() == Some(s.as_str());
@@ -829,7 +829,7 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Fingerprint a prompt/packet body for traceability (US-010): a hex hash plus
+/// Fingerprint a prompt/packet body for traceability: a hex hash plus
 /// the byte length, logged in events instead of the full body so prompts don't
 /// leak into the event history. Not cryptographic — it exists to answer "did
 /// the prompt change / how big was it", not to resist forgery.
@@ -1005,7 +1005,7 @@ pub async fn serve(
     // Print copy-paste launch commands for every `launch = false` agent.
     //
     // For every unmanaged agent with a `prompt_file`, pre-register a worker
-    // server-side and wire the printed command to the issue-#43 boot-prompt
+    // server-side and wire the printed command to the boot-prompt
     // bootstrap: `DISPATCH_WORKER_ID=<uuid>` in the env + `< <name>.boot.prompt`
     // on stdin. When the user pastes + runs, the agent's first tool call
     // (`dispatch register --for-agent`) idempotently claims the pre-registered
@@ -1175,7 +1175,7 @@ async fn handle_request(
             let mut state = state.lock().await;
             // A claim (the agent fetching its own prompt) passes no
             // `role_prompt` and receives the stored body back — that's the
-            // prompt-delivery moment (US-010). The orchestrator's pre-register
+            // prompt-delivery moment. The orchestrator's pre-register
             // passes `role_prompt = Some(body)` (storing, not delivering), so
             // it is not counted as a delivery.
             let is_claim = role_prompt.is_none();
@@ -1212,7 +1212,7 @@ async fn handle_request(
             // spawned agent receives its first instructions as the response
             // body of its own `dispatch register` claim.
             let role_prompt = state.role_prompts.get(&worker_id).cloned();
-            // US-010: record the delivery by fingerprint (hash + byte size),
+            // Record the delivery by fingerprint (hash + byte size),
             // never the full body unless `log_prompt_bodies` is set, so prompt
             // cost/compliance is auditable via `dispatch events --type prompt`.
             if is_claim {
@@ -1475,7 +1475,7 @@ async fn handle_request(
             artifacts,
         } => {
             let mut state = state.lock().await;
-            // `dispatch result` rides this request as a super-ack (US-007): when
+            // `dispatch result` rides this request as a super-ack: when
             // `status` is present, emit a `result` event with the completion
             // payload; otherwise a plain `ack` with its original shape. Capture
             // what we need for the event before the fields move into ack_message.
@@ -1548,7 +1548,7 @@ async fn handle_request(
                 }
             } else {
                 let workers = state.get_status(worker_id.as_deref());
-                // US-010: a stop-hook probe records the block/allow decision it
+                // A stop-hook probe records the block/allow decision it
                 // implies, derived from the worker's control state, as a
                 // `stop_decision` event (the hook itself runs in the agent's
                 // process and can't write to the broker's history directly).
@@ -1655,11 +1655,13 @@ async fn handle_request(
             }
         }
         BrokerRequest::AgentStop { name } => {
-            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
-            // Mark the worker `stopping` BEFORE the kill so a late stop-hook
+            let (resolved, target) = resolve_stop_target(&name, &state, &orchestrator).await;
+            // Mark the target `stopping` BEFORE the kill so a late stop-hook
             // call from the dying agent sees `stopping` (and is allowed to
-            // exit) instead of racing the record away (US-004/US-005).
-            mark_worker_stopping(&state, event_tx, &resolved).await;
+            // exit) instead of racing the record away. A worker-id argument
+            // marks only that worker; an agent-name argument marks every worker
+            // registered under it.
+            mark_worker_stopping(&state, event_tx, &target).await;
             // Release the orchestrator mutex before awaiting the supervisor's
             // shutdown so concurrent list_state / monitor polls don't stall
             // for 500ms+ per stop.
@@ -1680,7 +1682,7 @@ async fn handle_request(
             }
         }
         BrokerRequest::AgentRestart { name } => {
-            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            let (resolved, target) = resolve_stop_target(&name, &state, &orchestrator).await;
             // Validate the config up front so a bad name doesn't mark a worker
             // stopping for an agent we can't restart.
             {
@@ -1693,10 +1695,11 @@ async fn handle_request(
                     };
                 }
             }
-            // Stopping semantics for the OLD worker before the respawn (US-004):
-            // mark it stopping, then kill. The fresh spawn re-registers an
-            // active worker (its evict pass wipes the old id).
-            mark_worker_stopping(&state, event_tx, &resolved).await;
+            // Stopping semantics for the OLD worker before the respawn:
+            // mark it stopping, then kill. A worker-id argument marks only that
+            // worker; a name marks every worker under it. The fresh spawn
+            // re-registers an active worker (its evict pass wipes the old id).
+            mark_worker_stopping(&state, event_tx, &target).await;
             // Split phases mirror api_agent_restart: lock → signal stop →
             // unlock → await → lock → start. Avoids pinning the orchestrator
             // mutex across the kill window.
@@ -1738,25 +1741,70 @@ async fn handle_request(
     }
 }
 
-/// Mark every worker registered under `name` as `stopping` (stamping the drain
-/// clock) and emit a lifecycle event per worker. Called before the process is
-/// killed so a late stop-hook call from the dying agent sees `stopping` and is
-/// allowed to exit, and so the record drains rather than vanishing instantly
-/// (US-004). A no-op when no worker by that name is registered (e.g. an
-/// unmanaged agent that never attached).
+/// What a coordinator `agent stop`/`restart` marks `stopping`: a single worker
+/// (the caller passed a worker id) or every worker registered under an agent
+/// name (the caller passed a name). Stopping one replica by id must not take its
+/// same-named siblings down with it.
+enum StopTarget {
+    /// A single worker id — only this replica is marked.
+    Worker(String),
+    /// An agent name — every worker registered under it is marked.
+    Name(String),
+}
+
+/// Resolve a coordinator stop/restart argument (a worker id or an agent name)
+/// into the agent name that drives the supervisor plus the [`StopTarget`] that
+/// decides how many workers are marked `stopping`. Precedence mirrors
+/// [`resolve_agent_target`]: a configured agent name targets every worker under
+/// it; otherwise a live worker id targets just that worker; an unknown value
+/// falls back to a name target (the supervisor then surfaces "no such agent").
+async fn resolve_stop_target(
+    arg: &str,
+    state: &Arc<Mutex<BrokerState>>,
+    orchestrator: &Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
+) -> (String, StopTarget) {
+    {
+        let orch = orchestrator.lock().await;
+        if orch.has_config(arg) {
+            return (arg.to_string(), StopTarget::Name(arg.to_string()));
+        }
+    }
+    let s = state.lock().await;
+    if let Some(name) = s.worker_name(arg) {
+        return (name.to_string(), StopTarget::Worker(arg.to_string()));
+    }
+    (arg.to_string(), StopTarget::Name(arg.to_string()))
+}
+
+/// Mark a [`StopTarget`] `stopping` (stamping the drain clock) and emit a
+/// lifecycle event per affected worker. Called before the process is killed so a
+/// late stop-hook call from the dying agent sees `stopping` and is allowed to
+/// exit, and so the record drains rather than vanishing instantly. A no-op when
+/// the target matches no live worker (e.g. an unmanaged agent that never
+/// attached).
 async fn mark_worker_stopping(
     state: &Arc<Mutex<BrokerState>>,
     event_tx: &broadcast::Sender<BrokerEvent>,
-    name: &str,
+    target: &StopTarget,
 ) {
     let mut s = state.lock().await;
-    let ids = s.set_control_state_by_name(name, ControlState::Stopping);
+    let ids = match target {
+        StopTarget::Worker(id) => {
+            if s.set_control_state(id, ControlState::Stopping) {
+                vec![id.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        StopTarget::Name(name) => s.set_control_state_by_name(name, ControlState::Stopping),
+    };
     for id in &ids {
+        let name = s.worker_name(id).map(str::to_string);
         s.emit_and_record(
             event_tx,
             "lifecycle",
             id,
-            Some(name),
+            name.as_deref(),
             "active -> stopping",
             Some(serde_json::json!({ "control_state": "stopping" })),
         );
@@ -2686,8 +2734,7 @@ mod tests {
 
     /// `set_control_state_by_name` marks every worker registered under a name
     /// (and only those) `stopping`, returning the affected ids — the broker-side
-    /// primitive the coordinator's `agent stop`/`restart` calls before the kill
-    /// (US-004).
+    /// primitive the coordinator's `agent stop`/`restart` calls before the kill.
     #[test]
     fn set_control_state_by_name_marks_matching_workers() {
         let mut state = BrokerState::new();
@@ -2710,6 +2757,48 @@ mod tests {
         assert!(state
             .set_control_state_by_name("nobody", ControlState::Stopping)
             .is_empty());
+    }
+
+    /// `mark_worker_stopping` honors its `StopTarget`: by worker id it marks only
+    /// that replica (same-named siblings keep running); by name it marks every
+    /// worker under the name. Lets a coordinator stop one replica without taking
+    /// the others down with it.
+    #[tokio::test]
+    async fn mark_worker_stopping_targets_id_or_name() {
+        let state = Arc::new(Mutex::new(BrokerState::new()));
+        let (event_tx, _rx) = broadcast::channel::<BrokerEvent>(16);
+        let (twin_a, twin_b) = {
+            let mut s = state.lock().await;
+            (
+                register_active(&mut s, "twin"),
+                register_active(&mut s, "twin"),
+            )
+        };
+
+        // By id: only twin_a flips to stopping.
+        mark_worker_stopping(&state, &event_tx, &StopTarget::Worker(twin_a.clone())).await;
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                s.workers.get(&twin_a).unwrap().control_state,
+                ControlState::Stopping,
+            );
+            assert_eq!(
+                s.workers.get(&twin_b).unwrap().control_state,
+                ControlState::Active,
+                "a same-named sibling must keep running",
+            );
+        }
+
+        // By name: every worker under "twin" flips to stopping.
+        mark_worker_stopping(&state, &event_tx, &StopTarget::Name("twin".into())).await;
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                s.workers.get(&twin_b).unwrap().control_state,
+                ControlState::Stopping,
+            );
+        }
     }
 
     #[tokio::test]
@@ -3467,7 +3556,7 @@ mod tests {
         assert!(state.ack_log.contains_key(&message_id));
     }
 
-    /// US-007: `ack_message` carrying completion fields (the `result`
+    /// `ack_message` carrying completion fields (the `result`
     /// super-ack) records them on the `AckRecord` and still marks the message
     /// acked — no prior plain ack required.
     #[test]
@@ -3501,7 +3590,7 @@ mod tests {
         assert!(hist.acked_at.is_some(), "result must ack the message");
     }
 
-    /// US-010: `body_fingerprint` is deterministic, returns a 16-hex-char hash
+    /// `body_fingerprint` is deterministic, returns a 16-hex-char hash
     /// plus the byte length, and distinguishes different bodies.
     #[test]
     fn body_fingerprint_is_stable_and_sized() {

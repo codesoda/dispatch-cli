@@ -23,7 +23,7 @@ fn env_worker_id() -> Option<String> {
 
 /// Read `$DISPATCH_AGENT_NAME` (empty treated as unset). Used to resolve the
 /// per-agent `continue_instruction` when `listen --for-agent` times out while
-/// the worker is still active (US-006).
+/// the worker is still active.
 fn env_agent_name() -> Option<String> {
     std::env::var("DISPATCH_AGENT_NAME")
         .ok()
@@ -200,7 +200,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                 } => BrokerRequest::Register {
                     // name/role/description fall back to the orchestrator-
                     // injected env so the boot line is a bare
-                    // `dispatch register --for-agent` (US-003).
+                    // `dispatch register --for-agent`.
                     name: require_register_field(name, "DISPATCH_AGENT_NAME", "name")?,
                     role: require_register_field(role, "DISPATCH_AGENT_ROLE", "role")?,
                     description: require_register_field(
@@ -213,7 +213,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     evict,
                     // Identity from env when no explicit `--worker-id`: a
                     // dispatch-launched agent claims the pre-registered worker
-                    // dispatch reserved for it (issue #43 bootstrap).
+                    // dispatch reserved for it.
                     worker_id: worker_id.or_else(env_worker_id),
                     role_prompt,
                 },
@@ -306,7 +306,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     summary: None,
                     artifacts: vec![],
                 },
-                // `result` rides the Ack request as a super-ack (US-007): same
+                // `result` rides the Ack request as a super-ack: same
                 // identity resolution + broker-side validation, but `status`
                 // present flips the recorded event to `result`.
                 Commands::Result {
@@ -338,14 +338,14 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
             let response = backend.send_request(&request).await?;
             if for_agent {
                 match &request {
-                    // `listen --for-agent` (US-006): deliver a message body
+                    // `listen --for-agent`: deliver a message body
                     // verbatim; render a timeout as the continue-instruction
                     // while the worker is active, else the neutral JSON timeout.
                     BrokerRequest::Listen { worker_id, .. } => {
                         render_listen_for_agent(backend.as_ref(), &config, worker_id, &response)
                             .await?;
                     }
-                    // `result --for-agent` (US-007): terse completion
+                    // `result --for-agent`: terse completion
                     // confirmation. Only `result` sets `--for-agent` on an Ack
                     // request (plain `ack` has no such flag).
                     BrokerRequest::Ack {
@@ -353,7 +353,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
                     } => {
                         render_result_for_agent(&response, message_id, status.as_deref())?;
                     }
-                    // `register --for-agent` (issue #43): prompt body to stdout,
+                    // `register --for-agent`: prompt body to stdout,
                     // JSON envelope to stderr. If the broker has no prompt stored
                     // for this worker, exit nonzero — the agent has nothing to do
                     // and the supervisor should restart rather than have the
@@ -416,7 +416,7 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
 }
 
 /// Render a `listen --for-agent` response for direct LLM tool-result
-/// consumption (US-006).
+/// consumption.
 ///
 /// - A delivered `Message` body is written to stdout **verbatim** (no JSON, no
 ///   added newline) — the coordinator authored exactly what the agent should
@@ -477,7 +477,7 @@ async fn worker_is_active(backend: &dyn dispatch::backend::Backend, worker_id: &
     )
 }
 
-/// Render `result --for-agent` (US-007): a terse one-line confirmation on
+/// Render `result --for-agent`: a terse one-line confirmation on
 /// success — the loop contract lives elsewhere (the stop hook re-arms `listen`
 /// for hook-capable agents; SEAMS supplies any coda for the rest), so this adds
 /// no loop logic. A broker-side failure becomes a typed error so the exit code

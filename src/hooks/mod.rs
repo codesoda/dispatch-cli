@@ -44,7 +44,7 @@ fn env_agent_name() -> Option<String> {
 
 /// JSON body the stop hook emits on stdout to keep the agent alive. Both
 /// vendors accept `{"decision":"block","reason":"..."}`. `reason` is the
-/// resolved `continue_instruction` (US-009).
+/// resolved `continue_instruction`.
 pub fn stop_decision_json(reason: &str) -> String {
     serde_json::json!({
         "decision": "block",
@@ -53,8 +53,8 @@ pub fn stop_decision_json(reason: &str) -> String {
     .to_string()
 }
 
-/// Handler for both `dispatch codex-hook stop` and `dispatch claude-hook stop`
-/// (US-005). Decides whether to keep the agent in its listen loop:
+/// Handler for both `dispatch codex-hook stop` and `dispatch claude-hook stop`.
+/// Decides whether to keep the agent in its listen loop:
 ///
 /// 1. No `DISPATCH_WORKER_ID` → **allow** (an ad-hoc vendor session in a
 ///    hooked repo, not a dispatch worker). The hook fires for *every* session,
@@ -102,7 +102,7 @@ pub async fn run_stop_hook(cwd: &Path) {
 /// Resolve the `continue_instruction` for this agent from its config, falling
 /// back to the shipped default when no config is resolvable. Runs in the
 /// agent's own process, which carries `DISPATCH_CONFIG_PATH` +
-/// `DISPATCH_AGENT_NAME`, so the per-agent override is visible (US-009).
+/// `DISPATCH_AGENT_NAME`, so the per-agent override is visible.
 fn resolve_continue_instruction(cwd: &Path) -> String {
     let agent = env_agent_name();
     match resolve_config(None, None, cwd) {
@@ -156,7 +156,7 @@ async fn query_control_state(socket: &Path, worker_id: &str) -> Option<ControlSt
             worker_id: Some(worker_id.to_string()),
             clear: false,
             // Mark this as a stop-hook probe so the broker records the
-            // block/allow decision as a `stop_decision` event (US-010).
+            // block/allow decision as a `stop_decision` event.
             probe: Some("stop_hook".to_string()),
         };
         let mut bytes = serde_json::to_vec(&request).ok()?;
