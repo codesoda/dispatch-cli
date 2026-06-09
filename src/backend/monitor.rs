@@ -517,6 +517,7 @@ mod tests {
             ttl: None,
             listen_timeout: None,
             continue_instruction: None,
+            boot_prompt: None,
             stream_json: false,
             interactive: false,
             launch: false,

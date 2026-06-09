@@ -14,6 +14,16 @@ use crate::errors::DispatchError;
 pub const DEFAULT_CONTINUE_INSTRUCTION: &str =
     "No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.";
 
+/// Shipped fallback for the one-line boot prompt fed to a managed agent at
+/// launch. Used when neither a per-agent `[[agents]]` `boot_prompt` nor a
+/// file-level one is set. Kept deliberately minimal: the agent's first
+/// observable action is the bare `dispatch register --for-agent`, whose
+/// response body (the agent's `prompt_file`) carries the real role prompt —
+/// so the boot line only has to trigger that one call. Resolved at config
+/// time as per-agent **>** file-level, with this default applied at write
+/// time by `write_boot_prompt`.
+pub const DEFAULT_BOOT_PROMPT: &str = "Run: dispatch register --for-agent\n";
+
 /// Runtime configuration for Dispatch, resolved from multiple sources.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -85,6 +95,11 @@ pub struct ResolvedAgentConfig {
     /// falls back to the global `continue_instruction`, then the shipped
     /// default. Read via [`ResolvedConfig::continue_instruction_for`].
     pub continue_instruction: Option<String>,
+    /// The one-line boot prompt written to `<name>.boot.prompt` and fed to the
+    /// agent at launch. Already resolved at config time as per-agent
+    /// `[[agents]]` override **>** file-level `boot_prompt`; `None` means both
+    /// are unset and the shipped [`DEFAULT_BOOT_PROMPT`] applies at write time.
+    pub boot_prompt: Option<String>,
     /// When true, the claude adapter is launched with
     /// `--output-format stream-json --verbose` so per-tool-use entries
     /// appear in the agent log.
@@ -125,6 +140,12 @@ pub struct ConfigFile {
     /// `listen --for-agent` timeout renderer. Overridable per agent
     /// in `[[agents]]`. When unset, the shipped default applies.
     pub continue_instruction: Option<String>,
+    /// File-level boot prompt fed to every managed agent in this file at
+    /// launch (the first thing the model runs). Overridable per agent in
+    /// `[[agents]]`. When unset, the shipped [`DEFAULT_BOOT_PROMPT`]
+    /// (`Run: dispatch register --for-agent`) applies — keep it minimal; the
+    /// real role prompt arrives as the response to that register call.
+    pub boot_prompt: Option<String>,
     /// When true, broker events may log full prompt/packet bodies. Default
     /// `false` — bodies are recorded as hash + byte size only.
     #[serde(default)]
@@ -187,6 +208,8 @@ pub struct AgentConfig {
     pub listen_timeout: Option<u64>,
     /// Per-agent override of the global `continue_instruction`.
     pub continue_instruction: Option<String>,
+    /// Per-agent override of the file-level `boot_prompt`.
+    pub boot_prompt: Option<String>,
     /// Whether `dispatch serve` should auto-start this agent under the
     /// supervisor. `false` (the default) prints a copy-paste command at
     /// startup instead so you can run the agent yourself.
@@ -213,6 +236,7 @@ fn resolve_agent_config(
     agent: &AgentConfig,
     project_root: &Path,
     global_listen_timeout: Option<u64>,
+    global_boot_prompt: Option<&str>,
 ) -> Result<ResolvedAgentConfig, DispatchError> {
     use crate::adapter::Adapter;
 
@@ -311,6 +335,12 @@ fn resolve_agent_config(
         // Kept raw (per-agent only): `continue_instruction_for` layers global
         // and the shipped default on top, so don't fold them in here.
         continue_instruction: agent.continue_instruction.clone(),
+        // Per-agent override wins over the file-level boot prompt; `None` here
+        // means both are unset and DEFAULT_BOOT_PROMPT applies at write time.
+        boot_prompt: agent
+            .boot_prompt
+            .clone()
+            .or_else(|| global_boot_prompt.map(str::to_string)),
         stream_json: agent.stream_json,
         launch: agent.launch,
         interactive,
@@ -383,6 +413,13 @@ const CONFIG_TEMPLATE: &str = "\
 # [[agents]]. When unset, a built-in default is used.
 # continue_instruction = \"No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.\"
 
+# One-line boot prompt fed to every managed agent at launch — the first thing
+# the model runs. Keep it minimal: its only job is to trigger
+# `dispatch register --for-agent`, whose response body (the agent's prompt_file)
+# carries the real role prompt. Overridable per agent in [[agents]].
+# (default: \"Run: dispatch register --for-agent\")
+# boot_prompt = \"Run: dispatch register --for-agent\"
+
 # Log full prompt/packet bodies in broker events. Default false — bodies are
 # recorded by hash + byte size only, so prompts don't leak into the event
 # history or logs. Enable only for debugging.
@@ -419,6 +456,8 @@ const CONFIG_TEMPLATE: &str = "\
 # ttl = 3600
 # listen_timeout = 540                           # per-agent override of the global
 #                                                # listen_timeout (seconds)
+# boot_prompt = \"Run: dispatch register --for-agent\"  # per-agent override of the
+#                                                # file-level boot_prompt
 # stream_json = false                            # when true, claude is launched with
 #                                                # `--output-format stream-json --verbose`
 #                                                # so per-tool-use entries appear in the
@@ -582,6 +621,7 @@ fn resolve_config_inner(
         global_listen_timeout,
         stopping_drain_secs,
         continue_instruction,
+        global_boot_prompt,
         log_prompt_bodies,
         config_cwd,
         monitor_config,
@@ -595,6 +635,7 @@ fn resolve_config_inner(
             c.listen_timeout,
             c.stopping_drain_secs,
             c.continue_instruction,
+            c.boot_prompt,
             c.log_prompt_bodies,
             c.cwd,
             c.monitor,
@@ -602,6 +643,7 @@ fn resolve_config_inner(
             c.heartbeats,
         ),
         None => (
+            None,
             None,
             None,
             None,
@@ -629,7 +671,14 @@ fn resolve_config_inner(
     // Resolve agent prompt files
     let agents: Vec<ResolvedAgentConfig> = raw_agents
         .iter()
-        .map(|a| resolve_agent_config(a, &project_root, global_listen_timeout))
+        .map(|a| {
+            resolve_agent_config(
+                a,
+                &project_root,
+                global_listen_timeout,
+                global_boot_prompt.as_deref(),
+            )
+        })
         .collect::<Result<_, _>>()?;
 
     Ok(ResolvedConfig {
@@ -1472,5 +1521,99 @@ command = "./run.sh"
             resolved.continue_instruction_for(Some("plain")),
             "global text"
         );
+    }
+
+    /// With no `boot_prompt` anywhere, the resolved agent carries `None` —
+    /// `write_boot_prompt` applies the shipped [`DEFAULT_BOOT_PROMPT`] at
+    /// launch time.
+    #[test]
+    fn boot_prompt_unset_resolves_none() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[[agents]]
+name = "worker"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let worker = resolved.agents.iter().find(|a| a.name == "worker").unwrap();
+        assert_eq!(worker.boot_prompt, None);
+    }
+
+    /// A file-level `boot_prompt` is folded onto every agent that doesn't set
+    /// its own.
+    #[test]
+    fn boot_prompt_uses_file_level() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+boot_prompt = "Use the dispatch skill, then: dispatch register --for-agent"
+
+[[agents]]
+name = "worker"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let worker = resolved.agents.iter().find(|a| a.name == "worker").unwrap();
+        assert_eq!(
+            worker.boot_prompt.as_deref(),
+            Some("Use the dispatch skill, then: dispatch register --for-agent")
+        );
+    }
+
+    /// A per-agent `boot_prompt` wins over the file-level one for that agent;
+    /// a sibling without its own override still gets the file-level value.
+    #[test]
+    fn boot_prompt_per_agent_overrides_file_level() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("dispatch.config.toml");
+        fs::write(
+            &config_path,
+            r#"
+boot_prompt = "file-level boot"
+
+[[agents]]
+name = "special"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+boot_prompt = "special boot"
+
+[[agents]]
+name = "plain"
+role = "worker"
+description = "d"
+adapter = "command"
+command = "./run.sh"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
+        let special = resolved
+            .agents
+            .iter()
+            .find(|a| a.name == "special")
+            .unwrap();
+        let plain = resolved.agents.iter().find(|a| a.name == "plain").unwrap();
+        assert_eq!(special.boot_prompt.as_deref(), Some("special boot"));
+        assert_eq!(plain.boot_prompt.as_deref(), Some("file-level boot"));
     }
 }

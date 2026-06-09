@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Configurable boot prompt. The one-line bootstrap fed to a managed agent at launch is now set via `boot_prompt` — file-level (applies to every agent in the file) plus a per-agent `[[agents]]` override — with a shipped `DEFAULT_BOOT_PROMPT` (`Run: dispatch register --for-agent`). Precedence is per-agent `[[agents]]` > file-level > built-in default; the resolved value is normalized to a single trailing newline at write time. Lets a project point agents at a customized boot line (e.g. "use the dispatch skill, then register") without rebuilding dispatch, while keeping the minimal default that just triggers `register --for-agent`.
+
 ## [0.6.0] - 2026-06-09
 
 ### Added

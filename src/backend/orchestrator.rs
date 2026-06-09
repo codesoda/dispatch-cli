@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::adapter::{shell_arg_quote, shell_escape, BuildContext, Launch};
-use crate::config::ResolvedAgentConfig;
+use crate::config::{ResolvedAgentConfig, DEFAULT_BOOT_PROMPT};
 use crate::errors::DispatchError;
 
 /// Maximum consecutive restart attempts before marking an agent as crashed.
@@ -794,7 +794,13 @@ async fn write_boot_prompt(
     tokio::fs::create_dir_all(log_dir).await?;
     let safe = sanitize_name(&config.name);
     let path = log_dir.join(format!("{safe}.boot.prompt"));
-    tokio::fs::write(&path, "Run: dispatch register --for-agent\n").await?;
+    // Resolved precedence (per-agent > file-level) lands in `config.boot_prompt`;
+    // `None` falls back to the shipped default. Normalize to exactly one
+    // trailing newline so a user-supplied prompt without one still feeds the
+    // adapter a clean line.
+    let body = config.boot_prompt.as_deref().unwrap_or(DEFAULT_BOOT_PROMPT);
+    let body = format!("{}\n", body.trim_end_matches('\n'));
+    tokio::fs::write(&path, body).await?;
     Ok(path)
 }
 
@@ -1330,6 +1336,7 @@ mod tests {
             ttl: None,
             listen_timeout: None,
             continue_instruction: None,
+            boot_prompt: None,
             stream_json: false,
             interactive: false,
             launch: true,
@@ -1354,10 +1361,37 @@ mod tests {
             ttl: None,
             listen_timeout: None,
             continue_instruction: None,
+            boot_prompt: None,
             stream_json: false,
             interactive: false,
             launch: true,
         }
+    }
+
+    /// `write_boot_prompt` emits the shipped default when no `boot_prompt` is
+    /// configured, and the configured value (normalized to exactly one
+    /// trailing newline) when one is set.
+    #[tokio::test]
+    async fn write_boot_prompt_uses_default_or_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+
+        // Unset -> shipped default verbatim.
+        let cfg = test_config("alice", "sleep 0");
+        let path = write_boot_prompt(&log_dir, &cfg).await.unwrap();
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(body, DEFAULT_BOOT_PROMPT);
+
+        // Configured without a trailing newline -> value + exactly one newline.
+        let mut custom = test_config("bob", "sleep 0");
+        custom.boot_prompt =
+            Some("Use the dispatch skill, then: dispatch register --for-agent".into());
+        let path = write_boot_prompt(&log_dir, &custom).await.unwrap();
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            body,
+            "Use the dispatch skill, then: dispatch register --for-agent\n"
+        );
     }
 
     /// Issue #43: spawning a managed agent (launch=true with prompt_file)
