@@ -22,7 +22,7 @@ command -v jq >/dev/null 2>&1 || die "jq not found — brew install jq"
 # --- Resolve paths ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXAMPLES_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMMS="$EXAMPLES_DIR/dispatch-comms.md"
+SKILL="$(cd "$EXAMPLES_DIR/.." && pwd)/skills/dispatch/SKILL.md"
 
 SESSION="agent-counsel"
 
@@ -57,7 +57,7 @@ agent_cmd() {
   local model="$1"
   local prompt_file="$2"
   local extra="$3"
-  echo "claude --model $model \"Read the file $COMMS for how dispatch communication works. Then read $prompt_file and follow its instructions. $extra\""
+  echo "claude --model $model \"Read the file $SKILL (the dispatch skill) for how dispatch communication works. Then read $prompt_file and follow its instructions. $extra\""
 }
 
 # --- Window 1: counsel (chair + 4 counselors) ---

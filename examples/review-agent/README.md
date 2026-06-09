@@ -108,4 +108,4 @@ The writer and reviewer communicate using JSON messages with a `type` field:
 | `setup.sh` | Launches broker + both agents in a tmux session |
 | `writer.prompt.md` | Role instructions for the PRD writer agent |
 | `reviewer.prompt.md` | Role instructions for the PRD reviewer agent |
-| `dispatch-comms.md` | Shared communication guide — reusable for any dispatch worker |
+| `skills/dispatch/` (repo root) | The `dispatch` skill — communication guide, reusable for any dispatch worker |
