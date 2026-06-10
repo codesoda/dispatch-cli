@@ -1,6 +1,6 @@
 //! Codex CLI hook integration.
 //!
-//! Codex reads `<repo>/.codex/hooks.json` when `features.codex_hooks = true`
+//! Codex reads `<repo>/.codex/hooks.json` when `features.hooks = true`
 //! is set in `<repo>/.codex/config.toml`. The Stop hook we register runs
 //! `dispatch codex-hook stop` which prints a block decision — keeping the
 //! agent alive for the next dispatch message.
@@ -45,7 +45,7 @@ fn config_path(cwd: &Path) -> PathBuf {
 
 /// Merge the dispatch Stop hook into `.codex/hooks.json` (preserving any
 /// other Stop entries and any other hook categories the user has registered)
-/// and enable `features.codex_hooks = true` in `.codex/config.toml`. Creates
+/// and enable `features.hooks = true` in `.codex/config.toml`. Creates
 /// `.codex/` if it doesn't exist.
 ///
 /// Idempotent: re-running does not duplicate our Stop entry. If a legacy
@@ -112,7 +112,7 @@ pub async fn install(cwd: &Path) -> Result<PathBuf, DispatchError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(DispatchError::Io(e)),
     };
-    let updated = ensure_codex_hooks_feature(&existing);
+    let updated = ensure_hooks_feature(&existing);
     if updated != existing {
         tokio::fs::write(&config_path, updated).await?;
     }
@@ -229,14 +229,14 @@ async fn tokio_file_exists(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
 }
 
-/// Ensure `[features] codex_hooks = true` is present in `config.toml`.
+/// Ensure `[features] hooks = true` is present in `config.toml`.
 ///
 /// Cases (in order):
-/// 1. File already has `codex_hooks = true` somewhere → no change.
-/// 2. File has `codex_hooks = <anything-else>` (e.g. `false`) → the existing
+/// 1. File already has `hooks = true` somewhere → no change.
+/// 2. File has `hooks = <anything-else>` (e.g. `false`) → the existing
 ///    line is rewritten to `= true` in place. Avoids inserting a duplicate
 ///    key that would make the TOML invalid.
-/// 3. `[features]` section exists but no `codex_hooks` key → append the key
+/// 3. `[features]` section exists but no `hooks` key → append the key
 ///    at the end of the section.
 /// 4. No `[features]` section → append a fresh section.
 ///
@@ -244,10 +244,10 @@ async fn tokio_file_exists(path: &Path) -> bool {
 /// comments, ordering, and formatting of unrelated config are preserved.
 /// Line-ending agnostic: walks `split_inclusive('\n')` so CRLF-terminated
 /// files aren't split mid-pair when we compute offsets.
-fn ensure_codex_hooks_feature(existing: &str) -> String {
+fn ensure_hooks_feature(existing: &str) -> String {
     // Single pass: note whether we're inside `[features]`, find the end of
     // that section (start of the next `[header]` or EOF), and capture the
-    // byte range of any existing `codex_hooks = …` line so we can rewrite
+    // byte range of any existing `hooks = …` line so we can rewrite
     // it in place instead of appending a duplicate.
     let mut in_features = false;
     let mut features_end: Option<usize> = None;
@@ -264,10 +264,10 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
                 in_features = true;
             }
         } else if in_features {
-            // Match the exact `codex_hooks` key: next char must be `=` or
-            // whitespace so lookalikes such as `codex_hooks_extra = ...` are
+            // Match the exact `hooks` key: next char must be `=` or
+            // whitespace so lookalikes such as `hooks_extra = ...` are
             // left untouched.
-            if let Some(rest) = trimmed.strip_prefix("codex_hooks") {
+            if let Some(rest) = trimmed.strip_prefix("hooks") {
                 let boundary_ok = rest
                     .chars()
                     .next()
@@ -287,7 +287,7 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
         features_end = Some(existing.len());
     }
 
-    // Case 1 + 2: an existing `codex_hooks = …` line — short-circuit if
+    // Case 1 + 2: an existing `hooks = …` line — short-circuit if
     // already true, otherwise rewrite in place (preserving the original
     // line terminator).
     if let Some((start, end, is_true)) = existing_key {
@@ -303,21 +303,21 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
         };
         let mut out = String::with_capacity(existing.len());
         out.push_str(&existing[..start]);
-        out.push_str("codex_hooks = true");
+        out.push_str("hooks = true");
         out.push_str(terminator);
         out.push_str(&existing[end..]);
         return out;
     }
 
     match features_end {
-        // Case 3: [features] section exists, no codex_hooks key.
+        // Case 3: [features] section exists, no hooks key.
         Some(end) => {
             let mut out = String::with_capacity(existing.len() + 24);
             out.push_str(&existing[..end]);
             if !out.ends_with('\n') {
                 out.push('\n');
             }
-            out.push_str("codex_hooks = true\n");
+            out.push_str("hooks = true\n");
             out.push_str(&existing[end..]);
             out
         }
@@ -330,7 +330,7 @@ fn ensure_codex_hooks_feature(existing: &str) -> String {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str("[features]\ncodex_hooks = true\n");
+            out.push_str("[features]\nhooks = true\n");
             out
         }
     }
@@ -352,7 +352,7 @@ mod tests {
             .await
             .unwrap();
         assert!(cfg.contains("[features]"));
-        assert!(cfg.contains("codex_hooks = true"));
+        assert!(cfg.contains("hooks = true"));
     }
 
     #[tokio::test]
@@ -371,7 +371,7 @@ mod tests {
             .unwrap();
         assert!(cfg.contains("# user comment"));
         assert!(cfg.contains("[profile]"));
-        assert!(cfg.contains("codex_hooks = true"));
+        assert!(cfg.contains("hooks = true"));
     }
 
     #[tokio::test]
@@ -380,7 +380,7 @@ mod tests {
         tokio::fs::create_dir_all(dir.path().join(".codex"))
             .await
             .unwrap();
-        let original = "[features]\ncodex_hooks = true\n";
+        let original = "[features]\nhooks = true\n";
         tokio::fs::write(dir.path().join(".codex/config.toml"), original)
             .await
             .unwrap();
@@ -388,7 +388,7 @@ mod tests {
         let cfg = tokio::fs::read_to_string(dir.path().join(".codex/config.toml"))
             .await
             .unwrap();
-        assert_eq!(cfg.matches("codex_hooks").count(), 1);
+        assert_eq!(cfg.matches("hooks").count(), 1);
     }
 
     /// Fresh install writes the nested schema codex actually loads —
@@ -617,10 +617,10 @@ mod tests {
     #[test]
     fn inserts_flag_into_existing_features_section() {
         let input = "[features]\nother = true\n";
-        let out = ensure_codex_hooks_feature(input);
+        let out = ensure_hooks_feature(input);
         assert!(out.contains("[features]"));
         assert!(out.contains("other = true"));
-        assert!(out.contains("codex_hooks = true"));
+        assert!(out.contains("hooks = true"));
     }
 
     /// CRLF-terminated config.toml must produce valid TOML after the
@@ -629,45 +629,39 @@ mod tests {
     #[test]
     fn handles_crlf_line_endings() {
         let input = "[profile]\r\nmodel = \"gpt-5\"\r\n[features]\r\nother = true\r\n";
-        let out = ensure_codex_hooks_feature(input);
-        assert!(out.contains("codex_hooks = true"));
+        let out = ensure_hooks_feature(input);
+        assert!(out.contains("hooks = true"));
         // Round-trip the result through a TOML parser to prove the file
         // is still syntactically valid.
         let parsed: toml::Value = toml::from_str(&out).expect("CRLF merge must yield valid TOML");
-        assert_eq!(
-            parsed["features"]["codex_hooks"],
-            toml::Value::Boolean(true)
-        );
+        assert_eq!(parsed["features"]["hooks"], toml::Value::Boolean(true));
         assert_eq!(parsed["features"]["other"], toml::Value::Boolean(true));
     }
 
-    /// A pre-existing `codex_hooks = false` inside `[features]` must be
+    /// A pre-existing `hooks = false` inside `[features]` must be
     /// rewritten to `= true` in place, NOT appended after — appending
     /// would produce a duplicate key and make the TOML invalid.
     #[test]
     fn rewrites_existing_false_value_in_place() {
-        let input = "[features]\ncodex_hooks = false\nother = true\n";
-        let out = ensure_codex_hooks_feature(input);
-        assert_eq!(out.matches("codex_hooks").count(), 1);
-        assert!(out.contains("codex_hooks = true"));
-        assert!(!out.contains("codex_hooks = false"));
+        let input = "[features]\nhooks = false\nother = true\n";
+        let out = ensure_hooks_feature(input);
+        assert_eq!(out.matches("hooks").count(), 1);
+        assert!(out.contains("hooks = true"));
+        assert!(!out.contains("hooks = false"));
         assert!(out.contains("other = true"));
         // Must remain parseable TOML.
         let parsed: toml::Value = toml::from_str(&out).expect("merge must yield valid TOML");
-        assert_eq!(
-            parsed["features"]["codex_hooks"],
-            toml::Value::Boolean(true)
-        );
+        assert_eq!(parsed["features"]["hooks"], toml::Value::Boolean(true));
     }
 
     /// Non-boolean / unexpected values (e.g. a string) should also be
     /// rewritten to the canonical `= true` rather than appended after.
     #[test]
     fn rewrites_unexpected_value_in_place() {
-        let input = "[features]\ncodex_hooks = \"yes\"\n";
-        let out = ensure_codex_hooks_feature(input);
-        assert_eq!(out.matches("codex_hooks").count(), 1);
-        assert!(out.contains("codex_hooks = true"));
+        let input = "[features]\nhooks = \"yes\"\n";
+        let out = ensure_hooks_feature(input);
+        assert_eq!(out.matches("hooks").count(), 1);
+        assert!(out.contains("hooks = true"));
         assert!(!out.contains("\"yes\""));
     }
 
@@ -676,29 +670,26 @@ mod tests {
     /// is preserved.
     #[test]
     fn in_place_rewrite_preserves_crlf() {
-        let input = "[features]\r\ncodex_hooks = false\r\n";
-        let out = ensure_codex_hooks_feature(input);
-        assert!(out.contains("codex_hooks = true\r\n"));
-        assert!(!out.contains("codex_hooks = false"));
+        let input = "[features]\r\nhooks = false\r\n";
+        let out = ensure_hooks_feature(input);
+        assert!(out.contains("hooks = true\r\n"));
+        assert!(!out.contains("hooks = false"));
     }
 
-    /// A similarly-prefixed key such as `codex_hooks_extra = "foo"` inside
+    /// A similarly-prefixed key such as `hooks_extra = "foo"` inside
     /// `[features]` must NOT be rewritten as the feature flag — the match
-    /// is only for the exact `codex_hooks` key.
+    /// is only for the exact `hooks` key.
     #[test]
     fn does_not_rewrite_similar_prefixed_key() {
-        let input = "[features]\ncodex_hooks_extra = \"foo\"\n";
-        let out = ensure_codex_hooks_feature(input);
-        assert!(out.contains("codex_hooks_extra = \"foo\""));
-        assert!(out.contains("codex_hooks = true"));
+        let input = "[features]\nhooks_extra = \"foo\"\n";
+        let out = ensure_hooks_feature(input);
+        assert!(out.contains("hooks_extra = \"foo\""));
+        assert!(out.contains("hooks = true"));
         // Remains valid TOML with both keys intact.
         let parsed: toml::Value = toml::from_str(&out).expect("merge must yield valid TOML");
+        assert_eq!(parsed["features"]["hooks"], toml::Value::Boolean(true));
         assert_eq!(
-            parsed["features"]["codex_hooks"],
-            toml::Value::Boolean(true)
-        );
-        assert_eq!(
-            parsed["features"]["codex_hooks_extra"],
+            parsed["features"]["hooks_extra"],
             toml::Value::String("foo".to_string())
         );
     }

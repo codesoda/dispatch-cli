@@ -516,7 +516,7 @@ async fn run_codex_hook(
         HookAction::Install => {
             let path = hooks::codex::install(cwd).await?;
             eprintln!(
-                "installed codex hook at {}\nensure features.codex_hooks = true is set in .codex/config.toml (already added if missing)",
+                "installed codex hook at {}\nensure features.hooks = true is set in .codex/config.toml (already added if missing)",
                 path.display()
             );
         }
