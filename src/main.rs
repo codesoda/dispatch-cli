@@ -154,7 +154,6 @@ async fn run(cli: Cli) -> Result<(), dispatch::errors::DispatchError> {
 
     tracing::debug!(cell_id = %config.cell_id, project_root = %config.project_root.display(), "resolved config");
 
-    // Extract monitor port: CLI flag takes precedence over config.
     let monitor_port = if let Commands::Serve { monitor } = &cli.command {
         monitor.or(config.monitor_port)
     } else {

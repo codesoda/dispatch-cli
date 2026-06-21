@@ -110,10 +110,13 @@ async fn api_events(
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
-                    let sse_event = Event::default().event("broker").json_data(&event).unwrap();
-                    return Some((Ok(sse_event), rx));
-                }
+                Ok(event) => match Event::default().event("broker").json_data(&event) {
+                    Ok(sse_event) => return Some((Ok(sse_event), rx)),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to serialize broker event");
+                        continue;
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -252,7 +255,6 @@ async fn api_logs(
         Err(_) => return (StatusCode::NOT_FOUND, "log file not found").into_response(),
     };
 
-    // Return the last N lines, capped to MAX_LOG_LINES.
     let requested = query.lines.min(MAX_LOG_LINES);
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(requested);
