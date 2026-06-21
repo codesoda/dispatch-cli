@@ -1,59 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::adapter::{shell_arg_quote, shell_escape, BuildContext, Launch};
-use crate::config::ResolvedAgentConfig;
+use crate::config::{ResolvedAgentConfig, DEFAULT_BOOT_PROMPT};
 use crate::errors::DispatchError;
 
-/// Maximum consecutive restart attempts before marking an agent as crashed.
-/// Counter resets when the agent runs for at least `STABLE_AFTER` seconds.
-const MAX_RESTART_ATTEMPTS: u32 = 5;
+mod process;
 
-/// Duration an agent must stay running before its restart attempt counter
-/// resets. A process that stayed up at least this long is treated as a
-/// fresh first-attempt restart when it next exits — the counter is set
-/// back to `1` (not `0`), so the agent gets the full `MAX_RESTART_ATTEMPTS`
-/// budget from that point forward.
-const STABLE_AFTER: Duration = Duration::from_secs(30);
-
-/// Kill an entire process group. Sends SIGTERM first, then SIGKILL after a timeout.
-///
-/// Refuses to signal `pid == 0`: `libc::kill(-0, …)` signals the *caller's*
-/// process group, which would tear down `dispatch serve` itself along with
-/// every sibling supervisor. A missing/zero PID means the child already
-/// exited or was never spawned, so there is nothing to kill.
-async fn kill_process_group(pid: u32) {
-    if pid == 0 {
-        tracing::warn!("kill_process_group called with pid=0; refusing to signal caller's pgid");
-        return;
-    }
-    let pgid = pid as i32;
-    // Send SIGTERM to the process group.
-    unsafe {
-        libc::kill(-pgid, libc::SIGTERM);
-    }
-    // Give processes a moment to exit gracefully.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    // Force kill any remaining processes.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
-}
-
-/// Exponential backoff (capped at 30s) for consecutive restart attempts.
-/// attempt=1 → 1s, 2 → 2s, 3 → 4s, 4 → 8s, 5 → 16s, 6+ → 30s.
-fn restart_backoff(attempt: u32) -> Duration {
-    let secs = 1u64
-        .checked_shl(attempt.saturating_sub(1))
-        .unwrap_or(u64::MAX);
-    Duration::from_secs(secs.min(30))
-}
+#[cfg(test)]
+use process::restart_backoff;
+use process::{spawn_child_process, supervise_agent};
 
 /// Runtime state of a supervised agent. Consumed by the monitor UI and tests.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -110,7 +70,14 @@ pub struct SpawnContext {
 }
 
 impl SpawnContext {
-    fn env_vars(&self, name: &str, role: &str, worker_id: Option<&str>) -> HashMap<String, String> {
+    fn env_vars(
+        &self,
+        name: &str,
+        role: &str,
+        description: &str,
+        worker_id: Option<&str>,
+        listen_timeout: Option<u64>,
+    ) -> HashMap<String, String> {
         let mut vars = HashMap::new();
         vars.insert("DISPATCH_CELL_ID".into(), self.cell_id.clone());
         vars.insert(
@@ -125,8 +92,17 @@ impl SpawnContext {
         }
         vars.insert("DISPATCH_AGENT_NAME".into(), name.into());
         vars.insert("DISPATCH_AGENT_ROLE".into(), role.into());
+        // Injected so the bare boot line `dispatch register --for-agent` can
+        // resolve the broker-required --description from env.
+        vars.insert("DISPATCH_AGENT_DESCRIPTION".into(), description.into());
         if let Some(id) = worker_id {
             vars.insert("DISPATCH_WORKER_ID".into(), id.into());
+        }
+        // Resolved at config time as per-agent override > global; injected so
+        // the agent's bare `dispatch listen` long-polls for the configured
+        // duration. Omitted when unset — the CLI's 270s default then applies.
+        if let Some(timeout) = listen_timeout {
+            vars.insert("DISPATCH_LISTEN_TIMEOUT".into(), timeout.to_string());
         }
         vars
     }
@@ -165,7 +141,7 @@ pub struct AgentOrchestrator {
     /// when responding to `dispatch agent start/restart <name>` requests.
     configs: Vec<ResolvedAgentConfig>,
     /// Shared broker state — used by `spawn_agent` to pre-register managed
-    /// agents server-side at spawn time (issue #43) and by the supervisor
+    /// agents server-side at spawn time and by the supervisor
     /// to re-register them on restart so the worker record + role prompt
     /// stay alive across respawns.
     broker: Arc<Mutex<super::local::BrokerState>>,
@@ -614,11 +590,23 @@ pub async fn build_pending_agent(
             let mut sc = config.clone();
             sc.prompt_file_path = Some(boot_path);
 
-            let env = ctx.env_vars(&config.name, &config.role, Some(&id));
+            let env = ctx.env_vars(
+                &config.name,
+                &config.role,
+                &config.description,
+                Some(&id),
+                config.listen_timeout,
+            );
             (env, Some(id), Some(prompt_content), sc)
         } else {
             // Legacy unmanaged path (launch=false, or no prompt_file).
-            let env = ctx.env_vars(&config.name, &config.role, None);
+            let env = ctx.env_vars(
+                &config.name,
+                &config.role,
+                &config.description,
+                None,
+                config.listen_timeout,
+            );
             (env, None, None, config.clone())
         };
 
@@ -749,12 +737,16 @@ pub async fn pre_register_unmanaged(
     Ok((id, boot_path))
 }
 
-/// Write the issue-#43 one-line boot prompt to a stable per-agent file
-/// under the log dir. The boot prompt forces the model's first observable
-/// action to be a real `dispatch register --for-agent` tool call, which
-/// returns the role prompt body in its tool result. Description is
-/// substituted at write time (shell-escaped) so the dispatch CLI's
-/// required `--description` flag is satisfied without an env var.
+/// Write the one-line boot prompt to a stable per-agent file under the log
+/// dir. The boot prompt forces the model's first observable action to be a
+/// real `dispatch register --for-agent` tool call, which returns the role
+/// prompt body in its tool result.
+///
+/// The line is exactly `Run: dispatch register --for-agent` — worker
+/// id, name, role, and description all resolve from the env the orchestrator
+/// injects (`DISPATCH_WORKER_ID` / `DISPATCH_AGENT_NAME` / `_ROLE` /
+/// `_DESCRIPTION`), so the boot prompt is identical across every agent and
+/// carries no per-agent shell-escaped values.
 async fn write_boot_prompt(
     log_dir: &Path,
     config: &ResolvedAgentConfig,
@@ -762,277 +754,14 @@ async fn write_boot_prompt(
     tokio::fs::create_dir_all(log_dir).await?;
     let safe = sanitize_name(&config.name);
     let path = log_dir.join(format!("{safe}.boot.prompt"));
-    let body = format!(
-        "Run: dispatch register --worker-id \"$DISPATCH_WORKER_ID\" \
-         --name \"$DISPATCH_AGENT_NAME\" --role \"$DISPATCH_AGENT_ROLE\" \
-         --description {} --for-agent\n",
-        shell_escape(&config.description),
-    );
+    // Resolved precedence (per-agent > file-level) lands in `config.boot_prompt`;
+    // `None` falls back to the shipped default. Normalize to exactly one
+    // trailing newline so a user-supplied prompt without one still feeds the
+    // adapter a clean line.
+    let body = config.boot_prompt.as_deref().unwrap_or(DEFAULT_BOOT_PROMPT);
+    let body = format!("{}\n", body.trim_end_matches('\n'));
     tokio::fs::write(&path, body).await?;
     Ok(path)
-}
-
-/// Spawn the agent process (single attempt, no supervision).
-///
-/// Used both for the initial launch and for respawns inside the supervisor.
-/// Stdout/stderr append to `<log_dir>/<sanitized-name>.log`; restarts append
-/// to the same file so the full history is preserved across respawns.
-async fn spawn_child_process(
-    config: &ResolvedAgentConfig,
-    env_vars: &HashMap<String, String>,
-    agent_cwd: &Path,
-    log_dir: &Path,
-) -> Result<Child, DispatchError> {
-    let launch =
-        AgentOrchestrator::build_launch(config).map_err(|e| DispatchError::AgentLaunchFailed {
-            name: config.name.clone(),
-            reason: e.to_string(),
-        })?;
-
-    tracing::info!(
-        agent = %config.name,
-        role = %config.role,
-        adapter = %config.adapter,
-        program = %launch.program,
-        args = ?launch.args,
-        cwd = %agent_cwd.display(),
-        "launching agent"
-    );
-
-    tokio::fs::create_dir_all(&log_dir)
-        .await
-        .map_err(|e| DispatchError::AgentLaunchFailed {
-            name: config.name.clone(),
-            reason: format!("failed to create log dir {}: {e}", log_dir.display()),
-        })?;
-    let safe_name = sanitize_name(&config.name);
-    let log_path = log_dir.join(format!("{safe_name}.log"));
-    // Append rather than truncate so restart logs are retained.
-    let log_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .await
-        .map_err(|e| DispatchError::AgentLaunchFailed {
-            name: config.name.clone(),
-            reason: format!("failed to open log file {}: {e}", log_path.display()),
-        })?;
-    let log_file_err =
-        log_file
-            .try_clone()
-            .await
-            .map_err(|e| DispatchError::AgentLaunchFailed {
-                name: config.name.clone(),
-                reason: format!("failed to clone log file handle: {e}"),
-            })?;
-    let log_file_std = log_file.into_std().await;
-    let log_file_err_std = log_file_err.into_std().await;
-
-    let stdin = match &launch.stdin_file {
-        Some(path) => {
-            let f = tokio::fs::File::open(path).await.map_err(|e| {
-                DispatchError::AgentLaunchFailed {
-                    name: config.name.clone(),
-                    reason: format!("failed to open prompt file {}: {e}", path.display()),
-                }
-            })?;
-            std::process::Stdio::from(f.into_std().await)
-        }
-        None => std::process::Stdio::null(),
-    };
-
-    Command::new(&launch.program)
-        .args(&launch.args)
-        .envs(env_vars)
-        .current_dir(agent_cwd)
-        .stdin(stdin)
-        .stdout(std::process::Stdio::from(log_file_std))
-        .stderr(std::process::Stdio::from(log_file_err_std))
-        .process_group(0)
-        .spawn()
-        .map_err(|e| DispatchError::AgentLaunchFailed {
-            name: config.name.clone(),
-            reason: e.to_string(),
-        })
-}
-
-/// Supervisor loop for a single agent.
-///
-/// - Waits for the initial `child` to exit or for a shutdown signal.
-/// - On exit: if the agent ran for at least `STABLE_AFTER`, reset the attempt
-///   counter (a long-lived process that dies once shouldn't exhaust the
-///   budget). Otherwise increment.
-/// - Applies `restart_backoff(attempt)` before respawning.
-/// - Gives up after `MAX_RESTART_ATTEMPTS` consecutive unstable failures and
-///   leaves `AgentState::Crashed` in place.
-#[allow(clippy::too_many_arguments)]
-async fn supervise_agent(
-    config: ResolvedAgentConfig,
-    env_vars: HashMap<String, String>,
-    agent_cwd: PathBuf,
-    log_dir: PathBuf,
-    initial_child: Child,
-    state: Arc<Mutex<AgentState>>,
-    shutdown: Arc<Notify>,
-    // `Some((broker, worker_id, role_prompt))` for managed agents that need
-    // the broker worker record + role prompt re-stored on every respawn
-    // (issue #43). `None` for unmanaged agents on the legacy path.
-    re_register: Option<(Arc<Mutex<super::local::BrokerState>>, String, String)>,
-) {
-    let mut child = initial_child;
-    let mut attempt: u32 = 0;
-    let mut started_at = Instant::now();
-
-    loop {
-        let pid = child.id().unwrap_or(0);
-        tokio::select! {
-            _ = shutdown.notified() => {
-                tracing::info!(agent = %config.name, pid, "shutdown requested");
-                kill_process_group(pid).await;
-                let _ = child.wait().await;
-                *state.lock().await = AgentState::Stopped;
-                return;
-            }
-            status = child.wait() => {
-                let ran_for = started_at.elapsed();
-                tracing::info!(
-                    agent = %config.name,
-                    ?status,
-                    ran_secs = ran_for.as_secs(),
-                    "agent exited",
-                );
-
-                if ran_for >= STABLE_AFTER {
-                    attempt = 1;
-                } else {
-                    attempt = attempt.saturating_add(1);
-                }
-
-                if attempt > MAX_RESTART_ATTEMPTS {
-                    let reason = match status {
-                        Ok(s) => format!("exited with {s}"),
-                        Err(e) => format!("wait error: {e}"),
-                    };
-                    tracing::warn!(
-                        agent = %config.name,
-                        attempts = attempt - 1,
-                        %reason,
-                        "restart budget exhausted; marking crashed",
-                    );
-                    *state.lock().await = AgentState::Crashed {
-                        reason,
-                        attempts: attempt - 1,
-                    };
-                    return;
-                }
-
-                let backoff = restart_backoff(attempt);
-                tracing::info!(
-                    agent = %config.name,
-                    attempt,
-                    backoff_secs = backoff.as_secs(),
-                    "restarting after backoff",
-                );
-                *state.lock().await = AgentState::Restarting {
-                    attempt,
-                    backoff_secs: backoff.as_secs(),
-                };
-
-                // Sleep with shutdown cancellation.
-                tokio::select! {
-                    _ = shutdown.notified() => {
-                        *state.lock().await = AgentState::Stopped;
-                        return;
-                    }
-                    _ = tokio::time::sleep(backoff) => {}
-                }
-
-                // Issue #43: refresh the broker's worker record + role
-                // prompt before the respawn so the agent's claim call can
-                // get its prompt back even if TTL expired during downtime.
-                // Three branches in `BrokerState::register_worker`:
-                // - Supervisor's worker still alive (TTL not expired):
-                //   idempotent-claim short-circuit matches name+role,
-                //   renews TTL, refreshes description (and capabilities
-                //   if non-empty). evict pass is BYPASSED — a same-name
-                //   worker with a different id from a racing manual
-                //   `dispatch register` would persist alongside us.
-                // - Supervisor's worker GC'd: idempotent-claim misses,
-                //   evict=true wipes any same-name worker with a
-                //   different id, then a fresh entry is created using
-                //   the supervisor's id.
-                // - worker_id collision (different name+role under our
-                //   id — essentially impossible with UUIDs but defended
-                //   against): register_worker returns Err, handled below
-                //   as terminal Crashed.
-                //
-                // Treat the Err case as terminal: if we can't restore
-                // the broker state, the respawned child will fail its
-                // `--for-agent` lookup and crash-loop until
-                // MAX_RESTART_ATTEMPTS with only a generic "exited with
-                // ..." reason. Surface the real cause immediately instead.
-                if let Some((broker, worker_id, role_prompt)) = &re_register {
-                    let register_result = {
-                        let mut b = broker.lock().await;
-                        b.register_worker(
-                            config.name.clone(),
-                            config.role.clone(),
-                            config.description.clone(),
-                            Vec::new(),
-                            config.ttl,
-                            true,
-                            Some(worker_id.clone()),
-                            Some(role_prompt.clone()),
-                        )
-                        // `b` drops here so `state.lock().await` below
-                        // doesn't pin the broker mutex across the await.
-                    };
-                    if let Err(err) = register_result {
-                        tracing::error!(
-                            agent = %config.name,
-                            %err,
-                            "restart re-register failed; marking agent crashed",
-                        );
-                        *state.lock().await = AgentState::Crashed {
-                            reason: format!("re-register failed: {err}"),
-                            attempts: attempt,
-                        };
-                        return;
-                    }
-                }
-
-                match spawn_child_process(&config, &env_vars, &agent_cwd, &log_dir).await {
-                    Ok(new_child) => {
-                        child = new_child;
-                        started_at = Instant::now();
-                        let new_pid = child.id().unwrap_or(0);
-                        *state.lock().await = AgentState::Running {
-                            pid: new_pid,
-                            started_at: super::local::now_secs(),
-                        };
-                    }
-                    Err(e) => {
-                        tracing::warn!(agent = %config.name, error = %e, "respawn failed");
-                        // Symmetric with the initial-spawn cleanup guard:
-                        // the re-register above restored the worker record,
-                        // but spawn_child_process failed (log dir gone,
-                        // prompt file deleted, binary missing, ...). Drop
-                        // the broker entry so it doesn't linger as a zombie
-                        // for a process that will never run.
-                        if let Some((broker, worker_id, _)) = &re_register {
-                            let mut b = broker.lock().await;
-                            b.remove_worker(worker_id);
-                        }
-                        *state.lock().await = AgentState::Crashed {
-                            reason: format!("respawn failed: {e}"),
-                            attempts: attempt,
-                        };
-                        return;
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Build an agent command string for the user to paste.
@@ -1075,6 +804,10 @@ pub fn build_agent_command(
         "DISPATCH_AGENT_ROLE={}",
         shell_escape(&config.role)
     ));
+    parts.push(format!(
+        "DISPATCH_AGENT_DESCRIPTION={}",
+        shell_escape(&config.description)
+    ));
 
     if let Some(url) = monitor_url {
         parts.push(format!("DISPATCH_MONITOR_URL={}", shell_escape(url)));
@@ -1082,6 +815,13 @@ pub fn build_agent_command(
 
     if let Some(id) = worker_id {
         parts.push(format!("DISPATCH_WORKER_ID={}", shell_escape(id)));
+    }
+
+    if let Some(timeout) = config.listen_timeout {
+        parts.push(format!(
+            "DISPATCH_LISTEN_TIMEOUT={}",
+            shell_escape(&timeout.to_string())
+        ));
     }
 
     let cmd_str = AgentOrchestrator::build_launch(config)
@@ -1144,609 +884,4 @@ pub(super) fn sanitize_name(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::adapter::Adapter;
-
-    /// Constructing `SpawnContext::env_vars(_, _, Some(id))` injects
-    /// `DISPATCH_WORKER_ID`; `None` omits the key entirely so legacy
-    /// register-yourself agents see exactly the previous environment.
-    #[test]
-    fn env_vars_includes_worker_id_when_some() {
-        let tmp = tempfile::tempdir().unwrap();
-        let orch = AgentOrchestrator::new(
-            "cell-x",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            None,
-        );
-        let ctx = orch.snapshot_spawn_context();
-
-        let with_id = ctx.env_vars("alice", "test-runner", Some("w-123"));
-        assert_eq!(
-            with_id.get("DISPATCH_WORKER_ID").map(String::as_str),
-            Some("w-123")
-        );
-        assert_eq!(
-            with_id.get("DISPATCH_AGENT_NAME").map(String::as_str),
-            Some("alice")
-        );
-        assert_eq!(
-            with_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
-            Some("test-runner")
-        );
-
-        let without_id = ctx.env_vars("alice", "test-runner", None);
-        assert!(!without_id.contains_key("DISPATCH_WORKER_ID"));
-        // The other vars must match exactly so the legacy code path is bit-for-bit unchanged.
-        assert_eq!(
-            without_id.get("DISPATCH_AGENT_NAME").map(String::as_str),
-            Some("alice")
-        );
-        assert_eq!(
-            without_id.get("DISPATCH_AGENT_ROLE").map(String::as_str),
-            Some("test-runner")
-        );
-    }
-
-    /// `DISPATCH_CONFIG_PATH` is injected when the orchestrator carries a
-    /// config file path, so child `dispatch` calls from any cwd in the
-    /// agent tree resolve the same config.
-    #[test]
-    fn env_vars_includes_config_path_when_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        let orch = AgentOrchestrator::new(
-            "cell-x",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            Some(config_path.clone()),
-        );
-        let ctx = orch.snapshot_spawn_context();
-
-        let vars = ctx.env_vars("alice", "test-runner", None);
-        assert_eq!(
-            vars.get("DISPATCH_CONFIG_PATH").map(String::as_str),
-            Some(config_path.display().to_string().as_str())
-        );
-    }
-
-    /// When the orchestrator has no config file path (e.g. serve launched
-    /// outside a project), no `DISPATCH_CONFIG_PATH` env var is emitted
-    /// — regression guard for configs that don't opt into the feature.
-    #[test]
-    fn env_vars_absent_when_config_path_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let orch = AgentOrchestrator::new(
-            "cell-x",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            None,
-        );
-        let ctx = orch.snapshot_spawn_context();
-
-        let vars = ctx.env_vars("alice", "test-runner", None);
-        assert!(!vars.contains_key("DISPATCH_CONFIG_PATH"));
-    }
-
-    /// Exponential doubling capped at 30s — table-driven so the intent is
-    /// obvious if anyone tunes the backoff schedule later.
-    #[test]
-    fn restart_backoff_schedule() {
-        let cases = [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 30), (10, 30)];
-        for (attempt, expected) in cases {
-            assert_eq!(
-                restart_backoff(attempt).as_secs(),
-                expected,
-                "attempt {attempt} should back off {expected}s",
-            );
-        }
-    }
-
-    /// Build a ResolvedAgentConfig that runs a short sh command under the
-    /// `command` adapter — avoids needing `claude`/`codex` binaries on the
-    /// test host.
-    fn test_config(name: &str, command: &str) -> ResolvedAgentConfig {
-        ResolvedAgentConfig {
-            name: name.into(),
-            role: "test".into(),
-            description: "".into(),
-            adapter: Adapter::Command,
-            command: Some(command.into()),
-            extra_args: Vec::new(),
-            prompt: None,
-            prompt_file_path: None,
-            ttl: None,
-            stream_json: false,
-            interactive: false,
-            launch: true,
-        }
-    }
-
-    /// Helper: build a managed test config (launch=true, with prompt_file)
-    /// that exercises the issue-#43 pre-register flow. Uses the `command`
-    /// adapter so we don't need `claude` on the test host — the prompt file
-    /// is created but ignored by the adapter; what we're testing is whether
-    /// the orchestrator correctly pre-registers the worker server-side.
-    fn managed_test_config(name: &str, command: &str, prompt_path: PathBuf) -> ResolvedAgentConfig {
-        ResolvedAgentConfig {
-            name: name.into(),
-            role: "test-runner".into(),
-            description: "managed test agent".into(),
-            adapter: Adapter::Command,
-            command: Some(command.into()),
-            extra_args: Vec::new(),
-            prompt: None,
-            prompt_file_path: Some(prompt_path),
-            ttl: None,
-            stream_json: false,
-            interactive: false,
-            launch: true,
-        }
-    }
-
-    /// Issue #43: spawning a managed agent (launch=true with prompt_file)
-    /// pre-registers the worker server-side BEFORE the child starts, with
-    /// the prompt body stored under the assigned worker id.
-    #[tokio::test]
-    async fn spawn_managed_agent_pre_registers_with_prompt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let prompt_path = tmp.path().join("alice.md");
-        let prompt_body = "Run: dispatch listen --timeout 270\nRole context here.";
-        tokio::fs::write(&prompt_path, prompt_body).await.unwrap();
-
-        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::clone(&broker),
-            None,
-        );
-        let cfg = managed_test_config("alice", "sleep 30", prompt_path);
-        orch.spawn_agent(&cfg).await.expect("spawn");
-
-        // Worker is in the broker right away — the agent's later claim
-        // call will idempotently match it without inventing an id.
-        let b = broker.lock().await;
-        assert_eq!(b.workers.len(), 1, "pre-register must create the worker");
-        let (id, worker) = b.workers.iter().next().unwrap();
-        assert_eq!(worker.name, "alice");
-        assert_eq!(worker.role, "test-runner");
-        assert_eq!(
-            b.role_prompts.get(id).map(String::as_str),
-            Some(prompt_body),
-            "role prompt must be stored under the worker id",
-        );
-
-        drop(b);
-        orch.shutdown_all().await;
-    }
-
-    /// Issue #43: launch=false agents stay on the legacy register-yourself
-    /// path. No worker shows up in the broker after `spawn_agent`.
-    #[tokio::test]
-    async fn spawn_unmanaged_agent_does_not_pre_register() {
-        let tmp = tempfile::tempdir().unwrap();
-        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::clone(&broker),
-            None,
-        );
-        let mut cfg = test_config("bob", "sleep 30");
-        cfg.launch = false; // explicitly unmanaged
-        orch.spawn_agent(&cfg).await.expect("spawn");
-
-        let b = broker.lock().await;
-        assert!(
-            b.workers.is_empty(),
-            "unmanaged agents must not be pre-registered: {:?}",
-            b.workers,
-        );
-        drop(b);
-        orch.shutdown_all().await;
-    }
-
-    /// Issue #43: a missing prompt file fails the spawn and leaves NO
-    /// orphan worker in the broker. The read_to_string `?` returns before
-    /// `register_worker` is reached, so nothing is ever created — the
-    /// early return (not the cleanup guard) is what prevents the orphan.
-    #[tokio::test]
-    async fn spawn_managed_agent_missing_prompt_file_leaves_no_orphan() {
-        let tmp = tempfile::tempdir().unwrap();
-        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::clone(&broker),
-            None,
-        );
-        let cfg = managed_test_config("alice", "sleep 30", tmp.path().join("does-not-exist.md"));
-        let err = orch.spawn_agent(&cfg).await.expect_err("must fail");
-        assert!(
-            matches!(err, DispatchError::PromptFileNotFound { .. }),
-            "expected PromptFileNotFound, got: {err:?}",
-        );
-        let b = broker.lock().await;
-        assert!(
-            b.workers.is_empty(),
-            "failed pre-register must not leave an orphan worker",
-        );
-    }
-
-    /// Issue #43: when `spawn_child_process` fails AFTER the pre-register
-    /// succeeds, the cleanup guard must remove the worker record, role
-    /// prompt, mailbox, and notifier so no zombie state survives in the
-    /// broker. We trigger a spawn failure by pointing `agent_cwd` at a
-    /// path that doesn't exist — `Command::current_dir` errors with ENOENT
-    /// when the spawn syscall tries to chdir.
-    #[tokio::test]
-    async fn spawn_managed_agent_spawn_failure_triggers_cleanup_guard() {
-        let tmp = tempfile::tempdir().unwrap();
-        let prompt_path = tmp.path().join("alice.md");
-        tokio::fs::write(&prompt_path, "role prompt body")
-            .await
-            .unwrap();
-
-        let bad_cwd = tmp.path().join("does-not-exist-cwd");
-        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            &bad_cwd,
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::clone(&broker),
-            None,
-        );
-
-        // Force `spawn_agent` to fail and verify the broker is left with no
-        // residual state. This covers cleanup of any entries created during
-        // the failed spawn attempt across `workers`, `role_prompts`,
-        // `mailboxes`, and `notifiers`.
-        let cfg = managed_test_config("alice", "true", prompt_path);
-        let err = orch.spawn_agent(&cfg).await.expect_err("must fail");
-        assert!(
-            matches!(err, DispatchError::AgentLaunchFailed { .. }),
-            "expected AgentLaunchFailed, got: {err:?}",
-        );
-
-        let b = broker.lock().await;
-        assert!(
-            b.workers.is_empty(),
-            "spawn failure must not leave an orphan worker: {:?}",
-            b.workers,
-        );
-        assert!(
-            b.role_prompts.is_empty(),
-            "spawn failure must not leave an orphan role prompt: {:?}",
-            b.role_prompts,
-        );
-        assert!(
-            b.mailboxes.is_empty(),
-            "spawn failure must not leave an orphan mailbox",
-        );
-        assert!(
-            b.notifiers.is_empty(),
-            "spawn failure must not leave an orphan notifier",
-        );
-    }
-
-    /// Issue #45: `pre_register_unmanaged` mirrors the managed-agent
-    /// pre-register flow without spawning. The unmanaged serve-time banner
-    /// calls this so the printed copy-paste command can include a
-    /// `DISPATCH_WORKER_ID` that the agent's first
-    /// `dispatch register --for-agent` call can idempotently claim.
-    #[tokio::test]
-    async fn pre_register_unmanaged_stores_worker_and_role_prompt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let prompt_path = tmp.path().join("coord.md");
-        let prompt_body = "Run: dispatch listen --timeout 270\nCoordinator instructions.";
-        tokio::fs::write(&prompt_path, prompt_body).await.unwrap();
-
-        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
-        let orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::clone(&broker),
-            None,
-        );
-        let mut cfg = managed_test_config("coordinator", "true", prompt_path);
-        cfg.launch = false;
-
-        let ctx = orch.snapshot_spawn_context();
-        let (worker_id, boot_path) = pre_register_unmanaged(&ctx, &cfg)
-            .await
-            .expect("pre_register_unmanaged must succeed");
-
-        let b = broker.lock().await;
-        assert_eq!(b.workers.len(), 1);
-        let worker = b
-            .workers
-            .get(&worker_id)
-            .expect("worker must be stored under returned id");
-        assert_eq!(worker.name, "coordinator");
-        assert_eq!(worker.role, "test-runner");
-        assert_eq!(
-            b.role_prompts.get(&worker_id).map(String::as_str),
-            Some(prompt_body),
-        );
-        assert!(
-            boot_path.exists(),
-            "boot prompt file must be written: {}",
-            boot_path.display()
-        );
-    }
-
-    /// Issue #45: `pre_register_unmanaged` refuses a config without a
-    /// `prompt_file_path` — the caller should only reach this path for
-    /// unmanaged agents that actually need the boot-prompt bootstrap.
-    #[tokio::test]
-    async fn pre_register_unmanaged_rejects_config_without_prompt_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let broker = Arc::new(Mutex::new(super::super::local::BrokerState::new()));
-        let orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::clone(&broker),
-            None,
-        );
-        let mut cfg = test_config("bare", "true");
-        cfg.launch = false;
-
-        let ctx = orch.snapshot_spawn_context();
-        let err = pre_register_unmanaged(&ctx, &cfg)
-            .await
-            .expect_err("must fail without prompt_file_path");
-        assert!(
-            matches!(err, DispatchError::AgentLaunchFailed { .. }),
-            "expected AgentLaunchFailed, got: {err:?}",
-        );
-        assert!(
-            broker.lock().await.workers.is_empty(),
-            "failed pre-register must not leave a worker behind",
-        );
-    }
-
-    /// Issue #45: `build_agent_command` emits `DISPATCH_WORKER_ID=<id>`
-    /// only when the id is supplied — the legacy bare-register path
-    /// (no prompt_file → no pre-register) keeps its previous output.
-    #[test]
-    fn build_agent_command_includes_worker_id_when_some() {
-        let cfg = test_config("alice", "echo hi");
-        let with_id = build_agent_command(&cfg, "cell-x", None, Some("w-123"), None);
-        // shell_escape wraps the value in single quotes; assert on the
-        // escaped form we'll actually see in the printed banner.
-        assert!(
-            with_id.contains("DISPATCH_WORKER_ID='w-123'"),
-            "expected worker id in: {with_id}",
-        );
-
-        let without_id = build_agent_command(&cfg, "cell-x", None, None, None);
-        assert!(
-            !without_id.contains("DISPATCH_WORKER_ID"),
-            "legacy path must not emit worker id: {without_id}",
-        );
-    }
-
-    /// `build_agent_command` emits `DISPATCH_CONFIG_PATH=<shell-escaped>`
-    /// when a path is supplied, right alongside `DISPATCH_CELL_ID` so the
-    /// printed banner lets the pasted command resolve the same config from
-    /// any cwd. Unset → omitted, byte-identical to the previous banner.
-    #[test]
-    fn build_agent_command_includes_config_path_when_some() {
-        let cfg = test_config("alice", "echo hi");
-        let cfg_path = std::path::PathBuf::from("/tmp/ex/dispatch.config.toml");
-        let with_path = build_agent_command(&cfg, "cell-x", None, None, Some(cfg_path.as_path()));
-        assert!(
-            with_path.contains("DISPATCH_CONFIG_PATH='/tmp/ex/dispatch.config.toml'"),
-            "expected config path in: {with_path}"
-        );
-
-        let without = build_agent_command(&cfg, "cell-x", None, None, None);
-        assert!(
-            !without.contains("DISPATCH_CONFIG_PATH"),
-            "unset path must not appear: {without}"
-        );
-    }
-
-    /// `start_by_name` must release the `starting` reservation when
-    /// `build_pending_agent` fails — otherwise a bad prompt_file (or any
-    /// other build error) permanently blocks the name from ever being
-    /// started. Uses a managed config pointing at a nonexistent prompt
-    /// file to force `build_pending_agent` to error after the reservation
-    /// is claimed.
-    #[tokio::test]
-    async fn start_by_name_releases_reservation_on_build_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bad_cfg = managed_test_config("alice", "true", tmp.path().join("nope.md"));
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            vec![bad_cfg],
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            None,
-        );
-
-        // Build fails because the prompt file doesn't exist.
-        let err = orch.start_by_name("alice").await.expect_err("must fail");
-        assert!(
-            matches!(err, DispatchError::PromptFileNotFound { .. }),
-            "expected PromptFileNotFound, got: {err:?}",
-        );
-
-        // Reservation must have been released — a fresh `check_can_start`
-        // for the same name succeeds rather than hitting "already starting".
-        orch.check_can_start("alice")
-            .expect("reservation must be released after build failure");
-    }
-
-    /// `check_can_start` reserves the agent name in `starting` so a
-    /// concurrent caller in the unlocked-spawn pattern can't pass phase
-    /// 1 for the same name. `register_pending` and `cancel_start` both
-    /// release the reservation. Without this, two parallel
-    /// `BrokerRequest::AgentStart` calls would race past `check_can_start`
-    /// and push duplicate `ManagedAgent` entries.
-    #[tokio::test]
-    async fn check_can_start_reserves_name_until_register_or_cancel() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = test_config("alice", "sleep 30");
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            vec![cfg.clone()],
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            None,
-        );
-
-        // First reservation succeeds.
-        orch.check_can_start("alice").expect("first reservation");
-
-        // Second reservation while the first is still pending must fail
-        // with "already starting" — this is the race-defense that makes
-        // the 3-phase pattern safe.
-        let err = orch
-            .check_can_start("alice")
-            .expect_err("second reservation must be rejected");
-        match err {
-            DispatchError::AgentLaunchFailed { name, reason } => {
-                assert_eq!(name, "alice");
-                assert!(
-                    reason.contains("already starting"),
-                    "expected 'already starting' rejection, got: {reason}"
-                );
-            }
-            other => panic!("expected AgentLaunchFailed, got: {other:?}"),
-        }
-
-        // cancel_start releases the slot — a fresh check_can_start succeeds.
-        orch.cancel_start("alice");
-        orch.check_can_start("alice")
-            .expect("post-cancel reservation");
-
-        // Now exercise the success path via a real spawn. spawn_agent is
-        // tolerant of the lingering reservation (register_pending removes
-        // it) so the agent ends up in `agents` with no leftover slot.
-        orch.spawn_agent(&cfg).await.expect("spawn");
-        // After register_pending, "alice" is in agents and NOT in starting.
-        // Starting a fresh "alice" now hits the "already running" guard,
-        // not "already starting".
-        let err = orch.check_can_start("alice").expect_err("alice is running");
-        match err {
-            DispatchError::AgentLaunchFailed { reason, .. } => {
-                assert!(
-                    reason.contains("already running"),
-                    "expected 'already running', got: {reason}"
-                );
-            }
-            other => panic!("expected AgentLaunchFailed, got: {other:?}"),
-        }
-        orch.shutdown_all().await;
-    }
-
-    /// Supervisor reports Running while a long-lived child is alive, and
-    /// transitions to Stopped after `stop_by_name`.
-    #[tokio::test]
-    async fn supervisor_running_then_stopped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            None,
-        );
-        let cfg = test_config("alice", "sleep 30");
-        orch.spawn_agent(&cfg).await.expect("spawn");
-        // Let the supervisor publish its Running state.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let states = orch.list_state().await;
-        assert_eq!(states.len(), 1);
-        assert!(matches!(states[0].2, AgentState::Running { .. }));
-
-        assert!(orch.stop_by_name("alice").await);
-        assert!(orch.list_state().await.is_empty());
-    }
-
-    /// When the child exits quickly, the supervisor moves through
-    /// Running → Restarting (attempt=1) before the first-backoff sleep
-    /// completes. We probe at 300ms — well after exit, well before the 1s
-    /// backoff elapses.
-    #[tokio::test]
-    async fn supervisor_transitions_to_restarting_after_quick_exit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut orch = AgentOrchestrator::new(
-            "test-cell",
-            &tmp.path().join("broker.sock"),
-            None,
-            tmp.path(),
-            tmp.path().join("logs"),
-            Vec::new(),
-            Arc::new(Mutex::new(super::super::local::BrokerState::new())),
-            None,
-        );
-        let cfg = test_config("flaky", "exit 1");
-        orch.spawn_agent(&cfg).await.expect("spawn");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let states = orch.list_state().await;
-        assert_eq!(states.len(), 1);
-        assert!(
-            matches!(
-                states[0].2,
-                AgentState::Restarting {
-                    attempt: 1,
-                    backoff_secs: 1
-                } | AgentState::Running { .. }
-            ),
-            "unexpected state: {:?}",
-            states[0].2
-        );
-
-        // Shutdown should cancel the backoff sleep cleanly.
-        orch.shutdown_all().await;
-        assert!(orch.list_state().await.is_empty());
-    }
-}
+mod tests;

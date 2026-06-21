@@ -46,7 +46,7 @@ pub enum BrokerRequest {
         /// If true, evict any existing worker with the same name.
         #[serde(default)]
         evict: bool,
-        /// Pre-assigned worker id from the orchestrator (issue #43). When set,
+        /// Pre-assigned worker id from the orchestrator. When set,
         /// the broker uses this id instead of generating a UUID. If a worker
         /// with this id already exists and matches the supplied name+role,
         /// the call is treated as an idempotent claim — useful when dispatch
@@ -54,7 +54,7 @@ pub enum BrokerRequest {
         /// re-issues `dispatch register` to fetch its prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_id: Option<String>,
-        /// Role prompt body to associate with this worker (issue #43). Only
+        /// Role prompt body to associate with this worker. Only
         /// the orchestrator sets this — at pre-register time it loads the
         /// agent's `prompt_file` and ships the content here so the spawned
         /// agent can fetch it back as the response body of its own
@@ -84,12 +84,26 @@ pub enum BrokerRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    /// Acknowledge receipt of a message.
+    /// Acknowledge receipt of a message. `dispatch result` rides the same
+    /// request as a "super-ack": when `status` is present the broker
+    /// records a completion (status + optional summary + artifacts) in the same
+    /// `ack_log` and emits a `result` event instead of a plain `ack`. All three
+    /// completion fields are additive and omitted on the wire for a plain `ack`.
     Ack {
         worker_id: String,
         message_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Completion status: `done` | `failed` | `blocked`. `Some` marks this
+        /// as a `result` rather than a plain ack.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Optional free-text completion summary.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// Optional artifact paths/URLs produced by the task.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<String>,
     },
     /// Query event history.
     Events {
@@ -124,6 +138,13 @@ pub enum BrokerRequest {
         worker_id: Option<String>,
         #[serde(default)]
         clear: bool,
+        /// Marks the purpose of this query so the broker can record a traceable
+        /// event. The stop hook sets `Some("stop_hook")` so its
+        /// block/allow decision is logged as a `stop_decision` event; ordinary
+        /// status queries leave it `None` (no event). Additive — keeps the hook
+        /// on the existing `Status` request rather than a new wire variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe: Option<String>,
     },
     /// Start a configured agent by name.
     AgentStart { name: String },
@@ -154,6 +175,11 @@ pub struct WorkerStatus {
     pub last_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_status_at: Option<u64>,
+    /// Coordinator-controlled lifecycle state (see [`ControlState`]). Additive
+    /// field — lets the stop hook and `listen` renderer read worker state via
+    /// a `Status` query without introducing a new wire variant.
+    #[serde(default)]
+    pub control_state: ControlState,
 }
 
 /// A response sent from the broker back to the client.
@@ -167,6 +193,21 @@ pub enum BrokerResponse {
     },
     /// Error response.
     Error { message: String },
+}
+
+/// Coordinator-controlled lifecycle state of a worker, tracked independently
+/// of its TTL/`expires_at`. "Supposed to be alive" == `Active`. `Stopping` is
+/// a tombstone: after `agent stop`, the record lingers for the broker's drain
+/// window so late stop-hook calls still resolve deterministically, then it is
+/// finalized (`Stopped`/removed). Defaults to `Active` so payloads from older
+/// brokers (no field) decode unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlState {
+    #[default]
+    Active,
+    Stopping,
+    Stopped,
 }
 
 /// A registered worker in the broker.
@@ -198,7 +239,7 @@ pub struct Worker {
     /// True once the worker has been "claimed" by an actual process:
     /// either the agent ran `dispatch register` with the supplied id
     /// (idempotent-claim path), sent a heartbeat, or reported a status.
-    /// False for freshly-inserted records — including the issue-#43
+    /// False for freshly-inserted records — including the
     /// pre-register path where the orchestrator creates the worker
     /// server-side before the agent starts. The monitor uses this to
     /// distinguish "reserved, waiting for the agent to attach" from
@@ -206,6 +247,16 @@ pub struct Worker {
     /// older brokers (no field present) decode as `false`.
     #[serde(default)]
     pub claimed: bool,
+    /// Coordinator-controlled lifecycle state, independent of TTL. See
+    /// [`ControlState`]. `#[serde(default)]` so responses from older brokers
+    /// (no field) decode as `Active`.
+    #[serde(default)]
+    pub control_state: ControlState,
+    /// Unix timestamp when the worker entered `Stopping`; used to measure the
+    /// drain window. `None` unless currently stopping. Skipped when absent so
+    /// the wire shape is unchanged for active workers and older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopping_since: Option<u64>,
 }
 
 /// The payload inside a successful response, varies by request type.
@@ -239,7 +290,7 @@ pub enum ResponsePayload {
     /// in this serde version, hence the wrapper struct.)
     Timeout(TimeoutPayload),
     /// A worker was registered; returns the assigned worker ID. When the
-    /// broker has a role prompt stored for this worker (issue #43), it is
+    /// broker has a role prompt stored for this worker, it is
     /// returned here so the spawned agent receives its first instructions
     /// as the response body of its own `dispatch register` call. The
     /// `role_prompt` field is always serialized (even when `None`) so the
@@ -290,7 +341,7 @@ mod tests {
                 worker_id: None,
                 role_prompt: None,
             },
-            // Pre-assigned worker_id + role_prompt (issue #43) must round-trip cleanly.
+            // Pre-assigned worker_id + role_prompt must round-trip cleanly.
             BrokerRequest::Register {
                 name: "w1".into(),
                 role: "builder".into(),
@@ -319,6 +370,18 @@ mod tests {
                 worker_id: "w1".into(),
                 message_id: "m1".into(),
                 note: Some("starting impl".into()),
+                status: None,
+                summary: None,
+                artifacts: vec![],
+            },
+            // `result` super-ack shape: status + summary + artifacts.
+            BrokerRequest::Ack {
+                worker_id: "w1".into(),
+                message_id: "m2".into(),
+                note: None,
+                status: Some("done".into()),
+                summary: Some("shipped".into()),
+                artifacts: vec!["out/report.md".into()],
             },
             BrokerRequest::Events {
                 since: Some(100),
@@ -338,6 +401,7 @@ mod tests {
             BrokerRequest::Status {
                 worker_id: Some("w1".into()),
                 clear: false,
+                probe: None,
             },
             BrokerRequest::AgentStart {
                 name: "reviewer".into(),
@@ -390,6 +454,8 @@ mod tests {
                     last_status_at: None,
                     status_history: VecDeque::new(),
                     claimed: false,
+                    control_state: ControlState::Active,
+                    stopping_since: None,
                 }],
             },
             ResponsePayload::HeartbeatAck {
@@ -449,6 +515,8 @@ mod tests {
             last_status_at: Some(110),
             status_history: history.clone(),
             claimed: true,
+            control_state: ControlState::Active,
+            stopping_since: None,
         };
         let json = serde_json::to_string(&worker).unwrap();
         assert!(json.contains("status_history"));
@@ -464,6 +532,39 @@ mod tests {
         assert!(!json.contains("status_history"));
         let back: Worker = serde_json::from_str(&json).unwrap();
         assert!(back.status_history.is_empty());
+    }
+
+    /// `control_state` defaults to `Active` when absent from the wire (older
+    /// brokers) and round-trips through JSON. `stopping_since` is omitted while
+    /// `None`, so the active-worker wire shape is unchanged.
+    #[test]
+    fn worker_control_state_defaults_and_round_trips() {
+        // A payload from an older broker (no control_state / stopping_since)
+        // decodes as Active with no stop clock — rolling-upgrade safe.
+        let legacy = r#"{"id":"w1","name":"n","role":"r","description":"d","capabilities":[],"ttl_secs":300,"expires_at":1000}"#;
+        let w: Worker = serde_json::from_str(legacy).unwrap();
+        assert_eq!(w.control_state, ControlState::Active);
+        assert!(w.stopping_since.is_none());
+
+        // An active worker serializes control_state but omits stopping_since.
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(json.contains("\"control_state\":\"active\""));
+        assert!(
+            !json.contains("stopping_since"),
+            "active worker must omit stopping_since: {json}"
+        );
+
+        // A stopping worker carries both and round-trips faithfully.
+        let stopping = Worker {
+            control_state: ControlState::Stopping,
+            stopping_since: Some(42),
+            ..w
+        };
+        let json = serde_json::to_string(&stopping).unwrap();
+        assert!(json.contains("\"control_state\":\"stopping\""));
+        let back: Worker = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.control_state, ControlState::Stopping);
+        assert_eq!(back.stopping_since, Some(42));
     }
 
     /// Regression: `AckConfirm` is structurally a superset of `MessageAck`.

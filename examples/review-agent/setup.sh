@@ -22,7 +22,7 @@ command -v jq >/dev/null 2>&1 || die "jq not found — install with: brew instal
 # --- Resolve paths ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXAMPLES_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMMS="$EXAMPLES_DIR/dispatch-comms.md"
+SKILL="$(cd "$EXAMPLES_DIR/.." && pwd)/skills/dispatch/SKILL.md"
 WRITER="$SCRIPT_DIR/writer.prompt.md"
 REVIEWER="$SCRIPT_DIR/reviewer.prompt.md"
 
@@ -57,11 +57,11 @@ echo "Broker ready (pid $BROKER_PID)."
 # --- Build tmux layout ---
 # Create session with reviewer
 tmux new-session -d -s "$SESSION" -n "main" -c "$SCRIPT_DIR" \
-  "claude \"Read the file $COMMS for how dispatch communication works. Then read $REVIEWER and follow its instructions. Start by registering yourself and listening for review requests.\""
+  "claude \"Read the file $SKILL (the dispatch skill) for how dispatch communication works. Then read $REVIEWER and follow its instructions. Start by registering yourself and listening for review requests.\""
 
 # Split right: writer (user interacts here)
 tmux split-window -h -t "$SESSION" -c "$SCRIPT_DIR" \
-  "claude \"Read the file $COMMS for how dispatch communication works. Then read $WRITER and follow its instructions. Start by asking me what the PRD should be about.\""
+  "claude \"Read the file $SKILL (the dispatch skill) for how dispatch communication works. Then read $WRITER and follow its instructions. Start by asking me what the PRD should be about.\""
 
 # Focus on the writer pane (right) since the user interacts there
 tmux select-pane -t "$SESSION:0.1"

@@ -30,7 +30,7 @@
   .sidebar .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
   .sidebar .nav-item .dot.live { background: #3fb950; }
   /* `reserved` = orchestrator has pre-registered the worker server-side
-     (issue #43 bootstrap) but no agent process has claimed it yet. Amber
+     (the pre-register bootstrap) but no agent process has claimed it yet. Amber
      pulse disambiguates it from the dim-gray `pending` ("nothing there
      at all") and the solid green `live` ("attached and heartbeating"). */
   .sidebar .nav-item .dot.reserved { background: #d29922; animation: pulse 2s ease-in-out infinite; }
@@ -772,7 +772,7 @@ function renderAgentDetail() {
 
   // Status badge — "Registered" means an agent process has actually
   // claimed the slot (register-with-worker-id or heartbeat). A worker
-  // record exists pre-claim too (issue #43 pre-register flow), shown as
+  // record exists pre-claim too (the pre-register flow), shown as
   // "Reserved" so it's obvious the agent hasn't attached yet.
   let statusClass, statusLabel;
   if (!worker) {

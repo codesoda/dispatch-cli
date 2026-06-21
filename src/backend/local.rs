@@ -1,10 +1,7 @@
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -12,55 +9,24 @@ use tokio::sync::{Mutex, Notify};
 use tracing::instrument;
 
 use crate::errors::DispatchError;
-use crate::protocol::{
-    BrokerRequest, BrokerResponse, Message, ResponsePayload, StatusEntry, Worker,
-    STATUS_HISTORY_MAX,
+use crate::protocol::{BrokerRequest, BrokerResponse, ControlState, Message, ResponsePayload};
+
+mod control;
+mod socket;
+mod state;
+
+use control::{mark_worker_stopping, resolve_agent_target, resolve_stop_target};
+use socket::check_no_existing_broker;
+pub use socket::socket_path;
+pub use state::{
+    body_fingerprint, now_secs, AckRecord, BrokerError, BrokerEvent, BrokerState, EvictReason,
+    DEFAULT_STOPPING_DRAIN_SECS,
 };
 
-/// Errors returned by `BrokerState` mutations. Distinct from `DispatchError`
-/// because the broker is process-internal — these are translated at the IPC
-/// boundary into `BrokerResponse::Error { message }` (whose `message` is
-/// this enum's `Display`) and at the orchestrator boundary into
-/// `DispatchError::AgentLaunchFailed`. Keeping them typed lets call sites
-/// match on the variant (e.g. distinguish a collision from a future "not
-/// found" or "quota exceeded") instead of string-matching on `format!` output.
-#[derive(Debug, Error)]
-pub enum BrokerError {
-    #[error(
-        "worker_id {supplied} already registered as {existing_name}/{existing_role} -- supplied {requested_name}/{requested_role} does not match"
-    )]
-    WorkerIdCollision {
-        supplied: String,
-        existing_name: String,
-        existing_role: String,
-        requested_name: String,
-        requested_role: String,
-    },
-}
-
-/// Default worker TTL in seconds (1 hour).
-const DEFAULT_WORKER_TTL_SECS: u64 = 3600;
-
-/// Default listen timeout in seconds.
-const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 30;
-
-/// Default maximum number of events retained in history.
-const DEFAULT_EVENT_HISTORY_MAX: usize = 10_000;
-
-/// Event emitted by the broker for the monitor dashboard.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct BrokerEvent {
-    pub kind: String,
-    pub worker_id: String,
-    /// Human-readable worker name (for display in UI).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_name: Option<String>,
-    pub detail: String,
-    /// Full structured payload for the event (shown in web UI and console).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
-    pub timestamp: u64,
-}
+/// Default listen timeout in seconds. Single source of truth shared with the
+/// CLI (`main.rs` resolves `--timeout` flag > `$DISPATCH_LISTEN_TIMEOUT` env >
+/// this default) and the broker's own 0-means-default fallback below.
+pub const DEFAULT_LISTEN_TIMEOUT_SECS: u64 = 270;
 
 /// Local backend that uses a Unix domain socket for IPC.
 ///
@@ -138,644 +104,6 @@ impl super::Backend for LocalBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Broker state
-// ---------------------------------------------------------------------------
-
-/// Record of a message acknowledgement.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AckRecord {
-    pub message_id: String,
-    pub worker_id: String,
-    pub note: Option<String>,
-    pub acked_at: u64,
-}
-
-/// In-memory broker state.
-#[derive(Debug)]
-pub struct BrokerState {
-    /// Registered workers keyed by worker ID.
-    pub workers: HashMap<String, Worker>,
-    /// Per-worker message mailboxes keyed by worker ID.
-    pub mailboxes: HashMap<String, VecDeque<Message>>,
-    /// Per-worker notification channels for long-poll wakeup.
-    pub notifiers: HashMap<String, Arc<Notify>>,
-    /// Message acknowledgement log keyed by message ID.
-    pub ack_log: HashMap<String, AckRecord>,
-    /// Bounded event history for queries.
-    pub event_history: VecDeque<BrokerEvent>,
-    /// Maximum number of events to retain.
-    pub event_history_max: usize,
-    /// Bounded message history for queries (non-destructive inspection).
-    pub message_history: VecDeque<Message>,
-    /// Maximum number of messages to retain in history.
-    pub message_history_max: usize,
-    /// Default TTL for workers that don't specify one.
-    pub default_ttl: u64,
-    /// Total number of messages sent through the broker.
-    pub messages_sent: u64,
-    /// Total number of messages delivered to listeners.
-    pub messages_delivered: u64,
-    /// Total number of requests handled.
-    pub requests_handled: u64,
-    /// Per-worker role-prompt body keyed by worker ID (issue #43). Populated
-    /// at orchestrator pre-register time; returned in the `WorkerRegistered`
-    /// response when the spawned agent calls `dispatch register` to claim
-    /// its session. Absent for workers registered the legacy way.
-    pub role_prompts: HashMap<String, String>,
-}
-
-impl Default for BrokerState {
-    fn default() -> Self {
-        Self::with_default_ttl(DEFAULT_WORKER_TTL_SECS)
-    }
-}
-
-impl BrokerState {
-    pub fn new() -> Self {
-        Self::with_default_ttl(DEFAULT_WORKER_TTL_SECS)
-    }
-
-    pub fn with_default_ttl(default_ttl: u64) -> Self {
-        Self {
-            workers: HashMap::new(),
-            mailboxes: HashMap::new(),
-            notifiers: HashMap::new(),
-            ack_log: HashMap::new(),
-            event_history: VecDeque::new(),
-            event_history_max: DEFAULT_EVENT_HISTORY_MAX,
-            message_history: VecDeque::new(),
-            message_history_max: DEFAULT_EVENT_HISTORY_MAX,
-            default_ttl,
-            messages_sent: 0,
-            messages_delivered: 0,
-            requests_handled: 0,
-            role_prompts: HashMap::new(),
-        }
-    }
-
-    /// Register a new worker and return its unique ID.
-    ///
-    /// If `evict` is true and a worker with the same name already exists, the
-    /// old registration is removed (including its mailbox and notifier) before
-    /// the new one is created.
-    ///
-    /// If `worker_id` is `Some(id)` (issue #43 pre-register flow):
-    /// - When the id already exists with the same name+role, this is treated
-    ///   as an idempotent claim — the existing id is returned and TTL is
-    ///   renewed. This lets dispatch pre-register a worker server-side and
-    ///   the spawned agent then call `dispatch register` to fetch its prompt
-    ///   without creating a duplicate worker record.
-    /// - When the id already exists with a different name or role, the call
-    ///   is rejected with an error (config drift / collision).
-    /// - Otherwise, the supplied id is used verbatim.
-    ///
-    /// If `worker_id` is `None`, a fresh UUID is generated (legacy behavior).
-    ///
-    /// `role_prompt` (issue #43) is the agent's role prompt body. Only the
-    /// orchestrator passes it — at pre-register time it loads the agent's
-    /// prompt file and ships the content here. The broker stores it under
-    /// the worker id so the spawned agent can fetch it back via the
-    /// `WorkerRegistered` response of its own `dispatch register` claim.
-    /// Agents themselves never pass `role_prompt`, so the claim path leaves
-    /// the stored value untouched when `role_prompt` is `None`.
-    // Splitting these into a struct buys nothing — every caller passes them
-    // positionally and clippy's 7-arg threshold is an arbitrary heuristic.
-    #[allow(clippy::too_many_arguments)]
-    pub fn register_worker(
-        &mut self,
-        name: String,
-        role: String,
-        description: String,
-        capabilities: Vec<String>,
-        ttl_secs: Option<u64>,
-        evict: bool,
-        worker_id: Option<String>,
-        role_prompt: Option<String>,
-    ) -> Result<String, BrokerError> {
-        // Prune expired workers up front — every other broker entry point
-        // (`list_workers`, `heartbeat_worker`, message / team / mailbox
-        // handlers) does this, and skipping it here opens a race where the
-        // issue-#43 pre-register path stores a role_prompt, the pre-registered
-        // worker's TTL elapses before the agent claims, another broker
-        // request (e.g. `listen`) drops it via its own `evict_expired` AND
-        // its `role_prompts` entry, the agent's subsequent claim misses the
-        // idempotent short-circuit and falls through to the insert branch,
-        // and the response carries `role_prompt: None`. With the preamble
-        // the failure is deterministic regardless of interleaving, and the
-        // supervisor's respawn-time re-register (evict=true, role_prompt
-        // populated) restores the prompt on the next attempt.
-        self.evict_expired();
-
-        // Idempotent-claim short-circuit: if the supplied id already exists
-        // and matches name+role, return it (and renew TTL) without touching
-        // the rest of the state. This must run BEFORE the evict pass so that
-        // a pre-registered worker can be claimed by its agent without being
-        // wiped by a same-name evict.
-        if let Some(ref supplied) = worker_id {
-            if let Some(existing) = self.workers.get_mut(supplied) {
-                if existing.name == name && existing.role == role {
-                    let ttl = ttl_secs.unwrap_or(self.default_ttl);
-                    existing.ttl_secs = ttl;
-                    existing.expires_at = now_secs() + ttl;
-                    // Refresh mutable metadata so a re-register with updated
-                    // config values isn't silently dropped. `capabilities` is
-                    // only overwritten when non-empty — agent-side claims pass
-                    // an empty vec and must not erase what the orchestrator
-                    // registered.
-                    existing.description = description;
-                    if !capabilities.is_empty() {
-                        existing.capabilities = capabilities;
-                    }
-                    // Flip `claimed` on the idempotent-claim path so the
-                    // monitor can distinguish "pre-registered, waiting" from
-                    // "agent attached." The orchestrator passes `role_prompt =
-                    // Some(_)` when re-registering on respawn; agent claims
-                    // pass `None`. Either way, reaching this branch means an
-                    // actual process called register with our id, so mark it.
-                    existing.claimed = true;
-                    let id = supplied.clone();
-                    // Only overwrite the stored prompt if the caller supplied
-                    // one — agent claims pass `None` and must not erase what
-                    // the orchestrator stored at pre-register time.
-                    if let Some(prompt) = role_prompt {
-                        self.role_prompts.insert(id.clone(), prompt);
-                    }
-                    return Ok(id);
-                }
-                return Err(BrokerError::WorkerIdCollision {
-                    supplied: supplied.clone(),
-                    existing_name: existing.name.clone(),
-                    existing_role: existing.role.clone(),
-                    requested_name: name,
-                    requested_role: role,
-                });
-            }
-        }
-
-        if evict {
-            let old_ids: Vec<String> = self
-                .workers
-                .iter()
-                .filter(|(_, w)| w.name == name)
-                .map(|(id, _)| id.clone())
-                .collect();
-            for old_id in &old_ids {
-                self.remove_worker(old_id);
-            }
-        }
-
-        // `claimed = false` only when a caller pre-registers with a supplied
-        // id (issue #43 bootstrap flow — orchestrator creates the record
-        // server-side before the agent process starts). A fresh register
-        // without a supplied id is always an agent registering itself, so
-        // mark it claimed immediately. Distinguishing these keeps the
-        // "reserved, waiting" state precise rather than bleeding into the
-        // legacy self-register path.
-        let claimed = worker_id.is_none();
-        let id = worker_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let now = now_secs();
-        let ttl = ttl_secs.unwrap_or(self.default_ttl);
-        let worker = Worker {
-            id: id.clone(),
-            name,
-            role,
-            description,
-            capabilities,
-            ttl_secs: ttl,
-            expires_at: now + ttl,
-            last_status: None,
-            last_status_at: None,
-            status_history: VecDeque::new(),
-            claimed,
-        };
-        self.workers.insert(id.clone(), worker);
-        if let Some(prompt) = role_prompt {
-            self.role_prompts.insert(id.clone(), prompt);
-        }
-        Ok(id)
-    }
-
-    /// Remove a worker and all per-worker state (mailbox, notifier, role
-    /// prompt). Callers should route every worker removal through this so
-    /// the broker never retains partial state for a worker that no longer
-    /// exists — an invariant the issue-#43 pre-register cleanup path relies
-    /// on.
-    pub fn remove_worker(&mut self, id: &str) {
-        self.workers.remove(id);
-        self.mailboxes.remove(id);
-        self.notifiers.remove(id);
-        self.role_prompts.remove(id);
-    }
-
-    /// Remove workers whose TTL has expired, including their mailboxes and notifiers.
-    /// Returns `(id, name)` pairs for the evicted workers so callers can populate
-    /// expire events with the worker's name (which is otherwise lost on removal).
-    pub fn evict_expired(&mut self) -> Vec<(String, String)> {
-        let now = now_secs();
-        let expired: Vec<(String, String)> = self
-            .workers
-            .iter()
-            .filter(|(_, w)| w.expires_at <= now)
-            .map(|(id, w)| (id.clone(), w.name.clone()))
-            .collect();
-        for (id, _) in &expired {
-            self.remove_worker(id);
-        }
-        expired
-    }
-
-    /// Return a list of all active (non-expired) workers.
-    pub fn list_workers(&mut self) -> Vec<Worker> {
-        self.evict_expired();
-        self.workers.values().cloned().collect()
-    }
-
-    /// Look up a worker's name by ID.
-    pub fn worker_name(&self, worker_id: &str) -> Option<&str> {
-        self.workers.get(worker_id).map(|w| w.name.as_str())
-    }
-
-    /// Renew a worker's TTL and optionally update status.
-    /// Returns the new expiry timestamp, or None if not found/expired.
-    ///
-    /// When `status` differs from the worker's existing `last_status`, the
-    /// previous tagline (with its set time) is pushed onto `status_history`
-    /// so the card UI can show the last few values. Identical re-sets are
-    /// deduped so a steady heartbeat doesn't fill the buffer with copies.
-    pub fn heartbeat_worker(&mut self, worker_id: &str, status: Option<String>) -> Option<u64> {
-        self.evict_expired();
-        if let Some(worker) = self.workers.get_mut(worker_id) {
-            let now = now_secs();
-            worker.expires_at = now + worker.ttl_secs;
-            // Any heartbeat from the agent is proof of life — flip claimed
-            // so the monitor shows it as attached rather than "reserved,
-            // waiting" (relevant when the orchestrator pre-registers and
-            // the agent starts up by heartbeat-without-register, though
-            // the issue-#43 bootstrap always registers first).
-            worker.claimed = true;
-            if let Some(s) = status {
-                let unchanged = worker.last_status.as_deref() == Some(s.as_str());
-                if !unchanged {
-                    if let (Some(prev_status), Some(prev_at)) =
-                        (worker.last_status.take(), worker.last_status_at)
-                    {
-                        push_status_history(
-                            &mut worker.status_history,
-                            StatusEntry {
-                                status: prev_status,
-                                set_at: prev_at,
-                            },
-                        );
-                    }
-                    worker.last_status = Some(s);
-                    worker.last_status_at = Some(now);
-                }
-            }
-            Some(worker.expires_at)
-        } else {
-            None
-        }
-    }
-
-    /// Get status summaries for all active workers or a specific worker.
-    pub fn get_status(&mut self, worker_id: Option<&str>) -> Vec<crate::protocol::WorkerStatus> {
-        self.evict_expired();
-        match worker_id {
-            Some(id) => self
-                .workers
-                .get(id)
-                .map(|w| {
-                    vec![crate::protocol::WorkerStatus {
-                        id: w.id.clone(),
-                        name: w.name.clone(),
-                        role: w.role.clone(),
-                        last_status: w.last_status.clone(),
-                        last_status_at: w.last_status_at,
-                    }]
-                })
-                .unwrap_or_default(),
-            None => self
-                .workers
-                .values()
-                .map(|w| crate::protocol::WorkerStatus {
-                    id: w.id.clone(),
-                    name: w.name.clone(),
-                    role: w.role.clone(),
-                    last_status: w.last_status.clone(),
-                    last_status_at: w.last_status_at,
-                })
-                .collect(),
-        }
-    }
-
-    /// Emit an event: broadcast it, record in history, and print to stderr.
-    ///
-    /// `worker_name_override` wins when the worker has just been evicted (its
-    /// name can't be looked up anymore) or when the caller already has the
-    /// name cheaply. If `None`, falls back to `self.worker_name(worker_id)`.
-    pub fn emit_and_record(
-        &mut self,
-        tx: &broadcast::Sender<BrokerEvent>,
-        kind: &str,
-        worker_id: &str,
-        worker_name_override: Option<&str>,
-        detail: &str,
-        payload: Option<serde_json::Value>,
-    ) {
-        let worker_name = worker_name_override
-            .map(|s| s.to_string())
-            .or_else(|| self.worker_name(worker_id).map(|s| s.to_string()));
-        let event = BrokerEvent {
-            kind: kind.to_string(),
-            worker_id: worker_id.to_string(),
-            worker_name,
-            detail: detail.to_string(),
-            payload,
-            timestamp: now_secs(),
-        };
-        // Foreground console echo for `dispatch serve`. Routed through
-        // `tracing::info!` so it lands in both the daily log file AND on
-        // stderr (the same place the previous `eprintln!` wrote), and so
-        // `DISPATCH_LOG=warn` etc. can quiet the broker without losing
-        // file-side logs.
-        let display_name = event.worker_name.as_deref().unwrap_or(worker_id);
-        match event.payload.as_ref() {
-            Some(p) => tracing::info!(
-                kind = %event.kind,
-                worker = %display_name,
-                detail = %event.detail,
-                payload = %p,
-                "broker event",
-            ),
-            None => tracing::info!(
-                kind = %event.kind,
-                worker = %display_name,
-                detail = %event.detail,
-                "broker event",
-            ),
-        }
-        let _ = tx.send(event.clone());
-        self.event_history.push_back(event);
-        while self.event_history.len() > self.event_history_max {
-            self.event_history.pop_front();
-        }
-    }
-
-    /// Clear a worker's current status tagline. Does **not** touch
-    /// `status_history` — clear is a display-level operation so the recent
-    /// taglines stay visible on the agent card after the user resets the
-    /// current state.
-    pub fn clear_status(&mut self, worker_id: &str) -> Result<(), String> {
-        self.evict_expired();
-        if let Some(worker) = self.workers.get_mut(worker_id) {
-            worker.last_status = None;
-            worker.last_status_at = None;
-            Ok(())
-        } else {
-            Err(format!("worker not found or expired: {worker_id}"))
-        }
-    }
-
-    /// Record an acknowledgement for a message.
-    ///
-    /// Validates (in order) that the worker exists, the message exists in
-    /// history, and the message was addressed to this worker. Without these
-    /// checks a caller could record acks for arbitrary or nonexistent message
-    /// IDs, corrupting the monitor's message state.
-    pub fn ack_message(
-        &mut self,
-        worker_id: &str,
-        message_id: &str,
-        note: Option<String>,
-    ) -> Result<(), String> {
-        self.evict_expired();
-        if !self.workers.contains_key(worker_id) {
-            return Err(format!("worker not found or expired: {worker_id}"));
-        }
-        let recipient = self
-            .message_history
-            .iter()
-            .find(|m| m.message_id == message_id)
-            .map(|m| m.to.clone())
-            .ok_or_else(|| format!("message not found: {message_id}"))?;
-        if recipient != worker_id {
-            return Err(format!(
-                "message {message_id} was not addressed to worker {worker_id}"
-            ));
-        }
-        let now = now_secs();
-        self.ack_log.insert(
-            message_id.to_string(),
-            AckRecord {
-                message_id: message_id.to_string(),
-                worker_id: worker_id.to_string(),
-                note,
-                acked_at: now,
-            },
-        );
-        if let Some(hist) = self
-            .message_history
-            .iter_mut()
-            .find(|m| m.message_id == message_id)
-        {
-            hist.acked_at = Some(now);
-        }
-        Ok(())
-    }
-
-    /// Queue a message in a worker's mailbox. Returns the message ID, or None if the
-    /// recipient worker is not found or expired.
-    pub fn send_message(
-        &mut self,
-        to: String,
-        body: String,
-        from: Option<String>,
-    ) -> Option<String> {
-        self.evict_expired();
-        if !self.workers.contains_key(&to) {
-            return None;
-        }
-        let now = now_secs();
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let message = Message {
-            message_id: message_id.clone(),
-            from,
-            to: to.clone(),
-            body,
-            sent_at: Some(now),
-            delivered_at: None,
-            acked_at: None,
-        };
-        // Record in history before moving into mailbox.
-        self.message_history.push_back(message.clone());
-        while self.message_history.len() > self.message_history_max {
-            self.message_history.pop_front();
-        }
-        self.mailboxes
-            .entry(to.clone())
-            .or_default()
-            .push_back(message);
-        // Wake any long-polling listener for this worker.
-        if let Some(notify) = self.notifiers.get(&to) {
-            notify.notify_one();
-        }
-        Some(message_id)
-    }
-
-    /// Pop the next message from a worker's mailbox, if any.
-    /// Also marks the message as delivered in the history.
-    pub fn pop_message(&mut self, worker_id: &str) -> Option<Message> {
-        let msg = self.mailboxes.get_mut(worker_id)?.pop_front()?;
-        // Update delivered_at in history.
-        let now = now_secs();
-        if let Some(hist) = self
-            .message_history
-            .iter_mut()
-            .find(|m| m.message_id == msg.message_id)
-        {
-            hist.delivered_at = Some(now);
-        }
-        Some(msg)
-    }
-
-    /// Query event history with optional filters.
-    pub fn query_events(
-        &self,
-        since: Option<u64>,
-        until: Option<u64>,
-        event_type: Option<&str>,
-        worker: Option<&str>,
-        limit: Option<usize>,
-    ) -> Vec<&BrokerEvent> {
-        let limit = limit.unwrap_or(100);
-        self.event_history
-            .iter()
-            .rev() // most recent first
-            .filter(|e| since.is_none_or(|ts| e.timestamp >= ts))
-            .filter(|e| until.is_none_or(|ts| e.timestamp <= ts))
-            .filter(|e| event_type.is_none_or(|t| e.kind == t))
-            .filter(|e| worker.is_none_or(|w| e.worker_id == w))
-            .take(limit)
-            .collect()
-    }
-
-    /// Query message history with optional filters.
-    pub fn query_messages(
-        &self,
-        worker_id: &str,
-        unacked: bool,
-        sent: bool,
-        since: Option<u64>,
-        limit: Option<usize>,
-        id: Option<&str>,
-    ) -> Vec<&Message> {
-        let limit = limit.unwrap_or(100);
-
-        // Single message by ID
-        if let Some(msg_id) = id {
-            return self
-                .message_history
-                .iter()
-                .filter(|m| m.message_id == msg_id)
-                .collect();
-        }
-
-        self.message_history
-            .iter()
-            .rev() // most recent first
-            .filter(|m| {
-                if sent {
-                    m.from.as_deref() == Some(worker_id)
-                } else {
-                    m.to == worker_id
-                }
-            })
-            .filter(|m| {
-                if unacked {
-                    m.delivered_at.is_some() && m.acked_at.is_none()
-                } else {
-                    true
-                }
-            })
-            .filter(|m| since.is_none_or(|ts| m.sent_at.unwrap_or(0) >= ts))
-            .take(limit)
-            .collect()
-    }
-
-    /// Get or create the Notify handle for a worker's mailbox.
-    pub fn get_notifier(&mut self, worker_id: &str) -> Arc<Notify> {
-        self.notifiers
-            .entry(worker_id.to_string())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Get current Unix timestamp in seconds.
-pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs()
-}
-
-/// Push a status entry into a worker's history ring, deduping against the
-/// most-recent entry and capping the ring at `STATUS_HISTORY_MAX`.
-///
-/// Dedupe protects the buffer from filling with duplicates when an upstream
-/// re-emits the same tagline — only transitions show up in the history.
-fn push_status_history(history: &mut VecDeque<StatusEntry>, entry: StatusEntry) {
-    if history.back().map(|e| e.status.as_str()) == Some(entry.status.as_str()) {
-        return;
-    }
-    history.push_back(entry);
-    while history.len() > STATUS_HISTORY_MAX {
-        history.pop_front();
-    }
-}
-
-/// Derive the Unix domain socket path for a given cell identity.
-///
-/// Socket is placed in `/tmp/dispatch-cli/sockets/<cell_id>.sock`.
-/// The cell_id already encodes the project identity (hashed canonical path),
-/// so no additional path components are needed. Using `/tmp` avoids the
-/// Unix domain socket `SUN_LEN` limit (104 bytes on macOS) that triggers
-/// when project paths are deeply nested.
-pub fn socket_path(_project_root: &Path, cell_id: &str) -> PathBuf {
-    PathBuf::from("/tmp/dispatch-cli/sockets").join(format!("{cell_id}.sock"))
-}
-
-/// Check whether a broker is already running for this cell by testing
-/// if the socket file exists and a connection can be made.
-async fn check_no_existing_broker(socket: &Path, cell_id: &str) -> Result<(), DispatchError> {
-    if !socket.exists() {
-        return Ok(());
-    }
-
-    // Socket file exists — try to connect to see if a broker is actually listening.
-    match UnixStream::connect(socket).await {
-        Ok(_) => Err(DispatchError::BrokerAlreadyRunning {
-            cell_id: cell_id.to_string(),
-            socket_path: socket.to_path_buf(),
-        }),
-        Err(_) => {
-            // Stale socket file from a previous crashed run — remove it.
-            tracing::warn!(path = %socket.display(), "removing stale socket file");
-            std::fs::remove_file(socket).map_err(DispatchError::Io)?;
-            Ok(())
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
-
 /// Start the embedded broker server.
 ///
 /// Listens on a Unix domain socket and handles JSON-line requests.
@@ -794,10 +122,8 @@ pub async fn serve(
         std::fs::create_dir_all(parent).map_err(DispatchError::Io)?;
     }
 
-    // Check for duplicate broker.
     check_no_existing_broker(&socket, cell_id).await?;
 
-    // Bind the listener.
     let listener = UnixListener::bind(&socket).map_err(DispatchError::Io)?;
 
     tracing::info!(cell_id, socket_path = %socket.display(), "broker listening");
@@ -807,18 +133,21 @@ pub async fn serve(
         cell_id
     );
 
-    let state = Arc::new(Mutex::new(if let Some(ttl) = config.default_ttl {
+    let mut broker_state = if let Some(ttl) = config.default_ttl {
         BrokerState::with_default_ttl(ttl)
     } else {
         BrokerState::new()
-    }));
+    };
+    if let Some(drain) = config.stopping_drain_secs {
+        broker_state.stopping_drain_secs = drain;
+    }
+    broker_state.log_prompt_bodies = config.log_prompt_bodies;
+    let state = Arc::new(Mutex::new(broker_state));
     let (event_tx, _) = broadcast::channel::<BrokerEvent>(256);
 
     // Shutdown signal shared with the monitor dashboard.
     let monitor_shutdown = Arc::new(Notify::new());
 
-    // Single source of truth for the log directory — used by both the
-    // orchestrator (writes) and the monitor (reads via /api/logs/{agent}).
     let log_dir = config.project_root.join("logs");
 
     // Compute monitor URL up front so the orchestrator can pass it to agents
@@ -874,7 +203,6 @@ pub async fn serve(
     {
         let mut orch = orchestrator.lock().await;
         orch.launch_all().await?;
-        // Start configured heartbeat timers.
         if !config.heartbeats.is_empty() {
             orch.start_heartbeats(&config.heartbeats, &event_tx);
         }
@@ -883,7 +211,7 @@ pub async fn serve(
     // Print copy-paste launch commands for every `launch = false` agent.
     //
     // For every unmanaged agent with a `prompt_file`, pre-register a worker
-    // server-side and wire the printed command to the issue-#43 boot-prompt
+    // server-side and wire the printed command to the boot-prompt
     // bootstrap: `DISPATCH_WORKER_ID=<uuid>` in the env + `< <name>.boot.prompt`
     // on stdin. When the user pastes + runs, the agent's first tool call
     // (`dispatch register --for-agent`) idempotently claims the pre-registered
@@ -951,7 +279,6 @@ pub async fn serve(
         }
     };
 
-    // Clean up socket file on exit.
     if socket.exists() {
         if let Err(e) = std::fs::remove_file(&socket) {
             tracing::warn!(error = %e, "failed to remove socket file on shutdown");
@@ -1051,6 +378,12 @@ async fn handle_request(
             role_prompt,
         } => {
             let mut state = state.lock().await;
+            // A claim (the agent fetching its own prompt) passes no
+            // `role_prompt` and receives the stored body back — that's the
+            // prompt-delivery moment. The orchestrator's pre-register
+            // passes `role_prompt = Some(body)` (storing, not delivering), so
+            // it is not counted as a delivery.
+            let is_claim = role_prompt.is_none();
             let worker_id = match state.register_worker(
                 name.clone(),
                 role.clone(),
@@ -1084,6 +417,27 @@ async fn handle_request(
             // spawned agent receives its first instructions as the response
             // body of its own `dispatch register` claim.
             let role_prompt = state.role_prompts.get(&worker_id).cloned();
+            // Record the delivery by fingerprint (hash + byte size),
+            // never the full body unless `log_prompt_bodies` is set, so prompt
+            // cost/compliance is auditable via `dispatch events --type prompt`.
+            if is_claim {
+                if let Some(ref prompt) = role_prompt {
+                    let log_bodies = state.log_prompt_bodies;
+                    let (hash, bytes) = body_fingerprint(prompt);
+                    let mut payload = serde_json::json!({ "hash": hash, "bytes": bytes });
+                    if log_bodies {
+                        payload["body"] = serde_json::Value::String(prompt.clone());
+                    }
+                    state.emit_and_record(
+                        event_tx,
+                        "prompt",
+                        &worker_id,
+                        Some(&name),
+                        &format!("delivered role prompt ({bytes} bytes, {hash})"),
+                        Some(payload),
+                    );
+                }
+            }
             BrokerResponse::Ok {
                 payload: ResponsePayload::WorkerRegistered {
                     worker_id,
@@ -1160,8 +514,25 @@ async fn handle_request(
             let (notifier, immediate_msg, listener_name) = {
                 let mut s = state.lock().await;
                 let expired = s.evict_expired();
-                for (id, name) in &expired {
-                    s.emit_and_record(event_tx, "expire", id, Some(name), "worker expired", None);
+                for (id, name, reason) in &expired {
+                    match reason {
+                        EvictReason::TtlExpired => s.emit_and_record(
+                            event_tx,
+                            "expire",
+                            id,
+                            Some(name),
+                            "worker expired",
+                            None,
+                        ),
+                        EvictReason::StopDrained => s.emit_and_record(
+                            event_tx,
+                            "lifecycle",
+                            id,
+                            Some(name),
+                            "worker stopped (drain window elapsed)",
+                            Some(serde_json::json!({ "control_state": "stopped" })),
+                        ),
+                    }
                 }
                 if !s.workers.contains_key(&worker_id) {
                     return BrokerResponse::Error {
@@ -1304,23 +675,51 @@ async fn handle_request(
             worker_id,
             message_id,
             note,
+            status,
+            summary,
+            artifacts,
         } => {
             let mut state = state.lock().await;
+            // `dispatch result` rides this request as a super-ack: when
+            // `status` is present, emit a `result` event with the completion
+            // payload; otherwise a plain `ack` with its original shape. Capture
+            // what we need for the event before the fields move into ack_message.
+            let is_result = status.is_some();
             let note_clone = note.clone();
-            match state.ack_message(&worker_id, &message_id, note) {
+            let status_clone = status.clone();
+            let summary_clone = summary.clone();
+            let artifacts_clone = artifacts.clone();
+            match state.ack_message(&worker_id, &message_id, note, status, summary, artifacts) {
                 Ok(()) => {
-                    tracing::info!(worker_id = %worker_id, message_id = %message_id, "message acked");
-                    state.emit_and_record(
-                        event_tx,
-                        "ack",
-                        &worker_id,
-                        None,
-                        &format!("acked {}", &message_id[..message_id.len().min(8)]),
-                        Some(serde_json::json!({
-                            "message_id": message_id,
-                            "note": note_clone,
-                        })),
-                    );
+                    let short = &message_id[..message_id.len().min(8)];
+                    let (kind, detail, payload) = if is_result {
+                        (
+                            "result",
+                            format!(
+                                "result {} {}",
+                                status_clone.as_deref().unwrap_or("done"),
+                                short
+                            ),
+                            serde_json::json!({
+                                "message_id": message_id,
+                                "note": note_clone,
+                                "status": status_clone,
+                                "summary": summary_clone,
+                                "artifacts": artifacts_clone,
+                            }),
+                        )
+                    } else {
+                        (
+                            "ack",
+                            format!("acked {short}"),
+                            serde_json::json!({
+                                "message_id": message_id,
+                                "note": note_clone,
+                            }),
+                        )
+                    };
+                    tracing::info!(worker_id = %worker_id, message_id = %message_id, kind, "message acked");
+                    state.emit_and_record(event_tx, kind, &worker_id, None, &detail, Some(payload));
                     BrokerResponse::Ok {
                         payload: ResponsePayload::AckConfirm {
                             message_id,
@@ -1331,7 +730,11 @@ async fn handle_request(
                 Err(msg) => BrokerResponse::Error { message: msg },
             }
         }
-        BrokerRequest::Status { worker_id, clear } => {
+        BrokerRequest::Status {
+            worker_id,
+            clear,
+            probe,
+        } => {
             let mut state = state.lock().await;
             if clear {
                 match worker_id {
@@ -1350,6 +753,32 @@ async fn handle_request(
                 }
             } else {
                 let workers = state.get_status(worker_id.as_deref());
+                // A stop-hook probe records the block/allow decision it
+                // implies, derived from the worker's control state, as a
+                // `stop_decision` event (the hook itself runs in the agent's
+                // process and can't write to the broker's history directly).
+                if probe.as_deref() == Some("stop_hook") {
+                    if let Some(id) = worker_id.as_deref() {
+                        let observed = workers.iter().find(|w| w.id == id).map(|w| w.control_state);
+                        let (state_label, decision) = match observed {
+                            Some(ControlState::Active) => ("active", "block"),
+                            Some(ControlState::Stopping) => ("stopping", "allow"),
+                            Some(ControlState::Stopped) => ("stopped", "allow"),
+                            None => ("unknown", "allow"),
+                        };
+                        state.emit_and_record(
+                            event_tx,
+                            "stop_decision",
+                            id,
+                            None,
+                            &format!("{state_label} -> {decision}"),
+                            Some(serde_json::json!({
+                                "control_state": state_label,
+                                "decision": decision,
+                            })),
+                        );
+                    }
+                }
                 BrokerResponse::Ok {
                     payload: ResponsePayload::StatusResult { workers },
                 }
@@ -1431,7 +860,13 @@ async fn handle_request(
             }
         }
         BrokerRequest::AgentStop { name } => {
-            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
+            let (resolved, target) = resolve_stop_target(&name, &state, &orchestrator).await;
+            // Mark the target `stopping` BEFORE the kill so a late stop-hook
+            // call from the dying agent sees `stopping` (and is allowed to
+            // exit) instead of racing the record away. A worker-id argument
+            // marks only that worker; an agent-name argument marks every worker
+            // registered under it.
+            mark_worker_stopping(&state, event_tx, &target).await;
             // Release the orchestrator mutex before awaiting the supervisor's
             // shutdown so concurrent list_state / monitor polls don't stall
             // for 500ms+ per stop.
@@ -1452,12 +887,11 @@ async fn handle_request(
             }
         }
         BrokerRequest::AgentRestart { name } => {
-            let resolved = resolve_agent_target(&name, &state, &orchestrator).await;
-            // Split phases mirror api_agent_restart: lock → signal stop →
-            // unlock → await → lock → start. Avoids pinning the orchestrator
-            // mutex across the kill window.
-            let handle = {
-                let mut orch = orchestrator.lock().await;
+            let (resolved, target) = resolve_stop_target(&name, &state, &orchestrator).await;
+            // Validate the config up front so a bad name doesn't mark a worker
+            // stopping for an agent we can't restart.
+            {
+                let orch = orchestrator.lock().await;
                 if !orch.has_config(&resolved) {
                     return BrokerResponse::Error {
                         message: format!(
@@ -1465,6 +899,17 @@ async fn handle_request(
                         ),
                     };
                 }
+            }
+            // Stopping semantics for the OLD worker before the respawn:
+            // mark it stopping, then kill. A worker-id argument marks only that
+            // worker; a name marks every worker under it. The fresh spawn
+            // re-registers an active worker (its evict pass wipes the old id).
+            mark_worker_stopping(&state, event_tx, &target).await;
+            // Split phases mirror api_agent_restart: lock → signal stop →
+            // unlock → await → lock → start. Avoids pinning the orchestrator
+            // mutex across the kill window.
+            let handle = {
+                let mut orch = orchestrator.lock().await;
                 orch.signal_stop_by_name(&resolved)
             };
             if let Some(h) = handle {
@@ -1501,30 +946,6 @@ async fn handle_request(
     }
 }
 
-/// Resolve an `agent` subcommand target string (agent name or worker ID) to a
-/// configured agent name. If the input already matches a configured agent
-/// name, it's returned as-is. Otherwise, treat it as a worker ID and look up
-/// the worker's name in the broker registry. Falls back to the input itself
-/// when neither lookup succeeds — the orchestrator will then surface a
-/// "no such agent in config" error.
-async fn resolve_agent_target(
-    target: &str,
-    state: &Arc<Mutex<BrokerState>>,
-    orchestrator: &Arc<Mutex<super::orchestrator::AgentOrchestrator>>,
-) -> String {
-    {
-        let orch = orchestrator.lock().await;
-        if orch.has_config(target) {
-            return target.to_string();
-        }
-    }
-    let state = state.lock().await;
-    if let Some(name) = state.worker_name(target) {
-        return name.to_string();
-    }
-    target.to_string()
-}
-
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -1538,1791 +959,5 @@ async fn shutdown_signal() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::Backend;
-    use crate::config::ResolvedConfig;
-    use tempfile::TempDir;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    /// Create a minimal ResolvedConfig for testing.
-    fn test_config(project_root: &Path, cell_id: &str) -> ResolvedConfig {
-        ResolvedConfig {
-            name: None,
-            cell_id: cell_id.to_string(),
-            backend: None,
-            project_root: project_root.to_path_buf(),
-            config_file_path: None,
-            agent_cwd: project_root.to_path_buf(),
-            monitor_port: None,
-            monitor_open: false,
-            default_ttl: None,
-            agents: vec![],
-            heartbeats: vec![],
-        }
-    }
-
-    // ---- Client-side tests (formerly in client.rs) ----
-
-    #[tokio::test]
-    async fn test_client_broker_not_running() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path(), "nonexistent-cell");
-        let backend = LocalBackend::new(&config, None);
-
-        let result = backend
-            .send_request(&BrokerRequest::Team { from: None })
-            .await;
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            DispatchError::BrokerNotRunning { cell_id } => {
-                assert_eq!(cell_id, "nonexistent-cell");
-            }
-            other => panic!("expected BrokerNotRunning, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_client_send_and_receive() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "client-test";
-
-        // Start broker in background.
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-
-        // Wait for broker to start.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let cfg = test_config(&project_root, cell_id);
-        let backend = LocalBackend::new(&cfg, None);
-        let response = backend
-            .send_request(&BrokerRequest::Team { from: None })
-            .await;
-        assert!(response.is_ok(), "expected Ok response, got: {response:?}");
-
-        let resp = response.unwrap();
-        match resp {
-            BrokerResponse::Ok { .. } => {} // Expected
-            BrokerResponse::Error { message } => {
-                panic!("expected Ok response, got error: {message}");
-            }
-        }
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    // ---- Broker-side tests (formerly in broker.rs) ----
-
-    #[test]
-    fn test_socket_path_derivation() {
-        let path = socket_path(Path::new("/home/user/project"), "cell-abc123");
-        assert_eq!(
-            path,
-            PathBuf::from("/tmp/dispatch-cli/sockets/cell-abc123.sock")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_check_no_existing_broker_no_socket() {
-        let tmp = TempDir::new().unwrap();
-        let sock = tmp.path().join("test.sock");
-        let result = check_no_existing_broker(&sock, "test-cell").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_check_no_existing_broker_stale_socket() {
-        let tmp = TempDir::new().unwrap();
-        let sock = tmp.path().join("test.sock");
-        // Create a regular file pretending to be a stale socket.
-        std::fs::write(&sock, "").unwrap();
-        let result = check_no_existing_broker(&sock, "test-cell").await;
-        assert!(result.is_ok());
-        assert!(!sock.exists(), "stale socket should be removed");
-    }
-
-    #[tokio::test]
-    async fn test_check_no_existing_broker_active_broker() {
-        let tmp = TempDir::new().unwrap();
-        let sock = tmp.path().join("active.sock");
-
-        // Start a real listener to simulate an active broker.
-        let listener = UnixListener::bind(&sock).unwrap();
-
-        // Spawn a task to accept one connection so the connect test works.
-        let sock_clone = sock.clone();
-        let accept_handle = tokio::spawn(async move {
-            let _ = listener.accept().await;
-            // Keep listener alive until we drop it.
-            drop(listener);
-            // Clean up.
-            let _ = std::fs::remove_file(&sock_clone);
-        });
-
-        let result = check_no_existing_broker(&sock, "test-cell").await;
-        assert!(result.is_err());
-
-        let err = result.unwrap_err();
-        match err {
-            DispatchError::BrokerAlreadyRunning { cell_id, .. } => {
-                assert_eq!(cell_id, "test-cell");
-            }
-            other => panic!("expected BrokerAlreadyRunning, got: {other}"),
-        }
-
-        accept_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_server_startup_and_connection() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "test-cell";
-        let sock = socket_path(&project_root, cell_id);
-
-        // Start broker in background.
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-
-        // Wait briefly for the server to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Verify socket file exists.
-        assert!(sock.exists(), "socket file should exist after startup");
-
-        // Connect and send a request.
-        let stream = UnixStream::connect(&sock).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-
-        writer.write_all(b"{\"type\":\"ping\"}\n").await.unwrap();
-
-        let mut reader = BufReader::new(reader);
-        let mut response = String::new();
-        reader.read_line(&mut response).await.unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
-        // Unrecognized request type returns an error.
-        assert_eq!(parsed["status"], "error");
-
-        // Clean up: abort the server.
-        serve_handle.abort();
-
-        // Give it a moment to clean up.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_broker_detection() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "dup-cell";
-        let sock = socket_path(&project_root, cell_id);
-
-        // Ensure parent dir exists.
-        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-
-        // Start first broker.
-        let listener = UnixListener::bind(&sock).unwrap();
-        let accept_handle = tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-
-        // Try to start second broker — should fail.
-        let result = serve(&test_config(&project_root, cell_id), None).await;
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            DispatchError::BrokerAlreadyRunning {
-                cell_id: id,
-                socket_path: path,
-            } => {
-                assert_eq!(id, "dup-cell");
-                assert_eq!(path, sock);
-            }
-            other => panic!("expected BrokerAlreadyRunning, got: {other}"),
-        }
-
-        accept_handle.abort();
-        let _ = std::fs::remove_file(&sock);
-    }
-
-    #[tokio::test]
-    async fn test_restart_clears_stale_socket() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "restart-cell";
-        let sock = socket_path(&project_root, cell_id);
-
-        // Create socket directory and a stale socket file.
-        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-        // Remove any leftover real socket from a previous run before
-        // creating a fake stale file.
-        let _ = std::fs::remove_file(&sock);
-        std::fs::write(&sock, "stale").unwrap();
-
-        // Starting serve should clean up the stale socket and bind fresh.
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-
-        // Wait briefly for the server to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Should be able to connect.
-        let result = UnixStream::connect(&sock).await;
-        assert!(
-            result.is_ok(),
-            "should connect to fresh broker after stale cleanup"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    /// Issue #43: when an id is supplied, the broker uses it verbatim.
-    #[test]
-    fn test_register_worker_uses_supplied_id() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("register");
-        assert_eq!(id, "w-fixed");
-        assert!(state.workers.contains_key("w-fixed"));
-    }
-
-    /// Issue #43: re-registering an existing id with the same name+role is an
-    /// idempotent claim — same id returned, no duplicate worker, TTL renewed.
-    #[test]
-    fn test_register_worker_idempotent_claim_renews_ttl() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                Some(60),
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("first register");
-        // Force the expiry into the past so we can detect the renewal.
-        state.workers.get_mut(&id).unwrap().expires_at = 0;
-
-        let id2 = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                Some(60),
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("idempotent claim");
-        assert_eq!(id, id2);
-        assert_eq!(state.workers.len(), 1, "no duplicate worker created");
-        assert!(
-            state.workers.get(&id).unwrap().expires_at > 0,
-            "claim should renew TTL",
-        );
-    }
-
-    /// Issue #43: an idempotent claim with updated `description` /
-    /// `capabilities` must refresh the stored worker record so `dispatch
-    /// team` reflects current config — stale metadata from the initial
-    /// pre-register otherwise lingers. Empty capabilities (agent-side
-    /// claim shape) must NOT clobber the stored list.
-    #[test]
-    fn test_register_worker_idempotent_claim_updates_metadata() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "original description".into(),
-                vec!["cap-a".into(), "cap-b".into()],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("first register");
-
-        // Re-register with a new description and fresh capabilities —
-        // both must flow through to the stored worker.
-        state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "updated description".into(),
-                vec!["cap-c".into()],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("claim with updated metadata");
-        let w = state.workers.get(&id).unwrap();
-        assert_eq!(w.description, "updated description");
-        assert_eq!(w.capabilities, vec!["cap-c".to_string()]);
-
-        // Agent-style claim with empty capabilities must preserve the
-        // existing list rather than blanking it.
-        state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "third description".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("agent-style claim");
-        let w = state.workers.get(&id).unwrap();
-        assert_eq!(w.description, "third description");
-        assert_eq!(
-            w.capabilities,
-            vec!["cap-c".to_string()],
-            "empty capabilities must not wipe stored list",
-        );
-    }
-
-    /// Issue #43: re-registering an existing id with a *different* name or
-    /// role is rejected — silent overwriting would mask config drift.
-    #[test]
-    fn test_register_worker_collision_rejected() {
-        let mut state = BrokerState::new();
-        state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("first register");
-        let err = state
-            .register_worker(
-                "bob".into(),
-                "reviewer".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect_err("collision must be rejected");
-        assert!(
-            matches!(
-                err,
-                BrokerError::WorkerIdCollision { ref supplied, ref existing_name, .. }
-                    if supplied == "w-fixed" && existing_name == "alice"
-            ),
-            "expected WorkerIdCollision for w-fixed/alice, got: {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("w-fixed"),
-            "error display should name the colliding id: {msg}"
-        );
-        assert!(
-            msg.contains("alice"),
-            "error display should name the existing worker: {msg}"
-        );
-        // The original worker is still there, untouched.
-        assert_eq!(state.workers.len(), 1);
-        assert_eq!(state.workers.get("w-fixed").unwrap().name, "alice");
-    }
-
-    /// Issue #43: a fresh registration with `role_prompt` stores the prompt
-    /// keyed by worker id; subsequent claims with `role_prompt: None` see
-    /// the stored prompt back via `role_prompts`.
-    #[test]
-    fn test_register_worker_stores_and_returns_role_prompt() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                Some("Run: dispatch listen --timeout 270".into()),
-            )
-            .expect("pre-register");
-        assert_eq!(
-            state.role_prompts.get(&id).map(String::as_str),
-            Some("Run: dispatch listen --timeout 270"),
-        );
-
-        // Agent claim with role_prompt=None must NOT erase the stored prompt.
-        let claimed = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("claim");
-        assert_eq!(claimed, id);
-        assert_eq!(
-            state.role_prompts.get(&id).map(String::as_str),
-            Some("Run: dispatch listen --timeout 270"),
-            "claim must not erase the stored prompt",
-        );
-    }
-
-    /// A pre-registered worker (caller supplied `worker_id`) is born with
-    /// `claimed = false` so the monitor can show it as "reserved, waiting
-    /// for the agent" rather than solid green. When the agent then
-    /// registers with the same id (idempotent-claim path) OR sends a
-    /// heartbeat, `claimed` flips to true. Self-registered workers
-    /// (no supplied id) skip the reserved state entirely — they're
-    /// always a real process registering itself.
-    #[test]
-    fn test_register_worker_claimed_flips_on_attach() {
-        let mut state = BrokerState::new();
-
-        // Pre-register via supplied id — should start unclaimed.
-        let pre = state
-            .register_worker(
-                "alice".into(),
-                "runner".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                Some("prompt".into()),
-            )
-            .expect("pre-register");
-        assert!(
-            !state.workers.get(&pre).unwrap().claimed,
-            "pre-register must leave worker unclaimed",
-        );
-
-        // Agent-side claim (supplied id matches existing record).
-        let claimed = state
-            .register_worker(
-                "alice".into(),
-                "runner".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("claim");
-        assert_eq!(claimed, pre);
-        assert!(
-            state.workers.get(&pre).unwrap().claimed,
-            "idempotent claim must flip claimed = true",
-        );
-
-        // Self-register (no supplied id) should be claimed immediately.
-        let self_reg = state
-            .register_worker(
-                "bob".into(),
-                "worker".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("self-register");
-        assert!(
-            state.workers.get(&self_reg).unwrap().claimed,
-            "self-register (no supplied id) must be claimed immediately",
-        );
-
-        // Heartbeat alone is also proof of life — flips claimed on a
-        // pre-registered worker even without a register-claim step.
-        let hb_pre = state
-            .register_worker(
-                "carol".into(),
-                "worker".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                Some("w-carol".into()),
-                None,
-            )
-            .expect("pre-register carol");
-        assert!(!state.workers.get(&hb_pre).unwrap().claimed);
-        state
-            .heartbeat_worker(&hb_pre, None)
-            .expect("heartbeat on pre-registered worker");
-        assert!(
-            state.workers.get(&hb_pre).unwrap().claimed,
-            "heartbeat must flip claimed = true",
-        );
-    }
-
-    /// Issue #43: evicting a worker (via `evict=true` or TTL expiry) drops
-    /// its stored prompt too — no stale prompts left behind.
-    #[test]
-    fn test_register_worker_evict_clears_role_prompt() {
-        let mut state = BrokerState::new();
-        let first = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                Some("first prompt".into()),
-            )
-            .expect("first");
-        // Evict and re-register with a different id. Old prompt must be gone.
-        let second = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                true,
-                None,
-                Some("second prompt".into()),
-            )
-            .expect("evict + re-register");
-        assert_ne!(first, second);
-        assert!(
-            !state.role_prompts.contains_key(&first),
-            "evicted worker's prompt must be cleared",
-        );
-        assert_eq!(
-            state.role_prompts.get(&second).map(String::as_str),
-            Some("second prompt"),
-        );
-    }
-
-    /// Idempotent claim runs BEFORE evict, so a same-name evict cannot wipe a
-    /// pre-registered worker that an agent is about to claim.
-    #[test]
-    fn test_register_worker_claim_beats_evict() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("pre-register");
-        let claimed = state
-            .register_worker(
-                "alice".into(),
-                "test-runner".into(),
-                "desc".into(),
-                vec![],
-                None,
-                true, // evict
-                Some("w-fixed".into()),
-                None,
-            )
-            .expect("claim should win over evict");
-        assert_eq!(id, claimed);
-        assert_eq!(state.workers.len(), 1);
-    }
-
-    #[test]
-    fn test_register_worker_returns_unique_ids() {
-        let mut state = BrokerState::new();
-        let id1 = state
-            .register_worker(
-                "worker-a".into(),
-                "planner".into(),
-                "Plans things".into(),
-                vec!["plan:create plans".into()],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let id2 = state
-            .register_worker(
-                "worker-b".into(),
-                "coder".into(),
-                "Writes code".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        assert_ne!(id1, id2, "each registration must produce a unique ID");
-        assert_eq!(state.workers.len(), 2);
-    }
-
-    #[test]
-    fn test_register_worker_stores_fields() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "my-worker".into(),
-                "reviewer".into(),
-                "Reviews pull requests".into(),
-                vec!["review:code".into(), "review:docs".into()],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let worker = state.workers.get(&id).unwrap();
-        assert_eq!(worker.name, "my-worker");
-        assert_eq!(worker.role, "reviewer");
-        assert_eq!(worker.description, "Reviews pull requests");
-        assert_eq!(worker.capabilities, vec!["review:code", "review:docs"]);
-        assert!(worker.expires_at > 0, "worker should have a TTL expiry");
-    }
-
-    #[test]
-    fn test_register_worker_ttl_set() {
-        let mut state = BrokerState::new();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let id = state
-            .register_worker(
-                "ttl-worker".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let worker = state.workers.get(&id).unwrap();
-        // Should expire roughly DEFAULT_WORKER_TTL_SECS from now.
-        assert!(worker.expires_at >= now + DEFAULT_WORKER_TTL_SECS - 1);
-        assert!(worker.expires_at <= now + DEFAULT_WORKER_TTL_SECS + 1);
-    }
-
-    #[test]
-    fn test_evict_expired_workers() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "soon-expired".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        // Manually set expiry to the past.
-        state.workers.get_mut(&id).unwrap().expires_at = 0;
-        state.evict_expired();
-        assert!(state.workers.is_empty(), "expired worker should be evicted");
-    }
-
-    #[tokio::test]
-    async fn test_register_via_broker_returns_worker_id() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "reg-test";
-
-        // Start broker.
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Send register request via raw socket.
-        let sock = socket_path(&project_root, cell_id);
-        let stream = UnixStream::connect(&sock).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-
-        let req = serde_json::json!({
-            "type": "register",
-            "name": "test-agent",
-            "role": "coder",
-            "description": "Writes code",
-            "capabilities": ["rust", "python"]
-        });
-        let mut req_bytes = serde_json::to_vec(&req).unwrap();
-        req_bytes.push(b'\n');
-        writer.write_all(&req_bytes).await.unwrap();
-
-        let mut reader = BufReader::new(reader);
-        let mut response = String::new();
-        reader.read_line(&mut response).await.unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(parsed["status"], "ok");
-        assert!(
-            parsed["worker_id"].is_string(),
-            "response should contain worker_id"
-        );
-        // Worker ID should be a valid UUID.
-        let worker_id = parsed["worker_id"].as_str().unwrap();
-        assert!(
-            uuid::Uuid::parse_str(worker_id).is_ok(),
-            "worker_id should be a valid UUID"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_register_capability_storage_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "cap-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, "cap-test");
-
-        // Register with capabilities using name:description convention.
-        let stream = UnixStream::connect(&sock).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-
-        let req = serde_json::json!({
-            "type": "register",
-            "name": "cap-worker",
-            "role": "tester",
-            "description": "Runs tests",
-            "capabilities": ["test:unit", "test:integration"]
-        });
-        let mut req_bytes = serde_json::to_vec(&req).unwrap();
-        req_bytes.push(b'\n');
-        writer.write_all(&req_bytes).await.unwrap();
-
-        let mut reader = BufReader::new(reader);
-        let mut response = String::new();
-        reader.read_line(&mut response).await.unwrap();
-
-        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(parsed["status"], "ok");
-        assert!(parsed["worker_id"].is_string());
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    /// Helper: send a JSON request to a broker socket and return the parsed response.
-    async fn send_json_request(sock: &Path, request: &serde_json::Value) -> serde_json::Value {
-        let stream = UnixStream::connect(sock).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-        let mut req_bytes = serde_json::to_vec(request).unwrap();
-        req_bytes.push(b'\n');
-        writer.write_all(&req_bytes).await.unwrap();
-        let mut reader = BufReader::new(reader);
-        let mut response = String::new();
-        reader.read_line(&mut response).await.unwrap();
-        serde_json::from_str(&response).unwrap()
-    }
-
-    /// Helper: register a worker via broker and return its worker_id.
-    async fn register_worker(sock: &Path, name: &str, role: &str) -> String {
-        let req = serde_json::json!({
-            "type": "register",
-            "name": name,
-            "role": role,
-            "description": format!("{name} worker"),
-            "capabilities": []
-        });
-        let resp = send_json_request(sock, &req).await;
-        resp["worker_id"].as_str().unwrap().to_string()
-    }
-
-    #[test]
-    fn test_list_workers_excludes_expired() {
-        let mut state = BrokerState::new();
-        let active_id = state
-            .register_worker(
-                "active".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let expired_id = state
-            .register_worker(
-                "expired".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        // Expire one worker.
-        state.workers.get_mut(&expired_id).unwrap().expires_at = 0;
-
-        let workers = state.list_workers();
-        assert_eq!(workers.len(), 1);
-        assert_eq!(workers[0].id, active_id);
-    }
-
-    #[test]
-    fn test_heartbeat_worker_renews_ttl() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "hb-worker".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let original_expiry = state.workers.get(&id).unwrap().expires_at;
-
-        // Manually lower the expiry to simulate time passing.
-        state.workers.get_mut(&id).unwrap().expires_at = now_secs() + 10;
-
-        let new_expiry = state.heartbeat_worker(&id, None).unwrap();
-        assert!(
-            new_expiry >= original_expiry,
-            "heartbeat should renew to at least the original TTL"
-        );
-    }
-
-    #[test]
-    fn test_heartbeat_worker_not_found() {
-        let mut state = BrokerState::new();
-        assert!(state.heartbeat_worker("nonexistent", None).is_none());
-    }
-
-    #[test]
-    fn test_heartbeat_worker_expired() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "exp-worker".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        state.workers.get_mut(&id).unwrap().expires_at = 0;
-
-        assert!(
-            state.heartbeat_worker(&id, None).is_none(),
-            "heartbeat for expired worker should return None"
-        );
-    }
-
-    /// Pushing 5 distinct statuses leaves the current one on `last_status`
-    /// and the most recent `STATUS_HISTORY_MAX` priors in `status_history`,
-    /// oldest first. The very first status (A) drops off when the ring caps.
-    #[test]
-    fn test_status_history_caps_at_max() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "hist".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        for s in ["A", "B", "C", "D", "E"] {
-            state.heartbeat_worker(&id, Some(s.into())).unwrap();
-        }
-        let w = state.workers.get(&id).unwrap();
-        assert_eq!(w.last_status.as_deref(), Some("E"));
-        let history: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
-        assert_eq!(history, vec!["B", "C", "D"]);
-        assert_eq!(w.status_history.len(), STATUS_HISTORY_MAX);
-    }
-
-    /// Re-setting an identical status is a no-op for both `last_status_at`
-    /// and `status_history` — heartbeats that re-emit the same tagline must
-    /// not pollute the buffer with copies.
-    #[test]
-    fn test_status_history_dedupes_consecutive_repeats() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "dedup".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        state.heartbeat_worker(&id, Some("running".into())).unwrap();
-        let first_at = state.workers.get(&id).unwrap().last_status_at;
-        // Same status again — should not push, should not bump last_status_at.
-        state.heartbeat_worker(&id, Some("running".into())).unwrap();
-        let w = state.workers.get(&id).unwrap();
-        assert!(
-            w.status_history.is_empty(),
-            "no transition, no history push"
-        );
-        assert_eq!(
-            w.last_status_at, first_at,
-            "identical status must not bump last_status_at",
-        );
-    }
-
-    /// `status --clear` is a display-level reset: it nulls the current
-    /// tagline but leaves the historical buffer alone so the card still
-    /// shows the recent timeline.
-    #[test]
-    fn test_clear_status_preserves_history() {
-        let mut state = BrokerState::new();
-        let id = state
-            .register_worker(
-                "clr".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        state.heartbeat_worker(&id, Some("phase 1".into())).unwrap();
-        state.heartbeat_worker(&id, Some("phase 2".into())).unwrap();
-        state.clear_status(&id).unwrap();
-        let w = state.workers.get(&id).unwrap();
-        assert!(w.last_status.is_none());
-        assert!(w.last_status_at.is_none());
-        let history: Vec<&str> = w.status_history.iter().map(|e| e.status.as_str()).collect();
-        assert_eq!(history, vec!["phase 1"]);
-    }
-
-    #[tokio::test]
-    async fn test_team_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "team-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        // Register two workers.
-        let id1 = register_worker(&sock, "worker-a", "planner").await;
-        let id2 = register_worker(&sock, "worker-b", "coder").await;
-
-        // List team.
-        let resp = send_json_request(&sock, &serde_json::json!({"type": "team"})).await;
-        assert_eq!(resp["status"], "ok");
-
-        let workers = resp["workers"].as_array().unwrap();
-        assert_eq!(workers.len(), 2);
-        let ids: Vec<&str> = workers.iter().map(|w| w["id"].as_str().unwrap()).collect();
-        assert!(ids.contains(&id1.as_str()));
-        assert!(ids.contains(&id2.as_str()));
-
-        // Verify worker fields are present.
-        for w in workers {
-            assert!(w["name"].is_string());
-            assert!(w["role"].is_string());
-            assert!(w["description"].is_string());
-            assert!(w["capabilities"].is_array());
-            assert!(w["id"].is_string());
-        }
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_heartbeat_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "hb-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        // Register a worker.
-        let worker_id = register_worker(&sock, "hb-agent", "coder").await;
-
-        // Send heartbeat.
-        let resp = send_json_request(
-            &sock,
-            &serde_json::json!({"type": "heartbeat", "worker_id": worker_id}),
-        )
-        .await;
-        assert_eq!(resp["status"], "ok");
-        assert_eq!(resp["worker_id"], worker_id);
-        assert!(
-            resp["expires_at"].is_number(),
-            "should return new expires_at"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_heartbeat_unknown_worker_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "hb-err-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        // Heartbeat for a non-existent worker.
-        let resp = send_json_request(
-            &sock,
-            &serde_json::json!({"type": "heartbeat", "worker_id": "nonexistent-id"}),
-        )
-        .await;
-        assert_eq!(resp["status"], "error");
-        assert!(
-            resp["message"].as_str().unwrap().contains("not found"),
-            "error message should mention worker not found"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[test]
-    fn test_send_message_queues_in_mailbox() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-
-        let msg_id = state.send_message(worker_id.clone(), "hello".into(), Some("sender-1".into()));
-        assert!(msg_id.is_some(), "send_message should return a message ID");
-
-        let mailbox = state.mailboxes.get(&worker_id).unwrap();
-        assert_eq!(mailbox.len(), 1);
-        let msg = &mailbox[0];
-        assert_eq!(msg.message_id, msg_id.unwrap());
-        assert_eq!(msg.to, worker_id);
-        assert_eq!(msg.body, "hello");
-        assert_eq!(msg.from.as_deref(), Some("sender-1"));
-    }
-
-    #[test]
-    fn test_send_message_unknown_recipient() {
-        let mut state = BrokerState::new();
-        let result = state.send_message("nonexistent".into(), "hello".into(), None);
-        assert!(result.is_none(), "sending to unknown worker should fail");
-    }
-
-    #[test]
-    fn test_send_message_expired_recipient() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "expiring".into(),
-                "role".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        state.workers.get_mut(&worker_id).unwrap().expires_at = 0;
-
-        let result = state.send_message(worker_id, "hello".into(), None);
-        assert!(result.is_none(), "sending to expired worker should fail");
-    }
-
-    #[test]
-    fn test_send_message_unique_ids() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-
-        let id1 = state
-            .send_message(worker_id.clone(), "msg1".into(), None)
-            .unwrap();
-        let id2 = state
-            .send_message(worker_id.clone(), "msg2".into(), None)
-            .unwrap();
-        assert_ne!(id1, id2, "each message should have a unique ID");
-        assert_eq!(state.mailboxes.get(&worker_id).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn test_send_message_without_from() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-
-        let msg_id = state
-            .send_message(worker_id.clone(), "anon msg".into(), None)
-            .unwrap();
-        let msg = &state.mailboxes.get(&worker_id).unwrap()[0];
-        assert_eq!(msg.message_id, msg_id);
-        assert!(msg.from.is_none(), "from should be None when not provided");
-    }
-
-    #[tokio::test]
-    async fn test_send_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "send-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        // Register a worker to receive the message.
-        let worker_id = register_worker(&sock, "receiver", "coder").await;
-
-        // Send a message.
-        let resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": worker_id,
-                "body": "build the feature",
-                "from": "planner-1"
-            }),
-        )
-        .await;
-        assert_eq!(resp["status"], "ok");
-        assert!(
-            resp["message_id"].is_string(),
-            "response should contain message_id"
-        );
-        let message_id = resp["message_id"].as_str().unwrap();
-        assert!(
-            uuid::Uuid::parse_str(message_id).is_ok(),
-            "message_id should be a valid UUID"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_send_unknown_recipient_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "send-err-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        // Send to a non-existent worker.
-        let resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": "nonexistent-worker-id",
-                "body": "hello"
-            }),
-        )
-        .await;
-        assert_eq!(resp["status"], "error");
-        assert!(
-            resp["message"].as_str().unwrap().contains("not found"),
-            "error message should mention recipient not found"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    // ---- Listen tests ----
-
-    #[test]
-    fn test_pop_message_returns_fifo_order() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        state.send_message(worker_id.clone(), "first".into(), None);
-        state.send_message(worker_id.clone(), "second".into(), None);
-
-        let msg1 = state.pop_message(&worker_id).unwrap();
-        assert_eq!(msg1.body, "first");
-        let msg2 = state.pop_message(&worker_id).unwrap();
-        assert_eq!(msg2.body, "second");
-        assert!(state.pop_message(&worker_id).is_none());
-    }
-
-    #[test]
-    fn test_pop_message_empty_mailbox() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        assert!(state.pop_message(&worker_id).is_none());
-    }
-
-    #[test]
-    fn test_pop_message_unknown_worker() {
-        let mut state = BrokerState::new();
-        assert!(state.pop_message("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_get_notifier_returns_same_instance() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let n1 = state.get_notifier(&worker_id);
-        let n2 = state.get_notifier(&worker_id);
-        assert!(Arc::ptr_eq(&n1, &n2), "same worker should get same Notify");
-    }
-
-    #[test]
-    fn test_ack_message_rejects_unknown_worker() {
-        let mut state = BrokerState::new();
-        let err = state
-            .ack_message("missing-worker", "msg-1", None)
-            .unwrap_err();
-        assert!(err.contains("worker not found"), "got: {err}");
-    }
-
-    #[test]
-    fn test_ack_message_rejects_unknown_message() {
-        let mut state = BrokerState::new();
-        let worker_id = state
-            .register_worker(
-                "recv".into(),
-                "coder".into(),
-                "desc".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let err = state
-            .ack_message(&worker_id, "nonexistent-message", None)
-            .unwrap_err();
-        assert!(err.contains("message not found"), "got: {err}");
-    }
-
-    #[test]
-    fn test_ack_message_rejects_wrong_recipient() {
-        let mut state = BrokerState::new();
-        let alice = state
-            .register_worker(
-                "alice".into(),
-                "r".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let bob = state
-            .register_worker(
-                "bob".into(),
-                "r".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let message_id = state
-            .send_message(alice.clone(), "for alice".into(), None)
-            .expect("send");
-        let err = state.ack_message(&bob, &message_id, None).unwrap_err();
-        assert!(
-            err.contains("not addressed to worker"),
-            "expected recipient-mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_ack_message_success_updates_history() {
-        let mut state = BrokerState::new();
-        let alice = state
-            .register_worker(
-                "alice".into(),
-                "r".into(),
-                "d".into(),
-                vec![],
-                None,
-                false,
-                None,
-                None,
-            )
-            .expect("register");
-        let message_id = state
-            .send_message(alice.clone(), "hello".into(), None)
-            .expect("send");
-        state
-            .ack_message(&alice, &message_id, Some("noted".into()))
-            .expect("ack should succeed");
-        let hist = state
-            .message_history
-            .iter()
-            .find(|m| m.message_id == message_id)
-            .expect("message in history");
-        assert!(hist.acked_at.is_some(), "acked_at should be set");
-        assert!(state.ack_log.contains_key(&message_id));
-    }
-
-    #[tokio::test]
-    async fn test_listen_immediate_delivery_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "listen-imm-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        // Register a worker and send a message before listening.
-        let worker_id = register_worker(&sock, "listener", "coder").await;
-        let send_resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": worker_id,
-                "body": "immediate msg",
-                "from": "sender-1"
-            }),
-        )
-        .await;
-        assert_eq!(send_resp["status"], "ok");
-
-        // Listen should immediately return the queued message.
-        let listen_resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "listen",
-                "worker_id": worker_id,
-                "timeout_secs": 5
-            }),
-        )
-        .await;
-        assert_eq!(listen_resp["status"], "ok");
-        assert_eq!(listen_resp["body"], "immediate msg");
-        assert_eq!(listen_resp["from"], "sender-1");
-        assert_eq!(listen_resp["to"], worker_id);
-        assert!(listen_resp["message_id"].is_string());
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_listen_timeout_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "listen-to-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        let worker_id = register_worker(&sock, "waiter", "coder").await;
-
-        // Listen with a very short timeout and no messages queued.
-        let listen_resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "listen",
-                "worker_id": worker_id,
-                "timeout_secs": 1
-            }),
-        )
-        .await;
-        assert_eq!(listen_resp["status"], "ok");
-        assert_eq!(
-            listen_resp["worker_id"], worker_id,
-            "timeout response should contain worker_id"
-        );
-        // Timeout response should NOT have a message_id or body.
-        assert!(
-            listen_resp.get("message_id").is_none() || listen_resp["message_id"].is_null(),
-            "timeout should not have message_id"
-        );
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_listen_long_poll_delivery_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "listen-lp-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        let worker_id = register_worker(&sock, "poller", "coder").await;
-
-        // Start listening in a background task — message arrives after a delay.
-        let sock_clone = sock.clone();
-        let wid = worker_id.clone();
-        let listen_handle = tokio::spawn(async move {
-            send_json_request(
-                &sock_clone,
-                &serde_json::json!({
-                    "type": "listen",
-                    "worker_id": wid,
-                    "timeout_secs": 10
-                }),
-            )
-            .await
-        });
-
-        // Wait a bit, then send a message.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let send_resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": worker_id,
-                "body": "delayed message"
-            }),
-        )
-        .await;
-        assert_eq!(send_resp["status"], "ok");
-
-        // The listen should return the message.
-        let listen_resp = listen_handle.await.unwrap();
-        assert_eq!(listen_resp["status"], "ok");
-        assert_eq!(listen_resp["body"], "delayed message");
-        assert!(listen_resp["message_id"].is_string());
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_listen_renews_worker_ttl_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "listen-ttl-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        let worker_id = register_worker(&sock, "ttl-worker", "coder").await;
-
-        // Send a message so listen returns immediately.
-        send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": worker_id,
-                "body": "ttl test"
-            }),
-        )
-        .await;
-
-        // Listen (which should renew TTL).
-        let listen_resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "listen",
-                "worker_id": worker_id,
-                "timeout_secs": 5
-            }),
-        )
-        .await;
-        assert_eq!(listen_resp["status"], "ok");
-        assert_eq!(listen_resp["body"], "ttl test");
-
-        // Worker should still be active in team listing.
-        let team_resp = send_json_request(&sock, &serde_json::json!({"type": "team"})).await;
-        let workers = team_resp["workers"].as_array().unwrap();
-        let found = workers.iter().any(|w| w["id"] == worker_id);
-        assert!(found, "worker should still be active after listen");
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_listen_unknown_worker_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "listen-err-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        let resp = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "listen",
-                "worker_id": "nonexistent-id",
-                "timeout_secs": 1
-            }),
-        )
-        .await;
-        assert_eq!(resp["status"], "error");
-        assert!(resp["message"].as_str().unwrap().contains("not found"));
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_listen_fifo_ordering_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "listen-fifo-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        let worker_id = register_worker(&sock, "fifo-worker", "coder").await;
-
-        // Send two messages.
-        send_json_request(
-            &sock,
-            &serde_json::json!({"type": "send", "to": worker_id, "body": "first"}),
-        )
-        .await;
-        send_json_request(
-            &sock,
-            &serde_json::json!({"type": "send", "to": worker_id, "body": "second"}),
-        )
-        .await;
-
-        // Listen should return them in FIFO order.
-        let r1 = send_json_request(
-            &sock,
-            &serde_json::json!({"type": "listen", "worker_id": worker_id, "timeout_secs": 1}),
-        )
-        .await;
-        let r2 = send_json_request(
-            &sock,
-            &serde_json::json!({"type": "listen", "worker_id": worker_id, "timeout_secs": 1}),
-        )
-        .await;
-
-        assert_eq!(r1["body"], "first");
-        assert_eq!(r2["body"], "second");
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_send_multiple_messages_via_broker() {
-        let tmp = TempDir::new().unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let cell_id = "send-multi-test";
-
-        let root = project_root.clone();
-        let serve_handle =
-            tokio::spawn(async move { serve(&test_config(&root, cell_id), None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let sock = socket_path(&project_root, cell_id);
-
-        let worker_id = register_worker(&sock, "multi-recv", "coder").await;
-
-        // Send two messages.
-        let resp1 = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": worker_id,
-                "body": "first message"
-            }),
-        )
-        .await;
-        let resp2 = send_json_request(
-            &sock,
-            &serde_json::json!({
-                "type": "send",
-                "to": worker_id,
-                "body": "second message"
-            }),
-        )
-        .await;
-
-        assert_eq!(resp1["status"], "ok");
-        assert_eq!(resp2["status"], "ok");
-        let id1 = resp1["message_id"].as_str().unwrap();
-        let id2 = resp2["message_id"].as_str().unwrap();
-        assert_ne!(id1, id2, "each message should have a unique ID");
-
-        serve_handle.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
+mod tests;

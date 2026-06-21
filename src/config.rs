@@ -7,6 +7,23 @@ use serde::Deserialize;
 
 use crate::errors::DispatchError;
 
+/// Shipped fallback for the "listen again" instruction. Used when
+/// neither a per-agent `[[agents]]` `continue_instruction` nor a global one is
+/// set. Tells the agent to keep long-polling and not to stop on its own — the
+/// coordinator owns the stop decision via the worker's control state.
+pub const DEFAULT_CONTINUE_INSTRUCTION: &str =
+    "No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.";
+
+/// Shipped fallback for the one-line boot prompt fed to a managed agent at
+/// launch. Used when neither a per-agent `[[agents]]` `boot_prompt` nor a
+/// file-level one is set. Kept deliberately minimal: the agent's first
+/// observable action is the bare `dispatch register --for-agent`, whose
+/// response body (the agent's `prompt_file`) carries the real role prompt —
+/// so the boot line only has to trigger that one call. Resolved at config
+/// time as per-agent **>** file-level, with this default applied at write
+/// time by `write_boot_prompt`.
+pub const DEFAULT_BOOT_PROMPT: &str = "Run: dispatch register --for-agent\n";
+
 /// Runtime configuration for Dispatch, resolved from multiple sources.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -31,6 +48,20 @@ pub struct ResolvedConfig {
     pub monitor_open: bool,
     /// Default TTL in seconds for agents that don't specify one.
     pub default_ttl: Option<u64>,
+    /// Drain window (seconds) a `stopping` worker lingers before the broker
+    /// finalizes it. `None` → the broker's built-in default applies.
+    pub stopping_drain_secs: Option<u64>,
+    /// Global "listen again" instruction. The fallback when an agent
+    /// has no per-agent override; `None` → the shipped
+    /// [`DEFAULT_CONTINUE_INSTRUCTION`]. Resolve via
+    /// [`ResolvedConfig::continue_instruction_for`], never read directly, so
+    /// the per-agent > global > default precedence stays in one place.
+    pub continue_instruction: Option<String>,
+    /// When true, broker events that reference a prompt/packet body may include
+    /// the full body. Default `false`: bodies are logged by hash +
+    /// byte size only, never the full text, so prompts don't leak into the
+    /// event history / logs.
+    pub log_prompt_bodies: bool,
     /// Agent definitions to launch on serve.
     pub agents: Vec<ResolvedAgentConfig>,
     /// Scheduled heartbeat commands.
@@ -54,7 +85,22 @@ pub struct ResolvedAgentConfig {
     /// substitution in command-adapter shell strings.
     pub prompt_file_path: Option<PathBuf>,
     pub ttl: Option<u64>,
-    /// Issue #43: when true, the claude adapter is launched with
+    /// Effective default `--timeout` (seconds) for this agent's
+    /// `dispatch listen` calls, injected as `DISPATCH_LISTEN_TIMEOUT`.
+    /// Already resolved at config time as per-agent override **>** global
+    /// `listen_timeout`; `None` means "unset" and the CLI's built-in 270s
+    /// default applies.
+    pub listen_timeout: Option<u64>,
+    /// Per-agent override of the "listen again" instruction. `None`
+    /// falls back to the global `continue_instruction`, then the shipped
+    /// default. Read via [`ResolvedConfig::continue_instruction_for`].
+    pub continue_instruction: Option<String>,
+    /// The one-line boot prompt written to `<name>.boot.prompt` and fed to the
+    /// agent at launch. Already resolved at config time as per-agent
+    /// `[[agents]]` override **>** file-level `boot_prompt`; `None` means both
+    /// are unset and the shipped [`DEFAULT_BOOT_PROMPT`] applies at write time.
+    pub boot_prompt: Option<String>,
+    /// When true, the claude adapter is launched with
     /// `--output-format stream-json --verbose` so per-tool-use entries
     /// appear in the agent log.
     pub stream_json: bool,
@@ -83,6 +129,27 @@ pub struct ConfigFile {
     pub cwd: Option<String>,
     /// Default TTL in seconds for agents that don't specify one.
     pub default_ttl: Option<u64>,
+    /// Global default `--timeout` (seconds) for `dispatch listen`, injected
+    /// into spawned agents as `DISPATCH_LISTEN_TIMEOUT`. Overridable per
+    /// agent in `[[agents]]`. When unset, the CLI's built-in 270s applies.
+    pub listen_timeout: Option<u64>,
+    /// Drain window (seconds) a `stopping` worker lingers before the broker
+    /// finalizes it. When unset, the broker's built-in default (10s) applies.
+    pub stopping_drain_secs: Option<u64>,
+    /// Global "listen again" instruction returned by the stop hook and the
+    /// `listen --for-agent` timeout renderer. Overridable per agent
+    /// in `[[agents]]`. When unset, the shipped default applies.
+    pub continue_instruction: Option<String>,
+    /// File-level boot prompt fed to every managed agent in this file at
+    /// launch (the first thing the model runs). Overridable per agent in
+    /// `[[agents]]`. When unset, the shipped [`DEFAULT_BOOT_PROMPT`]
+    /// (`Run: dispatch register --for-agent`) applies — keep it minimal; the
+    /// real role prompt arrives as the response to that register call.
+    pub boot_prompt: Option<String>,
+    /// When true, broker events may log full prompt/packet bodies. Default
+    /// `false` — bodies are recorded as hash + byte size only.
+    #[serde(default)]
+    pub log_prompt_bodies: bool,
     /// Monitor dashboard configuration.
     pub monitor: Option<MonitorConfig>,
     /// Agent definitions to launch on serve.
@@ -135,6 +202,14 @@ pub struct AgentConfig {
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     pub ttl: Option<u64>,
+    /// Per-agent override of the global `listen_timeout` (seconds). Injected
+    /// as `DISPATCH_LISTEN_TIMEOUT` so this agent's bare `dispatch listen`
+    /// long-polls for the configured duration.
+    pub listen_timeout: Option<u64>,
+    /// Per-agent override of the global `continue_instruction`.
+    pub continue_instruction: Option<String>,
+    /// Per-agent override of the file-level `boot_prompt`.
+    pub boot_prompt: Option<String>,
     /// Whether `dispatch serve` should auto-start this agent under the
     /// supervisor. `false` (the default) prints a copy-paste command at
     /// startup instead so you can run the agent yourself.
@@ -160,13 +235,15 @@ pub struct AgentConfig {
 fn resolve_agent_config(
     agent: &AgentConfig,
     project_root: &Path,
+    global_listen_timeout: Option<u64>,
+    global_boot_prompt: Option<&str>,
 ) -> Result<ResolvedAgentConfig, DispatchError> {
     use crate::adapter::Adapter;
 
     // Reject names that can't be used as a single on-disk filename
     // component. The HTTP boundaries (`api_agent_start/stop/restart`) already
     // gate on `is_safe_name`, but the `launch_all` / `spawn_agent` path
-    // derives the issue-#43 boot-prompt filename from `sanitize_name`, which
+    // derives the boot-prompt filename from `sanitize_name`, which
     // lossily collapses non-`[A-Za-z0-9_-]` characters to `_`. Two configs
     // like `alice/foo` and `alice_foo` would both map to
     // `alice_foo.boot.prompt`, silently overwriting each other. Enforce the
@@ -252,6 +329,18 @@ fn resolve_agent_config(
         prompt,
         prompt_file_path,
         ttl: agent.ttl,
+        // Per-agent override wins over the global default; `None` here means
+        // both are unset and the CLI's built-in 270s default applies.
+        listen_timeout: agent.listen_timeout.or(global_listen_timeout),
+        // Kept raw (per-agent only): `continue_instruction_for` layers global
+        // and the shipped default on top, so don't fold them in here.
+        continue_instruction: agent.continue_instruction.clone(),
+        // Per-agent override wins over the file-level boot prompt; `None` here
+        // means both are unset and DEFAULT_BOOT_PROMPT applies at write time.
+        boot_prompt: agent
+            .boot_prompt
+            .clone()
+            .or_else(|| global_boot_prompt.map(str::to_string)),
         stream_json: agent.stream_json,
         launch: agent.launch,
         interactive,
@@ -307,6 +396,35 @@ const CONFIG_TEMPLATE: &str = "\
 # Default TTL in seconds for agents that don't specify their own (default: 3600)
 # default_ttl = 3600
 
+# Default `dispatch listen` timeout in seconds. Injected into spawned agents
+# as DISPATCH_LISTEN_TIMEOUT so a bare `dispatch listen` long-polls for this
+# duration. Overridable per agent in [[agents]]. (default: 270)
+# listen_timeout = 270
+
+# How long (seconds) a worker stays `stopping` after `dispatch agent stop`
+# before the broker finalizes it. This drain window lets a dying agent's late
+# stop-hook call still see `stopping` (and exit cleanly) rather than racing the
+# record's removal. (default: 10)
+# stopping_drain_secs = 10
+
+# What to tell an agent when it has no task right now — returned by the stop
+# hook (to keep the agent listening) and by `dispatch listen --for-agent` on a
+# timeout while the worker is still `active`. Overridable per agent in
+# [[agents]]. When unset, a built-in default is used.
+# continue_instruction = \"No task right now. Run `dispatch listen` again and keep waiting. Do not stop until dispatch tells you to.\"
+
+# One-line boot prompt fed to every managed agent at launch — the first thing
+# the model runs. Keep it minimal: its only job is to trigger
+# `dispatch register --for-agent`, whose response body (the agent's prompt_file)
+# carries the real role prompt. Overridable per agent in [[agents]].
+# (default: \"Run: dispatch register --for-agent\")
+# boot_prompt = \"Run: dispatch register --for-agent\"
+
+# Log full prompt/packet bodies in broker events. Default false — bodies are
+# recorded by hash + byte size only, so prompts don't leak into the event
+# history or logs. Enable only for debugging.
+# log_prompt_bodies = false
+
 # Monitor dashboard — starts an HTTP dashboard on serve
 # [monitor]
 # port = 8384
@@ -315,13 +433,14 @@ const CONFIG_TEMPLATE: &str = "\
 # Agent definitions — auto-started by `dispatch serve` when launch = true.
 #
 # When `launch = true` AND `prompt_file` is set (the managed-agent flow),
-# dispatch pre-registers the worker server-side at spawn time, injects
-# DISPATCH_WORKER_ID into the agent's environment, and feeds the agent a
-# one-line boot prompt. The first thing the model does is run
-# `dispatch register --worker-id \"$DISPATCH_WORKER_ID\" ... --for-agent`,
-# whose response body is the contents of `prompt_file` — so the role prompt
-# lands in the model's tool result instead of being narrated up front (this
-# kills a class of hallucination where the model fakes the register step).
+# dispatch pre-registers the worker server-side at spawn time, injects the
+# agent's identity into its environment (DISPATCH_WORKER_ID / DISPATCH_AGENT_NAME
+# / DISPATCH_AGENT_ROLE / DISPATCH_AGENT_DESCRIPTION), and feeds the agent a
+# one-line boot prompt. The first thing the model does is run the bare
+# `dispatch register --for-agent` (identity all from env), whose response body
+# is the contents of `prompt_file` — so the role prompt lands in the model's
+# tool result instead of being narrated up front (this kills a class of
+# hallucination where the model fakes the register step).
 #
 # When `launch = false`, dispatch prints the command for you to copy into a
 # separate terminal and the agent registers itself the legacy way.
@@ -335,10 +454,14 @@ const CONFIG_TEMPLATE: &str = "\
 # prompt_file = \"prompts/reviewer.md\"            # role prompt body (see above)
 # launch = true
 # ttl = 3600
+# listen_timeout = 540                           # per-agent override of the global
+#                                                # listen_timeout (seconds)
+# boot_prompt = \"Run: dispatch register --for-agent\"  # per-agent override of the
+#                                                # file-level boot_prompt
 # stream_json = false                            # when true, claude is launched with
 #                                                # `--output-format stream-json --verbose`
 #                                                # so per-tool-use entries appear in the
-#                                                # agent log (issue #43 verification).
+#                                                # agent log (verifies real register calls).
 #
 # # `command` adapter — for bash-script / non-LLM workers:
 # [[agents]]
@@ -353,7 +476,7 @@ const CONFIG_TEMPLATE: &str = "\
 # serve startup. `launch = false` (the default) keeps the orchestrator out
 # of its lifecycle; you run it yourself in a terminal. If a `prompt_file`
 # is set, dispatch pre-registers a worker server-side and the printed
-# command uses the issue-#43 boot-prompt bootstrap — the agent's first
+# command uses the boot-prompt bootstrap — the agent's first
 # tool call is `dispatch register --for-agent`, which returns the prompt
 # body from the broker rather than embedding it in a multi-kB shell string.
 # [[agents]]
@@ -490,20 +613,49 @@ fn resolve_config_inner(
         derive_cell_id(&project_root)
     };
 
-    // Extract fields from config file
-    let (name, backend, default_ttl, config_cwd, monitor_config, raw_agents, heartbeats) =
-        match config_file {
-            Some(c) => (
-                c.name,
-                c.backend,
-                c.default_ttl,
-                c.cwd,
-                c.monitor,
-                c.agents,
-                c.heartbeats,
-            ),
-            None => (None, None, None, None, None, vec![], vec![]),
-        };
+    let (
+        name,
+        backend,
+        default_ttl,
+        global_listen_timeout,
+        stopping_drain_secs,
+        continue_instruction,
+        global_boot_prompt,
+        log_prompt_bodies,
+        config_cwd,
+        monitor_config,
+        raw_agents,
+        heartbeats,
+    ) = match config_file {
+        Some(c) => (
+            c.name,
+            c.backend,
+            c.default_ttl,
+            c.listen_timeout,
+            c.stopping_drain_secs,
+            c.continue_instruction,
+            c.boot_prompt,
+            c.log_prompt_bodies,
+            c.cwd,
+            c.monitor,
+            c.agents,
+            c.heartbeats,
+        ),
+        None => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+        ),
+    };
 
     // Resolve agent working directory: config cwd (relative to project_root) or project_root
     let agent_cwd = if let Some(ref cwd_path) = config_cwd {
@@ -518,7 +670,14 @@ fn resolve_config_inner(
     // Resolve agent prompt files
     let agents: Vec<ResolvedAgentConfig> = raw_agents
         .iter()
-        .map(|a| resolve_agent_config(a, &project_root))
+        .map(|a| {
+            resolve_agent_config(
+                a,
+                &project_root,
+                global_listen_timeout,
+                global_boot_prompt.as_deref(),
+            )
+        })
         .collect::<Result<_, _>>()?;
 
     Ok(ResolvedConfig {
@@ -531,701 +690,41 @@ fn resolve_config_inner(
         monitor_port,
         monitor_open,
         default_ttl,
+        stopping_drain_secs,
+        continue_instruction,
+        log_prompt_bodies,
         agents,
         heartbeats,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_find_config_in_current_dir() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let result = find_config_file(tmp.path());
-        assert!(result.is_some());
-        let (path, root) = result.unwrap();
-        assert_eq!(path, config_path);
-        assert_eq!(root, tmp.path());
-    }
-
-    #[test]
-    fn test_find_config_does_not_walk_parents() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let child = tmp.path().join("subdir");
-        fs::create_dir(&child).unwrap();
-
-        let result = find_config_file(&child);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_find_config_not_found() {
-        let tmp = TempDir::new().unwrap();
-        let result = find_config_file(tmp.path());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_load_config_file_valid() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-cell_id = "my-cell"
-backend = "https://example.com"
-"#,
-        )
-        .unwrap();
-
-        let config = load_config_file(&config_path).unwrap();
-        assert_eq!(config.cell_id, Some("my-cell".to_string()));
-        assert_eq!(config.backend, Some("https://example.com".to_string()));
-    }
-
-    #[test]
-    fn test_load_config_file_denies_unknown_fields() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, r#"unknown_field = "oops""#).unwrap();
-
-        let result = load_config_file(&config_path);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_derive_cell_id_deterministic() {
-        let tmp = TempDir::new().unwrap();
-        let id1 = derive_cell_id(tmp.path());
-        let id2 = derive_cell_id(tmp.path());
-        assert_eq!(id1, id2);
-        assert!(id1.starts_with("cell-"));
-    }
-
-    #[test]
-    fn test_derive_cell_id_different_paths() {
-        let tmp1 = TempDir::new().unwrap();
-        let tmp2 = TempDir::new().unwrap();
-        let id1 = derive_cell_id(tmp1.path());
-        let id2 = derive_cell_id(tmp2.path());
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn test_resolve_config_cli_override() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, r#"cell_id = "from-config""#).unwrap();
-
-        let resolved = resolve_config_inner(Some("from-cli"), None, None, tmp.path()).unwrap();
-        assert_eq!(resolved.cell_id, "from-cli");
-    }
-
-    #[test]
-    fn test_resolve_config_env_override() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, r#"cell_id = "from-config""#).unwrap();
-
-        let resolved = resolve_config_inner(None, Some("from-env"), None, tmp.path()).unwrap();
-        assert_eq!(resolved.cell_id, "from-env");
-    }
-
-    #[test]
-    fn test_resolve_config_from_file() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, r#"cell_id = "from-config""#).unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert_eq!(resolved.cell_id, "from-config");
-    }
-
-    #[test]
-    fn test_resolve_config_derived_fallback() {
-        let tmp = TempDir::new().unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert!(resolved.cell_id.starts_with("cell-"));
-    }
-
-    #[test]
-    fn test_resolve_config_precedence_cli_over_env() {
-        let tmp = TempDir::new().unwrap();
-
-        let resolved =
-            resolve_config_inner(Some("from-cli"), Some("from-env"), None, tmp.path()).unwrap();
-        assert_eq!(resolved.cell_id, "from-cli");
-    }
-
-    #[test]
-    fn test_init_config_creates_file() {
-        let tmp = TempDir::new().unwrap();
-        let result = init_config(tmp.path());
-        assert!(result.is_ok());
-
-        let path = result.unwrap();
-        assert_eq!(path, tmp.path().join("dispatch.config.toml"));
-        assert!(path.is_file());
-
-        let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("# cell_id = \"my-project\""));
-
-        // Template must be valid TOML (all active lines are comments)
-        let parsed: Result<ConfigFile, _> = toml::from_str(&contents);
-        assert!(parsed.is_ok());
-    }
-
-    #[test]
-    fn test_init_config_already_exists() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let result = init_config(tmp.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("already exists"),
-            "expected 'already exists' in error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_config_explicit_config_path() {
-        let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("other");
-        fs::create_dir(&config_dir).unwrap();
-        let config_path = config_dir.join("dispatch.config.toml");
-        fs::write(&config_path, r#"cell_id = "explicit""#).unwrap();
-
-        // cwd is tmp root, config is in other/ — project_root should be other/
-        let resolved = resolve_config_inner(None, None, Some(&config_path), tmp.path()).unwrap();
-        assert_eq!(resolved.cell_id, "explicit");
-        assert_eq!(resolved.project_root, config_dir);
-    }
-
-    #[test]
-    fn agent_config_parses_claude_adapter() {
-        let tmp = TempDir::new().unwrap();
-        let prompt_path = tmp.path().join("reviewer.md");
-        fs::write(&prompt_path, "you are a reviewer").unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "reviewer"
-role = "reviewer"
-description = "reviews"
-adapter = "claude"
-extra_args = ["--model", "sonnet"]
-prompt_file = "reviewer.md"
-launch = true
-"#,
-        )
-        .unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert_eq!(resolved.agents.len(), 1);
-        let a = &resolved.agents[0];
-        assert_eq!(a.adapter, crate::adapter::Adapter::Claude);
-        assert_eq!(a.extra_args, vec!["--model", "sonnet"]);
-        assert!(a.launch);
-        assert!(a.command.is_none());
-        assert!(a.prompt_file_path.is_some());
-        // Issue #43: stream_json defaults to false so existing configs see
-        // no behavior change.
-        assert!(!a.stream_json, "stream_json must default to false");
-    }
-
-    /// Issue #43: `stream_json = true` round-trips through TOML and lands
-    /// on the resolved config. Verified separately by the claude adapter
-    /// test that translates this flag into argv.
-    #[test]
-    fn agent_config_parses_stream_json_flag() {
-        let tmp = TempDir::new().unwrap();
-        let prompt_path = tmp.path().join("reviewer.md");
-        fs::write(&prompt_path, "you are a reviewer").unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "reviewer"
-role = "reviewer"
-description = "reviews"
-adapter = "claude"
-prompt_file = "reviewer.md"
-stream_json = true
-"#,
-        )
-        .unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert!(
-            resolved.agents[0].stream_json,
-            "stream_json = true in TOML must land on the resolved config",
-        );
-    }
-
-    #[test]
-    fn agent_config_rejects_claude_adapter_with_inline_prompt() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "reviewer"
-role = "reviewer"
-description = "reviews"
-adapter = "claude"
-prompt = "you are a reviewer"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("prompt_file") && msg.contains("claude"),
-            "expected prompt_file-required error for claude, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn agent_config_rejects_codex_adapter_with_inline_prompt() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "worker"
-role = "worker"
-description = "codex"
-adapter = "codex"
-prompt = "be helpful"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("prompt_file"));
-    }
-
-    #[test]
-    fn agent_config_parses_command_adapter() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "worker"
-role = "worker"
-description = "bash worker"
-adapter = "command"
-command = "./worker.sh --verbose"
-"#,
-        )
-        .unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        let a = &resolved.agents[0];
-        assert_eq!(a.adapter, crate::adapter::Adapter::Command);
-        assert_eq!(a.command.as_deref(), Some("./worker.sh --verbose"));
-        assert!(!a.launch);
-        assert!(a.extra_args.is_empty());
-    }
-
-    #[test]
-    fn agent_config_rejects_command_adapter_without_command() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "broken"
-role = "worker"
-description = "no command"
-adapter = "command"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("adapter = \"command\""),
-            "expected command-required error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn agent_config_rejects_missing_adapter_field() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "legacy"
-role = "worker"
-description = "old shape"
-command = "./worker.sh"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("adapter"),
-            "expected adapter-related parse error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn agent_config_rejects_unknown_adapter_value() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "x"
-role = "r"
-description = "d"
-adapter = "gpt"
-"#,
-        )
-        .unwrap();
-
-        assert!(resolve_config_inner(None, None, None, tmp.path()).is_err());
-    }
-
-    /// Agent names must pass `is_safe_name` at resolve time so the
-    /// boot-prompt filename (derived via lossy `sanitize_name`) cannot
-    /// collide across distinct raw names under `dispatch serve`.
-    #[test]
-    fn agent_config_rejects_name_with_unsafe_characters() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "alice/foo"
-role = "worker"
-description = "d"
-adapter = "command"
-command = "./run.sh"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("alice/foo") && msg.contains("ASCII"),
-            "expected safe-name rejection for 'alice/foo', got: {msg}"
-        );
-    }
-
-    /// `interactive = true` on a `launch = false` agent round-trips
-    /// through TOML unchanged. The adapter uses this to drop `-p` (claude)
-    /// / `exec` (codex) so the printed copy-paste command opens the vendor
-    /// CLI in its REPL instead of headless mode.
-    #[test]
-    fn agent_config_parses_interactive_flag() {
-        let tmp = TempDir::new().unwrap();
-        let prompt_path = tmp.path().join("coord.md");
-        fs::write(&prompt_path, "you are the coordinator").unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "coordinator"
-role = "coordinator"
-description = "the human-run coordinator"
-adapter = "claude"
-prompt_file = "coord.md"
-launch = false
-interactive = true
-"#,
-        )
-        .unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert_eq!(resolved.agents.len(), 1);
-        let a = &resolved.agents[0];
-        assert!(a.interactive, "interactive = true must round-trip");
-        assert!(!a.launch);
-    }
-
-    /// `interactive = true + launch = true` is contradictory (the
-    /// supervisor owns stdin/stdout, so there's no TTY for a REPL). We
-    /// warn and prefer `launch = true` (headless), keeping the config
-    /// loadable rather than forcing a hard failure that would strand a
-    /// user who typed the wrong combo.
-    #[test]
-    fn agent_config_warns_and_prefers_launch_when_both_set() {
-        let tmp = TempDir::new().unwrap();
-        let prompt_path = tmp.path().join("r.md");
-        fs::write(&prompt_path, "role").unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "reviewer"
-role = "reviewer"
-description = "reviews"
-adapter = "claude"
-prompt_file = "r.md"
-launch = true
-interactive = true
-"#,
-        )
-        .unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        let a = &resolved.agents[0];
-        assert!(a.launch, "launch must win when both are set");
-        assert!(
-            !a.interactive,
-            "interactive must be forced off when launch is on",
-        );
-    }
-
-    /// `interactive` defaults to false so existing configs see no
-    /// behavior change after the new field is introduced.
-    #[test]
-    fn agent_config_interactive_defaults_false() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[[agents]]
-name = "worker"
-role = "worker"
-description = "d"
-adapter = "command"
-command = "./run.sh"
-"#,
-        )
-        .unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert!(!resolved.agents[0].interactive);
-    }
-
-    /// Issue #45: `[main_agent]` has been removed in favor of a regular
-    /// `[[agents]] launch = false + prompt_file` entry. `ConfigFile`'s
-    /// `deny_unknown_fields` means a legacy config with `[main_agent]`
-    /// fails parse with a clear pointer rather than silently ignoring
-    /// the section.
-    #[test]
-    fn config_rejects_legacy_main_agent_table() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(
-            &config_path,
-            r#"
-[main_agent]
-command = "claude"
-model = "opus"
-"#,
-        )
-        .unwrap();
-
-        let err = resolve_config_inner(None, None, None, tmp.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("main_agent"),
-            "expected error to reference main_agent, got: {msg}"
-        );
-    }
-
-    /// `config_file_path` carries the discovered file path as an absolute
-    /// canonical path, so agents spawned by `dispatch serve` can propagate
-    /// it via `DISPATCH_CONFIG_PATH` regardless of their working directory.
-    #[test]
-    fn resolved_config_carries_path_when_discovered() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        let expected = config_path.canonicalize().unwrap();
-        assert_eq!(
-            resolved.config_file_path.as_deref(),
-            Some(expected.as_path())
-        );
-    }
-
-    /// Explicit `--config <path>` flow: the absolute path threads through
-    /// to `ResolvedConfig` so the injected env var points at the right file.
-    #[test]
-    fn resolved_config_carries_path_when_flag_given() {
-        let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("other");
-        fs::create_dir(&config_dir).unwrap();
-        let config_path = config_dir.join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let resolved = resolve_config_inner(None, None, Some(&config_path), tmp.path()).unwrap();
-        let expected = config_path.canonicalize().unwrap();
-        assert_eq!(
-            resolved.config_file_path.as_deref(),
-            Some(expected.as_path())
-        );
-    }
-
-    /// Cwd without a config file: `config_file_path` stays `None` so the
-    /// orchestrator emits no `DISPATCH_CONFIG_PATH` env var (regression
-    /// guard — existing configs see byte-identical env).
-    #[test]
-    fn resolved_config_none_when_no_config_file() {
-        let tmp = TempDir::new().unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        assert!(resolved.config_file_path.is_none());
-    }
-
-    /// `DISPATCH_CONFIG_PATH` acts as a fallback to `--config`, mirroring how
-    /// `DISPATCH_SOCKET_PATH` already works for the broker socket.
-    #[test]
-    fn resolve_config_with_env_honors_dispatch_config_path() {
-        let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("elsewhere");
-        fs::create_dir(&config_dir).unwrap();
-        let config_path = config_dir.join("dispatch.config.toml");
-        fs::write(&config_path, r#"cell_id = "from-env-path""#).unwrap();
-
-        let resolved = resolve_config_with_env(
-            None,
-            None,
-            None,
-            Some(config_path.to_str().unwrap()),
-            tmp.path(),
-        )
-        .unwrap();
-        assert_eq!(resolved.cell_id, "from-env-path");
-    }
-
-    /// CLI flag beats env var — matches the stated precedence order
-    /// (CLI > env > discovery) from the config docs.
-    #[test]
-    fn resolve_config_with_env_prefers_cli_flag_over_env() {
-        let tmp = TempDir::new().unwrap();
-        let cli_dir = tmp.path().join("cli");
-        fs::create_dir(&cli_dir).unwrap();
-        let cli_config = cli_dir.join("dispatch.config.toml");
-        fs::write(&cli_config, r#"cell_id = "from-cli""#).unwrap();
-
-        let env_dir = tmp.path().join("env");
-        fs::create_dir(&env_dir).unwrap();
-        let env_config = env_dir.join("dispatch.config.toml");
-        fs::write(&env_config, r#"cell_id = "from-env""#).unwrap();
-
-        let resolved = resolve_config_with_env(
-            None,
-            None,
-            Some(&cli_config),
-            Some(env_config.to_str().unwrap()),
-            tmp.path(),
-        )
-        .unwrap();
-        assert_eq!(resolved.cell_id, "from-cli");
-    }
-
-    /// Empty `DISPATCH_CONFIG_PATH` is treated as unset — matches the
-    /// `resolve_socket_path_with_env` idiom and avoids a hard error when
-    /// a parent shell exports the var blank.
-    #[test]
-    fn resolve_config_with_env_treats_empty_string_as_unset() {
-        let tmp = TempDir::new().unwrap();
-
-        let resolved = resolve_config_with_env(None, None, None, Some(""), tmp.path()).unwrap();
-        assert!(resolved.config_file_path.is_none());
-    }
-
-    /// `DISPATCH_CONFIG_PATH` pointing at a missing file errors out — same
-    /// failure mode as `--config nonexistent.toml`, documented as a
-    /// breaking-change surface.
-    #[test]
-    fn resolve_config_with_env_hard_errors_on_missing_file() {
-        let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("does-not-exist.toml");
-
-        let err = resolve_config_with_env(
-            None,
-            None,
-            None,
-            Some(missing.to_str().unwrap()),
-            tmp.path(),
-        )
-        .unwrap_err();
-        // ConfigNotFound — exactly what `--config <missing>` emits today.
-        assert!(
-            err.to_string().to_lowercase().contains("not found")
-                || err.to_string().to_lowercase().contains("no such"),
-            "expected not-found error, got: {err}"
-        );
-    }
-
-    /// Regression guard for the `absolutize` fallback: when canonicalize
-    /// fails (e.g. permission denied on an ancestor dir), we must still
-    /// produce an absolute path, not echo the raw relative input. The
-    /// fallback is what stands between `DISPATCH_CONFIG_PATH` and a
-    /// worthless value in rare failure modes.
-    #[test]
-    fn absolutize_joins_relative_paths_against_cwd() {
-        let tmp = TempDir::new().unwrap();
-        let relative = Path::new("foo/bar.toml");
-        let joined = absolutize(tmp.path(), relative);
-        assert!(joined.is_absolute());
-        assert_eq!(joined, tmp.path().join("foo/bar.toml"));
-    }
-
-    /// `absolutize` leaves already-absolute paths untouched.
-    #[test]
-    fn absolutize_passes_absolute_paths_through() {
-        let tmp = TempDir::new().unwrap();
-        let already_abs = tmp.path().join("x.toml");
-        assert_eq!(absolutize(tmp.path(), &already_abs), already_abs);
-    }
-
-    /// Discovered path is always absolute — even a `TempDir` root (already
-    /// absolute) gets canonicalized to resolve `/tmp` → `/private/tmp` on
-    /// macOS, guaranteeing the stored path is what downstream code can
-    /// stat regardless of how the test env was configured.
-    #[test]
-    fn discovered_config_path_is_absolute() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = tmp.path().join("dispatch.config.toml");
-        fs::write(&config_path, "").unwrap();
-
-        let resolved = resolve_config_inner(None, None, None, tmp.path()).unwrap();
-        let stored = resolved.config_file_path.expect("path must be set");
-        assert!(
-            stored.is_absolute(),
-            "discovered path must be absolute, got: {}",
-            stored.display()
-        );
+impl ResolvedConfig {
+    /// Resolve the "listen again" instruction for `agent_name` with precedence
+    /// per-agent `[[agents]]` override **>** global `continue_instruction` **>**
+    /// shipped [`DEFAULT_CONTINUE_INSTRUCTION`].
+    ///
+    /// `agent_name` is the agent's `DISPATCH_AGENT_NAME` when known; `None`
+    /// (ad-hoc session, or a name not in this config) skips straight to the
+    /// global/default fallback. The single resolver feeds both the stop hook
+    /// and the `listen --for-agent` timeout renderer so the
+    /// two can't drift.
+    pub fn continue_instruction_for(&self, agent_name: Option<&str>) -> String {
+        if let Some(name) = agent_name {
+            if let Some(text) = self
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.continue_instruction.as_deref())
+            {
+                return text.to_string();
+            }
+        }
+        self.continue_instruction
+            .as_deref()
+            .unwrap_or(DEFAULT_CONTINUE_INSTRUCTION)
+            .to_string()
     }
 }
+
+#[cfg(test)]
+mod tests;

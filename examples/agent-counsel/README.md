@@ -103,4 +103,4 @@ The main agent (right, large pane) asks you for a question. The left column show
 | `counselor-jobs.prompt.md` | Steve Jobs persona |
 | `counselor-gates.prompt.md` | Bill Gates persona |
 | `counselor-bezos.prompt.md` | Jeff Bezos persona |
-| `dispatch-comms.md` | Shared communication guide for all workers |
+| `skills/dispatch/` (repo root) | The `dispatch` skill — communication guide for all workers |

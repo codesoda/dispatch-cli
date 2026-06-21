@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -48,17 +48,19 @@ pub enum Commands {
 
     /// Register a worker with the broker
     Register {
-        /// Worker name
+        /// Worker name. Falls back to `$DISPATCH_AGENT_NAME` — so a
+        /// dispatch-launched agent boots with a bare
+        /// `dispatch register --for-agent`.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
 
-        /// Worker role
+        /// Worker role. Falls back to `$DISPATCH_AGENT_ROLE`.
         #[arg(long)]
-        role: String,
+        role: Option<String>,
 
-        /// Worker description
+        /// Worker description. Falls back to `$DISPATCH_AGENT_DESCRIPTION`.
         #[arg(long)]
-        description: String,
+        description: Option<String>,
 
         /// Worker capabilities (repeatable)
         #[arg(long = "capability")]
@@ -72,7 +74,7 @@ pub enum Commands {
         #[arg(long)]
         evict: bool,
 
-        /// Pre-assigned worker id (issue #43). When set, the broker uses
+        /// Pre-assigned worker id. When set, the broker uses
         /// this id rather than generating one. If a worker with this id
         /// already exists with the same name+role, the call is treated as
         /// an idempotent claim — used by spawned agents to attach to a
@@ -80,7 +82,7 @@ pub enum Commands {
         #[arg(long = "worker-id")]
         worker_id: Option<String>,
 
-        /// Role prompt body to associate with this worker (issue #43).
+        /// Role prompt body to associate with this worker.
         /// Only the orchestrator passes this — at pre-register time it
         /// loads the agent's `prompt_file` and ships the content here so
         /// the spawned agent can fetch it back via `--for-agent`.
@@ -89,7 +91,7 @@ pub enum Commands {
 
         /// Route the role prompt body to stdout (for downstream LLM tool
         /// result consumption); the JSON envelope is redirected to stderr
-        /// with `role_prompt` stripped (issue #43). Intentional CLI wart
+        /// with `role_prompt` stripped. Intentional CLI wart
         /// whose only purpose is to be friendly to a downstream LLM tool
         /// result: the spawned agent's first tool call is `dispatch
         /// register --for-agent`, and the prompt body landing on stdout
@@ -115,13 +117,26 @@ pub enum Commands {
 
     /// Long-poll for incoming messages
     Listen {
-        /// Worker ID to listen as
+        /// Worker ID to listen as. Falls back to the global `--from`, then
+        /// `$DISPATCH_WORKER_ID` — so a dispatch-launched agent can run a
+        /// bare `dispatch listen`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
-        /// Timeout in seconds (default: 30)
-        #[arg(long, default_value = "30")]
-        timeout: u64,
+        /// Timeout in seconds. Falls back to `$DISPATCH_LISTEN_TIMEOUT`
+        /// (injected by the orchestrator from `listen_timeout`), then the
+        /// built-in default of 270s.
+        #[arg(long)]
+        timeout: Option<u64>,
+
+        /// Render results for direct LLM tool-result consumption: a
+        /// delivered message body is written verbatim to stdout (no JSON
+        /// envelope); on timeout, if the worker is still `active`, the
+        /// configured `continue_instruction` is printed so the agent listens
+        /// again, otherwise the neutral JSON timeout is emitted. Without the
+        /// flag, `listen` prints the raw JSON response unchanged.
+        #[arg(long = "for-agent")]
+        for_agent: bool,
     },
 
     /// Query event history
@@ -149,9 +164,10 @@ pub enum Commands {
 
     /// Query message history (non-destructive)
     Messages {
-        /// Worker ID to inspect messages for
+        /// Worker ID to inspect messages for. Falls back to the global
+        /// `--from`, then `$DISPATCH_WORKER_ID`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
         /// Show only delivered but unacked messages
         #[arg(long)]
@@ -187,9 +203,10 @@ pub enum Commands {
 
     /// Acknowledge receipt of a message
     Ack {
-        /// Worker ID that received the message
+        /// Worker ID that received the message. Falls back to the global
+        /// `--from`, then `$DISPATCH_WORKER_ID`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
         /// Message ID to acknowledge
         #[arg(long)]
@@ -200,11 +217,43 @@ pub enum Commands {
         note: Option<String>,
     },
 
+    /// Report task completion for a message (a "super-ack": records status,
+    /// summary, and artifacts on top of an ack). The message must have been
+    /// addressed to this worker.
+    Result {
+        /// Worker ID reporting completion. Falls back to the global `--from`,
+        /// then `$DISPATCH_WORKER_ID`.
+        #[arg(long)]
+        worker_id: Option<String>,
+
+        /// Message ID this result completes
+        #[arg(long)]
+        message_id: String,
+
+        /// Completion status: done | failed | blocked
+        #[arg(long, value_enum)]
+        status: ResultStatus,
+
+        /// Optional free-text completion summary
+        #[arg(long)]
+        summary: Option<String>,
+
+        /// Artifact path or URL produced by the task (repeatable)
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+
+        /// Render a terse confirmation for direct LLM tool-result consumption
+        /// instead of the JSON envelope
+        #[arg(long = "for-agent")]
+        for_agent: bool,
+    },
+
     /// Renew worker liveness TTL
     Heartbeat {
-        /// Worker ID to heartbeat
+        /// Worker ID to heartbeat. Falls back to the global `--from`, then
+        /// `$DISPATCH_WORKER_ID`.
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
 
         /// Set a status tagline (e.g. "Running e2e tests 3/10")
         #[arg(long)]
@@ -228,6 +277,27 @@ pub enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+}
+
+/// Completion status reported by `dispatch result`. Maps 1:1 to the
+/// wire string stored in the ack log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ResultStatus {
+    Done,
+    Failed,
+    Blocked,
+}
+
+impl ResultStatus {
+    /// Wire string sent to the broker (`done` | `failed` | `blocked`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResultStatus::Done => "done",
+            ResultStatus::Failed => "failed",
+            ResultStatus::Blocked => "blocked",
+        }
+    }
 }
 
 #[derive(Subcommand)]

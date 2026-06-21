@@ -79,13 +79,21 @@ async fn dashboard() -> Html<&'static str> {
 async fn api_team(State(state): State<MonitorState>) -> axum::Json<Vec<crate::protocol::Worker>> {
     let mut broker = state.broker.lock().await;
     let expired = broker.evict_expired();
-    for (id, name) in &expired {
+    for (id, name, reason) in &expired {
+        let (kind, detail, payload) = match reason {
+            super::local::EvictReason::TtlExpired => ("expire", "worker expired", None),
+            super::local::EvictReason::StopDrained => (
+                "lifecycle",
+                "worker stopped (drain window elapsed)",
+                Some(serde_json::json!({ "control_state": "stopped" })),
+            ),
+        };
         let _ = state.events.send(super::local::BrokerEvent {
-            kind: "expire".to_string(),
+            kind: kind.to_string(),
             worker_id: id.clone(),
             worker_name: Some(name.clone()),
-            detail: "worker expired".to_string(),
-            payload: None,
+            detail: detail.to_string(),
+            payload,
             timestamp: super::local::now_secs(),
         });
     }
@@ -102,10 +110,13 @@ async fn api_events(
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
-                    let sse_event = Event::default().event("broker").json_data(&event).unwrap();
-                    return Some((Ok(sse_event), rx));
-                }
+                Ok(event) => match Event::default().event("broker").json_data(&event) {
+                    Ok(sse_event) => return Some((Ok(sse_event), rx)),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to serialize broker event");
+                        continue;
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -244,7 +255,6 @@ async fn api_logs(
         Err(_) => return (StatusCode::NOT_FOUND, "log file not found").into_response(),
     };
 
-    // Return the last N lines, capped to MAX_LOG_LINES.
     let requested = query.lines.min(MAX_LOG_LINES);
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(requested);
@@ -507,6 +517,9 @@ mod tests {
             prompt: None,
             prompt_file_path: None,
             ttl: None,
+            listen_timeout: None,
+            continue_instruction: None,
+            boot_prompt: None,
             stream_json: false,
             interactive: false,
             launch: false,
